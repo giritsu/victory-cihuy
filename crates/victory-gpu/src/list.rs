@@ -243,7 +243,7 @@ const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 #[cfg(windows)]
 fn idle_most() -> (usize, u64) {
     if crate::residency::compact_host_ram() {
-        (256, 64 << 20)
+        (320, 64 << 20)
     } else {
         IDLE_MOST
     }
@@ -272,7 +272,7 @@ pub(crate) fn trim_idle_to(keep: usize) {
 pub(crate) fn trim_idle() {
     thin::trim_idle();
     let keep = if crate::residency::compact_host_ram() {
-        if crate::residency::critical_commit() { 96 } else { 192 }
+        if crate::residency::critical_commit() { 128 } else { 256 }
     } else if crate::residency::critical_commit() {
         128
     } else {

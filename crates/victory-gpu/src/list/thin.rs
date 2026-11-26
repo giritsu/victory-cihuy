@@ -299,9 +299,9 @@ impl Recording {
 
 fn backs_most_for(compact: bool, pressured: bool, critical: bool) -> usize {
     if critical {
-        if compact { 64 } else { 128 }
+        if compact { 128 } else { 128 }
     } else if pressured {
-        if compact { 128 } else { 256 }
+        if compact { 256 } else { 256 }
     } else if compact {
         256
     } else {
@@ -1008,8 +1008,8 @@ mod tests {
         assert_eq!(backs_most_for(false, true, false), 256);
         assert_eq!(backs_most_for(false, true, true), 128);
         assert_eq!(backs_most_for(true, false, false), 256);
-        assert_eq!(backs_most_for(true, true, false), 128);
-        assert_eq!(backs_most_for(true, true, true), 64);
+        assert_eq!(backs_most_for(true, true, false), 256);
+        assert_eq!(backs_most_for(true, true, true), 128);
     }
 
     #[test]

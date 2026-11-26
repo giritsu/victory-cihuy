@@ -417,6 +417,11 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
+/// Whether submissions copy card-bound updates via per-submission upload buffers (`send::own()`).
+pub(crate) fn send_own() -> bool {
+    send::own()
+}
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -446,6 +451,9 @@ fn sweep() {
     if crate::residency::pressured() {
         if crate::residency::critical_commit() || !crate::residency::compact_host_ram() {
             trim_spare_chunks();
+        }
+        if crate::residency::critical_commit() {
+            send::trim_spare();
         }
         crate::list::trim_idle();
     }
@@ -4049,6 +4057,7 @@ impl Host {
             return false;
         }
         crate::residency::allocation_error(err);
+        send::trim_spare();
         trim_spare_chunks();
         if drain_idle_lists {
             crate::list::trim_idle_to(0);
@@ -4340,7 +4349,19 @@ impl Host {
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
-        let own = if send::own() { send::take(self, &dirty) } else { None };
+        let mut own = if send::own() { send::take(self, &dirty) } else { None };
+        if own.is_none()
+            && send::own()
+            && dirty.iter().any(|(_, ranges)| !ranges.is_empty())
+        {
+            send::trim_spare();
+            trim_spare_chunks();
+            crate::pool::room(self.video_memory());
+            own = send::take(self, &dirty);
+            if own.is_none() {
+                tracing::warn!("send::take failed for dirty card copies after OOM reclaim");
+            }
+        }
         taking.end();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
@@ -4370,7 +4391,9 @@ impl Host {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
-                        if own.is_none() {
+                        if own.is_none()
+                            && let Some(staging) = staging
+                        {
                             for &(a, b) in ranges {
                                 list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
                             }

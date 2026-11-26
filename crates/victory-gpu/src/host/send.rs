@@ -22,7 +22,7 @@
 use super::*;
 use crate::shadow::Shadow;
 
-pub(super) fn own() -> bool {
+pub(crate) fn own() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
@@ -120,7 +120,13 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    if on_card() {
+        256 << 20
+    } else if crate::residency::compact_host_ram() {
+        128 << 20
+    } else {
+        768 << 20
+    }
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -167,6 +173,12 @@ pub(super) fn give_back(memory: Memory) {
     while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
         spare.remove(0);
     }
+}
+
+/// Drops spare submission-send upload buffers under critical memory pressure or OOM.
+pub(super) fn trim_spare() {
+    let freed = std::mem::take(&mut *SPARE.lock().unwrap_or_else(|e| e.into_inner()));
+    drop(freed);
 }
 
 /// Since the last frame-rate line: bytes copied, runs copied, words stored,
