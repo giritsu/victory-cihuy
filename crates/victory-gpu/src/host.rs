@@ -1952,7 +1952,7 @@ fn scratch_spare_limit(
         } else if shared_pressured {
             64 << 20
         } else {
-            192 << 20
+            256 << 20
         }
     } else if keep_freed && !limited {
         SPARE_KEPT
@@ -10786,8 +10786,8 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn scratch_spare_limit_scales_for_compact_ram_and_pressure() {
-        assert_eq!(super::scratch_spare_limit(true, true, false, false, false), 192 << 20);
-        assert_eq!(super::scratch_spare_limit(true, true, true, false, false), 192 << 20);
+        assert_eq!(super::scratch_spare_limit(true, true, false, false, false), 256 << 20);
+        assert_eq!(super::scratch_spare_limit(true, true, true, false, false), 256 << 20);
         assert_eq!(super::scratch_spare_limit(true, true, false, true, false), 64 << 20);
         assert_eq!(super::scratch_spare_limit(true, true, false, false, true), 0);
         assert_eq!(super::scratch_spare_limit(false, true, true, false, false), super::SPARE_MOST);

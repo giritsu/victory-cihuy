@@ -142,12 +142,12 @@ fn next_pressure_for(was: bool, physical: u64, commit: u64, compact: bool) -> bo
     if compact {
         // On <= 18 GiB RAM hosts, Windows keeps active working sets near physical RAM
         // while a large pagefile handles commit and WDDM NON_LOCAL is tracked separately
-        // by `next_shared_pressure`. Only signal RAM pressure on low commit or very low
-        // physical headroom.
+        // by `next_shared_pressure`. Only signal RAM pressure on low commit or critically
+        // low physical headroom.
         if was {
-            physical < 768 * MIB || commit < 4 * GIB
+            physical < 512 * MIB || commit < 4 * GIB
         } else {
-            physical <= 512 * MIB || commit <= 3 * GIB
+            physical <= 256 * MIB || commit <= 3 * GIB
         }
     } else if was {
         physical < 5 * GIB || commit < 6 * GIB
@@ -156,6 +156,7 @@ fn next_pressure_for(was: bool, physical: u64, commit: u64, compact: bool) -> bo
     }
 }
 
+#[cfg(test)]
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     next_pressure_for(was, physical, commit, false)
 }
@@ -313,14 +314,14 @@ mod tests {
     fn compact_ram_pressure_tracks_commit_and_low_physical_floor() {
         // 3 GiB physical free with ample commit does not falsely trigger on 16 GiB RAM.
         assert!(!next_pressure_for(false, 3 * GIB, 20 * GIB, true));
-        assert!(!next_pressure_for(false, 513 * MIB, 3 * GIB + 1, true));
-        // Enters on low physical (<= 512 MiB) or low commit (<= 3 GiB).
-        assert!(next_pressure_for(false, 512 * MIB, 20 * GIB, true));
+        assert!(!next_pressure_for(false, 257 * MIB, 3 * GIB + 1, true));
+        // Enters on low physical (<= 256 MiB) or low commit (<= 3 GiB).
+        assert!(next_pressure_for(false, 256 * MIB, 20 * GIB, true));
         assert!(next_pressure_for(false, 3 * GIB, 3 * GIB, true));
-        // Hysteresis keeps pressure until both physical >= 768 MiB and commit >= 4 GiB.
-        assert!(next_pressure_for(true, 700 * MIB, 20 * GIB, true));
+        // Hysteresis keeps pressure until both physical >= 512 MiB and commit >= 4 GiB.
+        assert!(next_pressure_for(true, 450 * MIB, 20 * GIB, true));
         assert!(next_pressure_for(true, 2 * GIB, 3900 * MIB, true));
-        assert!(!next_pressure_for(true, 768 * MIB, 4 * GIB, true));
+        assert!(!next_pressure_for(true, 512 * MIB, 4 * GIB, true));
     }
 
     #[test]

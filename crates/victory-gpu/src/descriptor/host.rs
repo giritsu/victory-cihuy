@@ -2832,7 +2832,7 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let kept = make_twinned(&view, views.slot(at), Some((views.slot(at + 1), true)))?;
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
@@ -2881,9 +2881,11 @@ impl HostHeap {
         self.keep(index, None);
     }
 
-    /// Where the raw twin of slot `index` is made.
-    fn twin(&self, index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
-        (index < self.twins.len() as u32).then(|| staged(self.sampler, 1).unwrap_or_else(|| self.cpu(self.raw + index)))
+    /// Where the raw twin of slot `index` is made, and whether it is CPU-staged.
+    fn twin(&self, index: u32) -> Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)> {
+        (index < self.twins.len() as u32).then(|| {
+            staged(self.sampler, 1).map_or_else(|| (self.cpu(self.raw + index), false), |slot| (slot, true))
+        })
     }
 
     /// The raw twin of slot `index` was made by this thread ([`make_twinned`]),
@@ -3075,7 +3077,7 @@ impl HostHeap {
         self.put(index);
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
-        if let Some(twin) = twin {
+        if let Some((twin, _)) = twin {
             // SAFETY: a live buffer that holds the range.
             let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -3780,7 +3782,7 @@ fn buffer_srv(
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
 ) -> Option<Kept> {
     let mut shadow = crate::shadow::find(address, len)?;
     let mut offset = shadow.offset(address);
@@ -3850,7 +3852,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    if let Some(twin) = twin {
+    if let Some((twin, staged_twin)) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -3866,7 +3868,7 @@ fn buffer_srv(
                     .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && !(staged_twin && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -3887,7 +3889,7 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
 ) -> Option<Kept> {
     let mut shadow = crate::shadow::find(address, len)?;
     let unit = {
@@ -3973,7 +3975,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    if let Some(twin) = twin {
+    if let Some((twin, staged_twin)) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
@@ -3990,7 +3992,7 @@ fn buffer_uav(
                     .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
                 shadow.buffer.GetGPUVirtualAddress() + first * 4
             };
-            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+            if by > 0 && !(staged_twin && move_raw(twin, start, count.saturating_mul(4), by)) {
                 TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 null_buffer_view(twin);
             }
@@ -4153,7 +4155,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 fn make_twinned(
     view: &View,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+    twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
 ) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
@@ -4175,7 +4177,7 @@ fn make_twinned(
             // SAFETY: slots of our heap; the range lies in the host copy.
             unsafe {
                 device.CreateConstantBufferView(Some(&desc), at);
-                if let Some(twin) = twin {
+                if let Some((twin, _)) = twin {
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
@@ -5215,6 +5217,47 @@ mod tests {
             assert_eq!(moved[12..], before[12..]);
         } else {
             assert_eq!(words(), before);
+        }
+    }
+
+    /// A raw twin built in a thread-local `ListViews` CPU descriptor heap can
+    /// be shifted with `move_raw` even though its handle is not `staged(false, 1)`.
+    #[test]
+    fn list_views_slot_moves_unaligned_raw_twin_when_supported() {
+        let (Some(host), Some(views)) = (host(), ListViews::new()) else {
+            return; // no host GPU here
+        };
+        let at = views.slot(1);
+        if let Some(staged_slot) = staged(false, 1) {
+            assert_ne!(staged_slot.ptr, at.ptr);
+        }
+        let (buffer, _) = host.shared_buffer(1 << 16).unwrap();
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 8,
+                    NumElements: 100,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: `ListViews` slot on a CPU-visible heap, live buffer.
+        let start = unsafe {
+            host.device.CreateShaderResourceView(&buffer, Some(&desc), at);
+            buffer.GetGPUVirtualAddress() + 32
+        };
+        let mut before = [0u8; 32];
+        assert!(crate::host::read_into(at.ptr as *const u8, &mut before));
+        if move_raw(at, start, 400, 8) {
+            let mut moved = [0u8; 32];
+            assert!(crate::host::read_into(at.ptr as *const u8, &mut moved));
+            assert_eq!(moved[..8], (start + 8).to_le_bytes());
+            assert_eq!(moved[8..12], 392u32.to_le_bytes());
+            assert_eq!(moved[12..], before[12..]);
         }
     }
 

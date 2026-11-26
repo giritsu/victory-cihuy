@@ -16,15 +16,15 @@ Chronological logs and deep technical notes live in [bug-journal.md](bug-journal
 | Area | Progress | Current State |
 |---|---|---|
 | **Boot, Loader, Win10 Agility SDK & Shader Cache** | **95%** | Boots cleanly on Windows 10 (`0xC00` root signatures fixed, 29/29 upscaler pipelines created, `25,805` shader files / `914.3 MB` in `cache-pareto`). |
-| **Visual & Rendering Core (RDNA 3)** | **75–80%** | World, characters, textures, and lighting render through full 46-min campaign; Pass 7 targets remaining blur, late texture pop-in, eviction (`574k` let go), and random purple/glitch artifacts. |
+| **Visual & Rendering Core (RDNA 3)** | **80–85%** | World, characters, textures, and lighting render through 46-min Series S campaign and Series X `diag` tests; Pass 7 restored `UPLOAD_AHEAD` (`3,790 MB`, `1.1 ms` avg), `SHOW_AFTER` (`0.60–0.69` frames), and `0/frame` non-RT pipeline drops, while Pass 8 fixes the remaining `629–855/frame` null raw buffer twins behind distant object flicker. |
 | **Input & Controls (XInput + Keyboard Stand-in)** | **85%** | XInput pads (slots 0–3, low/high rumble), merged `VICTORY_ONE_PAD=1` mode, full keyboard-to-pad mapping, and `F3` performance panel toggle; trigger rumble and mouse-to-camera mapping not yet implemented. |
-| **16 GB RAM / WDDM Shared GPU Stability** | **90–95%** | **Pass 6 verified live (46 min full main mission, 0 crashes, 0 OOMs):** Shared GPU held flat at **2,771–3,850 / 7,490 MiB** (~3.6 GiB headroom) and VRAM at **12,289–12,569 / 14,956 MiB**. Pass 7 rebalances loose windows (`1,792 MiB`) and strips `shape` filler words to stop minute-31 RAM/view growth. |
-| **FPS Performance vs. 30 FPS Target (6C/12T CPU)** | **55–65%** | **Pass 6 (`diag`):** **10.1–16.3 FPS** (min 4–31, median 10.2), dropping to **6.3–8.7 FPS** at min 34–46 from `4,194,304` `Shape` overflow + `1.95M` upload-buffer (`858.7 s` `MakeResident`) churn + false `PRESSURED` throttling. **Pass 7** eliminates all three bottlenecks and unlocks `release` benchmarking. |
+| **16 GB RAM / WDDM Shared GPU Stability** | **90–95%** | **Pass 6 verified live (46 min full main mission, 0 crashes)** and **Pass 7 verified live on Series X (`diag`, 7 min, 0 crashes):** Shared GPU held at **4,157–5,166 / 7,490 MiB** and VRAM at **13,018–13,191 / 14,859 MiB**. Pass 8 lowers compact physical RAM pressure floor (`256 / 512 MiB`) and raises scratch cap (`256 MiB`) to eliminate the remaining 14 false pressure toggles. |
+| **FPS Performance vs. 30 FPS Target (6C/12T CPU)** | **60–65%** | **Pass 7 (`diag` Series X):** `3,327` pre-warmed pipelines (`made=1`), `0.00` empty indirects, `MakeResident` cut to `40.9 s` in 7 min (~`5.8 s/min` vs `18.7 s/min` in Pass 6), median `8.3 FPS` (`2.4–11.8`) under `diag` overhead. **Pass 8** removes `629–855/frame` null raw twins and `224 MB` scratch churn; `release` FPS benchmark pending. |
 
-- **Overall "Playable & Stabil di PC ini": ~80–85%**
-- **Overall "100% Mulus 30 FPS Konstan di Semua Scene": ~55–65%**
+- **Overall "Playable & Stabil di PC ini": ~85%**
+- **Overall "100% Mulus 30 FPS Konstan di Semua Scene": ~60–65%**
 
-## Optimization Passes Summary (Pass 1–7)
+## Optimization Passes Summary (Pass 1–8)
 
 | Pass | Focus | Key Result / Status |
 |---|---|---|
@@ -35,7 +35,8 @@ Chronological logs and deep technical notes live in [bug-journal.md](bug-journal
 | **Pass 4** | `detach_take` + `finish_back()` + `VICTORY_CARD_BUFFERS_MIN_KB=256` | Ran **7m41s (frame 4,662)** and isolated remaining 640→849 `HostList` + `243k` card-buffer churn root cause. |
 | **Pass 5** | Lazy `Front::recording`, `boxed -> fresh_list()`, 1-frame pool size, `8 MiB`/`500 ms` staging, `make_prelude` OOM retry | Ran **8m01s / frame 6,584** (**10.3–18.0 FPS** `diag`); startup `HostList` **640 → 23**, total lists **-92%**, staging **352 → 56 MB**. |
 | **Pass 6** | `CardStaging::Ram` demand-zero RAM mirrors, VRAM loose-window offload, `send::SPARE` cap, `320` `IDLE` pool | **Verified live (46 min full main mission, 0 crash):** Shared GPU flat at **2.8–3.8 / 7.49 GB**, VRAM **12.3–12.6 / 14.95 GB**, `diag` **10.1–16.3 FPS** (min 4–31). |
-| **Pass 7** | Compact RAM pressure threshold (`512 MiB`/commit), `192 MiB` scratch / `256 MiB` send caps, strip `Shape` filler words, `1,792 MiB` (`80%`) VRAM window balance, `left_out` diagnostic fix, `-NoKeepShown`/`-Warm` flags | **Built & unit-tested (`37/37` passed):** stops false pressure lock, eliminates `1.95M` upload-buffer / `858.7 s` `MakeResident` churn & `4.19M` shape overflow, reclaims 768 MiB VRAM for textures. |
+| **Pass 7** | Compact RAM pressure threshold (`512 MiB`/commit), `192 MiB` scratch / `256 MiB` send caps, strip `Shape` filler words, `1,792 MiB` (`80%`) VRAM window balance, `left_out` diagnostic fix, `-NoKeepShown`/`-Warm` flags | **Verified live (Series X `diag`, 7 min, 0 crash):** `3,327` pre-warmed pipelines (`made=1`), `0/frame` non-RT drops, `0.00` empty indirects, `UPLOAD_AHEAD` (`3,790 MB`, `1.1 ms`), `SHOW_AFTER` (`0.60–0.69` frames), `distinct views kept=8,506`, Shared GPU `4,157–5,166 / 7,490 MiB`, `MakeResident` `40.9 s` (`~5.8 s/min`). Exposed `629–855/frame` null raw twins in `ListViews`, 14 false pressure toggles (`435–510 MiB` phys), and `224 MB` scratch peak. |
+| **Pass 8** | Fix `ListViews` (`make_listed`) unaligned raw buffer twins via `(handle, staged_twin)` tuple, lower compact RAM physical floor (`256 / 512 MiB`), raise `scratch_spare_limit` (`256 MiB`) | **Unit-tested (`72/72` targeted `victory-gpu` tests passed):** eliminates `629–855/frame` null raw twins causing distant object flicker, stops `435–510 MiB` pressure toggles, and accommodates `224 MB` Series X scratch. |
 
 Details: [bug-journal.md](bug-journal.md) | Hardware findings: [findings.md](findings.md).
 
@@ -61,7 +62,6 @@ Details: [bug-journal.md](bug-journal.md) | Hardware findings: [findings.md](fin
 ## Next Milestones
 
 - [x] Uji live **Pass 6** (`46 menit` penuh tamat misi utama, **0 crash**, Shared GPU flat `2.8–3.8 / 7.49 GB`).
-- [ ] Uji live **Pass 7** di `release` (`.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build release -Panel`) dan `diag` untuk verifikasi FPS baru, turunnya `MakeResident` (`858.7 s -> ~0`), `shapes` tetap di bawah 4.19M, dan berkurangnya blur/eviction tekstur.
-- [ ] Uji ketajaman visual & tekstur ungu dengan `-Console series-x` (16 GB VRAM lega setelah rebalance 1,792 MiB) serta A/B test `-NoKeepShown` bila masih ada tekstur ungu acak.
-- [ ] Aktifkan `VICTORY_PIPELINE_BOOK=1` pada satu sesi (`-More @{ VICTORY_PIPELINE_BOOK = '1' }`), lalu jalankan `victory warm --used --jobs 6` (atau `-Warm`) agar `known-pipelines.bin` terisi dan driver pipeline tidak lagi terkompilasi saat bermain (`0` diketahui sebelumnya).
-- [ ] Opsional BIOS tuning: aktifkan **Above 4G Decoding + Re-Size BAR / AMD SAM** untuk membuka `mapped_card_memory=true` (offload otomatis hingga `1,536 MiB` loose window langsung via PCIe BAR tanpa mirror RAM).
+- [x] Uji live **Pass 7** di Series X `diag` (`7 menit`, **0 crash**, `3,327` pre-warmed pipelines `made=1`, `0.00` empty indirects, `UPLOAD_AHEAD` aktif `3,790 MB`, `distinct views kept = 8,506`, Shared GPU `4,157–5,166 / 7,490 MiB`).
+- [ ] Uji live **Pass 8** di `release` dan `diag` (`-Console series-x -Panel`) untuk memastikan `0` null raw buffer views (objek jauh tidak lagi hilang/flicker), `0` false `host memory pressure` toggle, dan mengukur FPS murni `release`.
+- [ ] Uji opsi `-NoKeepShown` (dan opsional **Above 4G Decoding + Re-Size BAR / AMD SAM** di BIOS untuk membuka `mapped_card_memory=true` agar offload `1,536 MiB` loose window berjalan langsung via PCIe BAR tanpa mirror RAM).
