@@ -1,6 +1,6 @@
 # Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p).
 #   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-s|series-x]
-#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-Warm] [-Safe]
+#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-Warm] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
 # Note: -Console series-x is now viable to test on 16 GB VRAM for sharper visuals.
 # Run from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified.
@@ -16,6 +16,7 @@ param(
     [switch]$LevelsOnDemand,
     [switch]$InplaceProbe,
     [switch]$NoKeepShown,
+    [switch]$LearnWriteSites,
     [switch]$Warm,
     [switch]$Safe,
     [string]$LogFile = (Join-Path $env:LOCALAPPDATA 'victory\dev-run.log'),
@@ -70,7 +71,7 @@ $settings = @{
     VICTORY_SHOW_AFTER           = '1'
     VICTORY_AMBIENT              = '0.8'
     VICTORY_AMBIENT_AIR          = '1.5'
-    VICTORY_CARD_BUFFERS_MIN_KB  = '64'
+    VICTORY_CARD_BUFFERS_MIN_KB  = '256'
 }
 
 if ($Build -eq 'diag') {
@@ -84,20 +85,19 @@ if ($Build -eq 'diag') {
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'
     $settings.VICTORY_LAND_ECHO = '0'
-    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '256'
 } else {
     $settings.VICTORY_THIN = '1'
     $settings.VICTORY_JOIN_PARTS = '8'
     $settings.VICTORY_UPLOAD_AHEAD = '1'
     $settings.VICTORY_PLACED_ORDER = '1'
     $settings.VICTORY_COPY_BESIDE = '1'
-    $settings.VICTORY_STORE_BESIDE = '1'
-    $settings.VICTORY_THIN_THREADS = '6'
-    $settings.VICTORY_LAND_THREADS = '6'
-    $settings.VICTORY_WIDE_THREADS = '5'
-    $settings.VICTORY_WIDE_SPIN = '50'
-    $settings.VICTORY_VIEW_THREADS = '5'
-    $settings.VICTORY_UNDER_THREADS = '6'
+    $settings.VICTORY_WRITE_SITES = (Join-Path $env:VICTORY_CACHE_DIR 'write-sites.txt')
+    if ($LearnWriteSites) { $settings.VICTORY_STORE_BESIDE = '1' }
+    $settings.VICTORY_THIN_THREADS = '4'
+    $settings.VICTORY_LAND_THREADS = '4'
+    $settings.VICTORY_WIDE_THREADS = '4'
+    $settings.VICTORY_VIEW_THREADS = '4'
+    $settings.VICTORY_UNDER_THREADS = '4'
 }
 
 if ($Panel) { $settings.VICTORY_PANEL = '1' }

@@ -265,6 +265,14 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+fn compact_card_max_bytes(max_bytes: u64, compact: bool, explicit_max: bool) -> u64 {
+    if compact && !explicit_max {
+        max_bytes.min(1536 << 20)
+    } else {
+        max_bytes
+    }
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -283,9 +291,7 @@ fn card_limits() -> (u64, u64) {
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
             max_mb_override,
         );
-        if max_mb_override.is_none() && crate::residency::compact_host_ram() {
-            max_bytes = max_bytes.min(1024 << 20);
-        }
+        max_bytes = compact_card_max_bytes(max_bytes, crate::residency::compact_host_ram(), max_mb_override.is_some());
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
@@ -5722,6 +5728,10 @@ mod window_tests {
         assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
         assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
         assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+        assert_eq!(super::compact_card_max_bytes(2048 * MIB, true, false), 1536 * MIB);
+        assert_eq!(super::compact_card_max_bytes(512 * MIB, true, false), 512 * MIB);
+        assert_eq!(super::compact_card_max_bytes(2048 * MIB, true, true), 2048 * MIB);
+        assert_eq!(super::compact_card_max_bytes(2048 * MIB, false, false), 2048 * MIB);
     }
 
     /// An ask that may take any window takes the longest that holds all of
