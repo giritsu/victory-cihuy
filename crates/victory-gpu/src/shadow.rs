@@ -32,8 +32,8 @@ pub(crate) struct Shadow {
     landings: Mutex<Vec<u64>>,
     /// Whether any is.
     landing: std::sync::atomic::AtomicBool,
-    /// The bytes of `buffer`, once asked.
-    width: std::sync::OnceLock<u64>,
+    /// The bytes and UAV flag of `buffer`, once asked.
+    desc: std::sync::OnceLock<(u64, bool)>,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -3060,12 +3060,17 @@ pub(crate) fn let_go_idle() {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
         });
     }
+    // Retire idle windows and invalidate `ListViews` if any vanished.
+    let any_gone = !gone.is_empty();
     for shadow in gone {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
+    }
+    if any_gone {
+        crate::descriptor::host::invalidate_list_views();
     }
 }
 
@@ -3179,10 +3184,30 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    fn desc_info(&self) -> (u64, bool) {
+        *self.desc.get_or_init(|| {
+            // SAFETY: a live buffer.
+            let d = unsafe { self.buffer.GetDesc() };
+            (
+                d.Width,
+                d.Flags.0 & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0,
+            )
+        })
+    }
+
     /// The bytes of the host buffer.
     pub(crate) fn width(&self) -> u64 {
-        // SAFETY: a live buffer.
-        *self.width.get_or_init(|| unsafe { self.buffer.GetDesc() }.Width)
+        self.desc_info().0
+    }
+
+    /// Whether shaders can write the host buffer through unordered access.
+    pub(crate) fn allow_uav(&self) -> bool {
+        self.desc_info().1
+    }
+
+    /// The base GPU virtual address of `self.buffer`.
+    pub(crate) fn buffer_gpu(&self) -> u64 {
+        self.gpu.wrapping_sub(self.place.as_ref().map_or(0, |place| place.1))
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
@@ -3192,7 +3217,7 @@ impl Shadow {
         Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
-            width: Default::default(),
+            desc: Default::default(),
             buffer,
             data,
             gpu,
@@ -4998,6 +5023,7 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    crate::descriptor::host::invalidate_list_views();
     map
 }
 
@@ -5695,9 +5721,13 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if map.len() >= MANY {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
+        let before = map.len();
         map.retain(|_, (shadow, used)| {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
+        if map.len() < before {
+            crate::descriptor::host::invalidate_list_views();
+        }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));

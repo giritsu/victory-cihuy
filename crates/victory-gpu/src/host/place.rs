@@ -239,7 +239,7 @@ impl HostList {
                 }
                 STATS[2].fetch_add(1, Ordering::Relaxed);
             }
-            (None, Some((from, offset, _))) => unsafe {
+            (None, Some((from, _, offset, _))) => unsafe {
                 self.list.CopyBufferRegion(&to.buffer, at, from, *offset, len as u64);
             },
             (None, None) => return false,
@@ -254,9 +254,10 @@ impl HostList {
             src,
             len,
             shadow: to.clone(),
-            from: scratch.map(|s| s.2 as usize),
+            from: scratch.map(|s| s.3 as usize),
         }));
         deferred.placed_ranges.push((dst, dst.saturating_add(len), to));
+        self.has_placed.store(true, Ordering::Relaxed);
         deferred.title_written();
         self.changed_something();
         true
@@ -296,9 +297,9 @@ impl HostList {
     /// [`HostList::place_copy`] in this recording (and all overlapping placed
     /// writes target the same host copy), copies those bytes inline on the GPU
     /// into a reusable device-local buffer for a constant buffer view instead
-    /// of queuing a CPU `Step::Fill`.
-    pub(crate) fn constant_from_placed(&self, address: u64, size: u64) -> Option<(ID3D12Resource, u64)> {
-        if !on() || size == 0 {
+    /// of queuing a CPU `Step::Fill`. Returns `(buffer, buffer_gpu, view_gpu)`.
+    pub(crate) fn constant_from_placed(&self, address: u64, size: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        if !on() || size == 0 || !self.has_placed.load(Ordering::Relaxed) {
             return None;
         }
         let shadow = {
@@ -324,32 +325,34 @@ impl HostList {
         }
         let host = host()?;
         shadow.refresh(self, address, size);
-        let (buf, dst_offset, was_read, prev_buf) = {
+        let (buf, buffer_gpu, dst_offset, was_read, prev_buf) = {
             let mut slot = self.inline_cbv.lock().unwrap_or_else(|e| e.into_inner());
             let mut prev = None;
             let needs_new = match &*slot {
-                Some((_, cap, used, _)) => *used + aligned > *cap,
+                Some((_, _, cap, used, _)) => *used + aligned > *cap,
                 None => true,
             };
             if needs_new {
-                let prev_cap = slot.as_ref().map_or(0, |(_, cap, _, _)| *cap);
+                let prev_cap = slot.as_ref().map_or(0, |(_, _, cap, _, _)| *cap);
                 let cap = prev_cap
                     .saturating_mul(2)
                     .max(aligned)
                     .max(64 << 10)
                     .next_multiple_of(64 << 10);
                 let buffer = host.uav_buffer(cap)?;
+                // SAFETY: a live UAV buffer.
+                let buffer_gpu = unsafe { buffer.GetGPUVirtualAddress() };
                 name(&buffer, || format!("inline placed constant buffer {cap:#x}"));
-                if let Some((old, ..)) = slot.replace((buffer, cap, 0, false)) {
+                if let Some((old, ..)) = slot.replace((buffer, buffer_gpu, cap, 0, false)) {
                     prev = Some(old);
                 }
             }
-            let (buffer, _, used, in_read_state) = slot.as_mut()?;
+            let (buffer, buffer_gpu, _, used, in_read_state) = slot.as_mut()?;
             let dst_offset = *used;
             *used += aligned;
             let was_read = *in_read_state;
             *in_read_state = true;
-            (buffer.clone(), dst_offset, was_read, prev)
+            (buffer.clone(), *buffer_gpu, dst_offset, was_read, prev)
         };
         if let Some(old) = prev_buf {
             self.keep(&old);
@@ -360,7 +363,7 @@ impl HostList {
                 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0,
         );
         // SAFETY: open list, live host shadow & inline buffers, validated offsets.
-        let gpu = unsafe {
+        unsafe {
             wait_for_all(host, &self.list);
             if was_read {
                 self.list.ResourceBarrier(&[transition(&buf, CBV_READ, D3D12_RESOURCE_STATE_COPY_DEST)]);
@@ -368,10 +371,9 @@ impl HostList {
             self.list.CopyBufferRegion(&buf, dst_offset, &shadow.buffer, shadow.offset(address), size);
             self.list.ResourceBarrier(&[transition(&buf, D3D12_RESOURCE_STATE_COPY_DEST, CBV_READ)]);
             wait_for_all(host, &self.list);
-            buf.GetGPUVirtualAddress() + dst_offset
-        };
+        }
         STATS[4].fetch_add(1, Ordering::Relaxed);
-        Some((buf, gpu))
+        Some((buf, buffer_gpu, buffer_gpu + dst_offset))
     }
 }
 

@@ -326,7 +326,7 @@ pub(crate) fn sync_heaps() {
         if !before.is_empty() {
             crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
                 for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                    host.mirror(index, start + u64::from(index) * step, false);
+                    host.mirror_sync(index, start + u64::from(index) * step);
                 }
             });
         }
@@ -449,7 +449,7 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
             for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                host.mirror(index, start + u64::from(index) * step, false);
+                host.mirror_sync(index, start + u64::from(index) * step);
             }
         });
         spent[2] += since(began);
@@ -1263,6 +1263,8 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    #[cfg(windows)]
+    host::invalidate_list_views();
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -1302,6 +1304,17 @@ pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     (words[0] == VIEW_TAG).then_some(words)
+}
+
+/// Decodes an inline constant-buffer record `(address, size)` directly from
+/// its 3 record words without touching `VIEWS` or [`ListViews`].
+pub(crate) fn constant_record(words: [u32; 3]) -> Option<(u64, u32)> {
+    if words[0] == VIEW_TAG && words[2] >> KIND_SHIFT == CONSTANT {
+        if let View::Constant(address, size) = constant_of(words[1], words[2]) {
+            return Some((address, size));
+        }
+    }
+    None
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -1880,5 +1893,26 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    #[test]
+    fn constant_record_decodes_inline_cbv_and_rejects_others() {
+        if !inline() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slot = [0u64; 4];
+        let at = slot.as_ptr() as u64;
+        create_cbv(null, &[0x1234_5600, 5, 1024, 0], at);
+        let rec = record_at(at).expect("inline CBV should write VIEW_TAG record");
+        assert_eq!(constant_record(rec), Some((0x5_1234_5600, 1024)));
+
+        // Non-constant and non-view records return None.
+        let srv_slot = [0u64; 4];
+        create_srv(null, 0x4444_0000usize as This, std::ptr::null(), srv_slot.as_ptr() as u64);
+        let srv_rec = record_at(srv_slot.as_ptr() as u64).unwrap();
+        assert_eq!(constant_record(srv_rec), None);
+        assert_eq!(constant_record([0, srv_rec[1], srv_rec[2]]), None);
+        forget(0x4444_0000);
     }
 }

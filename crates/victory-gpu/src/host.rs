@@ -69,16 +69,69 @@ unsafe impl Send for Host {}
 // SAFETY: as above.
 unsafe impl Sync for Host {}
 
-/// Host objects the title let go of while a submission may still use them
-/// (a texture its descriptors name, a descriptor slot's old resource), by
-/// the submission count they wait for. The title's descriptor writes and
-/// releases reach the host at once, from its own threads, while the host
-/// runs a submission: freeing there is a GPU page fault on the freed
-/// texture (a device hang).
-static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+/// Shards holding host objects the title let go of while a submission may
+/// still use them (`host::retire`, `host::retire_resource`,
+/// `host::retire_resources`), partitioned by cache line so concurrent
+/// recording threads do not contend on one global queue or counter.
+const RETIRE_SHARDS: usize = 16;
+
+#[repr(align(64))]
+struct RetireShard {
+    queue: Mutex<std::collections::VecDeque<(u64, Retired)>>,
+    pending: std::sync::atomic::AtomicUsize,
+    immediate: std::sync::atomic::AtomicU64,
+    deferred: std::sync::atomic::AtomicU64,
+}
+
+impl RetireShard {
+    const fn new() -> Self {
+        Self {
+            queue: Mutex::new(std::collections::VecDeque::new()),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            immediate: std::sync::atomic::AtomicU64::new(0),
+            deferred: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+static RETIRED_SHARDS: [RetireShard; RETIRE_SHARDS] = [const { RetireShard::new() }; RETIRE_SHARDS];
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Returns this thread's assigned retirement shard.
+fn retire_shard() -> &'static RetireShard {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static MINE: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    }
+    let idx = MINE
+        .try_with(|mine| {
+            let mut i = mine.get();
+            if i >= RETIRE_SHARDS {
+                i = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRE_SHARDS;
+                mine.set(i);
+            }
+            i
+        })
+        .unwrap_or(0);
+    &RETIRED_SHARDS[idx]
+}
+
+fn retire_into_shards(shards: &[RetireShard], shard_idx: usize, cutoff: u64) -> Vec<(u64, Retired)> {
+    let shard = &shards[shard_idx];
+    if shard.pending.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let mut retired = shard.queue.lock().unwrap_or_else(|e| e.into_inner());
+    let n = retired.iter().take_while(|(at, _)| *at <= cutoff).count();
+    if n == 0 {
+        return Vec::new();
+    }
+    let done: Vec<(u64, Retired)> = retired.drain(..n).collect();
+    shard.pending.store(retired.len(), Ordering::Release);
+    done
+}
 
 /// A retired object, dropped on whatever thread finishes the submission.
 #[allow(dead_code)]
@@ -474,31 +527,64 @@ pub(crate) fn submissions() -> (u64, u64) {
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     // (Those the title made and the host has not begun get the next numbers.)
+    let shard = retire_shard();
     let queued = crate::queue::queued();
     let started = STARTED.load(Ordering::Acquire) + queued;
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
-        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        shard.immediate.fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
     }
-    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push_back((started, Retired::Any(Box::new(object))));
+    shard.deferred.fetch_add(1, Ordering::Relaxed);
+    let mut q = shard.queue.lock().unwrap_or_else(|e| e.into_inner());
+    q.push_back((started, Retired::Any(Box::new(object))));
+    shard.pending.store(q.len(), Ordering::Release);
 }
 
 /// [`retire`] for a resource.
 pub(crate) fn retire_resource(object: ID3D12Resource) {
+    let shard = retire_shard();
     let queued = crate::queue::queued();
     let started = STARTED.load(Ordering::Acquire) + queued;
     if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
-        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+        shard.immediate.fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
     }
-    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    shard.deferred.fetch_add(1, Ordering::Relaxed);
+    let mut q = shard.queue.lock().unwrap_or_else(|e| e.into_inner());
+    q.push_back((started, Retired::Resource(object)));
+    shard.pending.store(q.len(), Ordering::Release);
+}
+
+/// Retires a batch of resources under a single lock acquisition on this
+/// thread's retirement shard.
+pub(crate) fn retire_resources(objects: impl IntoIterator<Item = ID3D12Resource>) {
+    let mut iter = objects.into_iter().peekable();
+    if iter.peek().is_none() {
+        return;
+    }
+    let shard = retire_shard();
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        let mut count = 0u64;
+        for obj in iter {
+            count += 1;
+            drop(obj);
+        }
+        shard.immediate.fetch_add(count, Ordering::Relaxed);
+        return;
+    }
+    let mut q = shard.queue.lock().unwrap_or_else(|e| e.into_inner());
+    let mut count = 0u64;
+    for obj in iter {
+        q.push_back((started, Retired::Resource(obj)));
+        count += 1;
+    }
+    shard.pending.store(q.len(), Ordering::Release);
+    drop(q);
+    shard.deferred.fetch_add(count, Ordering::Relaxed);
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -525,21 +611,22 @@ fn bury_lag() -> u64 {
 /// numbers come in order, but for threads that overtake each other: one of
 /// those is dropped a little later than it could be.
 fn bury(finished: u64) {
-    let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
-        }
-        retired.drain(..n).collect()
-    };
-    drop(done);
+    let cutoff = finished.saturating_sub(bury_lag());
+    for i in 0..RETIRE_SHARDS {
+        let done = retire_into_shards(&RETIRED_SHARDS, i, cutoff);
+        drop(done);
+    }
 }
 
-/// Objects [`retire`] dropped at once (no submission was running) and
-/// kept until a running submission finished, since the start.
-static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+fn retirements() -> (u64, u64) {
+    let mut immediate = 0u64;
+    let mut deferred = 0u64;
+    for shard in &RETIRED_SHARDS {
+        immediate += shard.immediate.load(Ordering::Relaxed);
+        deferred += shard.deferred.load(Ordering::Relaxed);
+    }
+    (immediate, deferred)
+}
 
 /// What the layer did to the host's objects lately, newest last (sweeps
 /// that let host copies go, pipeline library calls, saves and trims): said
@@ -609,13 +696,14 @@ pub(crate) fn removal_context() -> String {
         2 => "waiting for the card to run a submission",
         _ => "copying back what a submission wrote (nothing of ours was running on the card)",
     };
+    let (retired_immediate, retired_deferred) = retirements();
     let mut text = format!(
         "the submitting thread was {phase}, of {} lists, for {:.1} ms; {}; objects let go at once {} and after a running submission {}; submissions started {} finished {}",
         SUBMITTING[1].load(Ordering::Relaxed),
         ms(SUBMITTING[2].load(Ordering::Relaxed)),
         crate::pipeline::library_removal_note(),
-        RETIREMENTS[0].load(Ordering::Relaxed),
-        RETIREMENTS[1].load(Ordering::Relaxed),
+        retired_immediate,
+        retired_deferred,
         STARTED.load(Ordering::Relaxed),
         FINISHED.load(Ordering::Relaxed),
     );
@@ -1210,8 +1298,11 @@ pub(crate) struct HostList {
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Device-local constant buffer fed inline on the GPU for draws reading
     /// ranges written by an earlier [`place`] copy in this same list:
-    /// `(buffer, capacity, used_bytes, in_read_state)`.
-    inline_cbv: Mutex<Option<(ID3D12Resource, u64, u64, bool)>>,
+    /// `(buffer, buffer_gpu, capacity, used_bytes, in_read_state)`.
+    inline_cbv: Mutex<Option<(ID3D12Resource, u64, u64, u64, bool)>>,
+    /// Lock-free hint for whether `deferred.placed_ranges` is non-empty in the
+    /// current recording.
+    has_placed: std::sync::atomic::AtomicBool,
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
@@ -1838,10 +1929,11 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping.
+/// mapping, and its base GPU virtual address.
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    gpu: u64,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -1934,12 +2026,15 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         return Some(chunk);
     }
     let (buffer, data) = host.upload_buffer(size)?;
+    // SAFETY: a live upload buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
         buffer,
         data: data as usize,
+        gpu,
     })
 }
 
@@ -4199,6 +4294,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 inline_cbv: Mutex::default(),
+                has_placed: std::sync::atomic::AtomicBool::new(false),
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
@@ -6468,9 +6564,10 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.has_placed.store(false, Ordering::Relaxed);
         if let Some(slot) = &mut *self.inline_cbv.lock().unwrap_or_else(|e| e.into_inner()) {
-            slot.2 = 0;
-            slot.3 = false;
+            slot.3 = 0;
+            slot.4 = false;
         }
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7102,31 +7199,31 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+        let (.., buffer_gpu, at, data) = self.scratch_at(len)?;
+        Some((buffer_gpu + at, data))
     }
 
-    /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
-    /// slot to hold: the slot outlives the list's use of it.
-    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
-        Some((buffer, gpu, data))
+    /// [`HostList::scratch`] and the buffer it lies in, along with the
+    /// buffer's base GPU virtual address, for a descriptor slot to hold via
+    /// [`HostHeap::constant_at_base`] without re-querying `GetGPUVirtualAddress`.
+    pub(crate) fn scratch_held_base(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
+        let (buffer, buffer_gpu, at, data) = self.scratch_at(len)?;
+        Some((buffer, buffer_gpu, buffer_gpu + at, data))
     }
 
-    /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
-    /// pointer.
-    fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    /// [`HostList::scratch`]: the buffer, its base GPU virtual address, the
+    /// offset in it, and the CPU pointer.
+    fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
+            // SAFETY: a live upload buffer.
+            let buffer_gpu = unsafe { buffer.GetGPUVirtualAddress() };
             name(&buffer, || format!("list scratch {len:#x}"));
             self.deferred().hold_upload(buffer.clone(), len);
-            return Some((buffer, 0, data));
+            return Some((buffer, buffer_gpu, 0, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -7143,10 +7240,11 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
+        let chunk = &s.chunks[s.current].0;
+        let (data, buffer_gpu, buffer) = (chunk.data, chunk.gpu, chunk.buffer.clone());
         let at = s.used;
         s.used += len;
-        Some((buffer, at, (data + at as usize) as *mut u8))
+        Some((buffer, buffer_gpu, at, (data + at as usize) as *mut u8))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -10894,6 +10992,27 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(super::should_land_inline(true, true, 39, 6));
         assert!(super::should_land_inline(false, true, 0, 6));
         assert!(super::should_land_inline(true, false, 0, 6));
+    }
+
+    #[test]
+    fn sharded_retire_drains_due_items_and_updates_pending() {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        let shards = [const { super::RetireShard::new() }; 2];
+        shards[0].queue.lock().unwrap().push_back((10, super::Retired::Any(Box::new(1u32))));
+        shards[0].queue.lock().unwrap().push_back((25, super::Retired::Any(Box::new(2u32))));
+        shards[0].pending.store(2, Release);
+        shards[1].queue.lock().unwrap().push_back((15, super::Retired::Any(Box::new(3u32))));
+        shards[1].pending.store(1, Release);
+
+        let d0 = super::retire_into_shards(&shards, 0, 18);
+        let d1 = super::retire_into_shards(&shards, 1, 18);
+        assert_eq!(d0.len(), 1);
+        assert_eq!(d1.len(), 1);
+        assert_eq!(shards[0].pending.load(Acquire), 1);
+        assert_eq!(shards[1].pending.load(Acquire), 0);
+        assert!(super::retire_into_shards(&shards, 1, 30).is_empty());
+        assert_eq!(super::retire_into_shards(&shards, 0, 30).len(), 1);
+        assert_eq!(shards[0].pending.load(Acquire), 0);
     }
 }
 

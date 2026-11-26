@@ -1179,9 +1179,11 @@ pub(crate) struct HostTexture {
     pub(crate) holds: std::sync::Arc<Holds>,
     /// Who makes its first upload (`crate::texture::ahead`).
     pub(crate) ahead: std::sync::atomic::AtomicU8,
-    /// The texture's flags (asked once: the runtime takes 100 ns to say, and
-    /// every texture of every draw is asked about).
+    /// The texture's flags, format, and mip count (asked once: avoids
+    /// repeated `GetDesc` COM calls when creating descriptor views).
     flags: u32,
+    format: i32,
+    mip_levels: u16,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -2128,6 +2130,7 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
     if went > 0 {
+        crate::descriptor::host::invalidate_list_views();
         crate::host::trail(|| {
             format!(
                 "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",
@@ -2281,11 +2284,20 @@ impl HostTexture {
         self.flags
     }
 
+    pub(crate) fn format(&self) -> i32 {
+        self.format
+    }
+
+    pub(crate) fn mip_levels(&self) -> u16 {
+        self.mip_levels
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         // SAFETY: a live texture.
-        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        let desc = unsafe { texture.GetDesc() };
+        let flags = desc.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
@@ -2300,6 +2312,8 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            format: desc.Format.0,
+            mip_levels: desc.MipLevels,
         }
     }
 
@@ -2312,7 +2326,8 @@ impl HostTexture {
     ) -> HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: a live texture.
-        let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
+        let desc = unsafe { texture.GetDesc() };
+        let flags = desc.Flags.0 as u32;
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2325,6 +2340,8 @@ impl HostTexture {
             holds: Default::default(),
             ahead: crate::texture::ahead::fresh(),
             flags,
+            format: desc.Format.0,
+            mip_levels: desc.MipLevels,
         }
     }
 }
