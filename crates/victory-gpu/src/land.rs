@@ -363,7 +363,7 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
                     if records {
                         (cpus / 3).clamp(2, 6)
                     } else {
-                        (cpus / 4).clamp(2, 4)
+                        (cpus / 3).clamp(2, 4)
                     }
                 });
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads.clamp(1, 16))

@@ -959,6 +959,7 @@ impl Bits {
     }
 
     /// Sixty-four of them.
+    #[cfg(test)]
     fn word(&self, word: usize) -> u64 {
         self.piece(word).map_or(0, |piece| piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst))
     }
@@ -1161,10 +1162,7 @@ fn known_holes() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KNOWN_HOLES").is_none_or(|v| v != "0") && light())
 }
 
-/// Whether `block` lies in a placeholder: a reservation in which pages come
-/// to be only by mapping a view (or an allocation) in its place, which an
-/// ordinary commit cannot do.
-fn placeholder(block: usize) -> bool {
+fn placeholder_end(block: usize) -> Option<usize> {
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -1203,7 +1201,16 @@ fn placeholder(block: usize) -> bool {
             std::ptr::null_mut(),
         )
     };
-    status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0
+    (status >= 0 && region.region_type & PLACEHOLDER_RESERVATION != 0)
+        .then(|| (region.allocation_base.saturating_add(region.region_size) / BLOCK).max(block + 1))
+}
+
+/// Whether `block` lies in a placeholder: a reservation in which pages come
+/// to be only by mapping a view (or an allocation) in its place, which an
+/// ordinary commit cannot do.
+#[cfg(test)]
+fn placeholder(block: usize) -> bool {
+    placeholder_end(block).is_some()
 }
 
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
@@ -1339,10 +1346,18 @@ impl Blocks {
         if first >= last {
             return true;
         }
-        for word in first / 64..last.div_ceil(64) {
-            let mask = in_word(word * 64, first, last);
-            if self.word(word) & mask != mask {
+        for piece in first / Blocks::IN_PIECE..=(last - 1) / Blocks::IN_PIECE {
+            let Some(words) = self.pieces.get(&piece) else {
                 return false;
+            };
+            let base = piece * Blocks::IN_PIECE;
+            let from = first.max(base) - base;
+            let to = last.min(base + Blocks::IN_PIECE) - base;
+            for w in from / 64..to.div_ceil(64) {
+                let mask = in_word(w * 64, from, to);
+                if words[w] & mask != mask {
+                    return false;
+                }
             }
         }
         true
@@ -1400,8 +1415,22 @@ impl Blocks {
     }
 
     fn insert_all(&mut self, blocks: std::ops::Range<usize>) {
-        for block in blocks {
-            self.insert(block);
+        let (first, last) = (blocks.start, blocks.end);
+        if first >= last {
+            return;
+        }
+        for piece in first / Blocks::IN_PIECE..=(last - 1) / Blocks::IN_PIECE {
+            let words = self.pieces.entry(piece).or_insert_with(|| Box::new([0; Blocks::WORDS]));
+            let base = piece * Blocks::IN_PIECE;
+            let from = first.max(base) - base;
+            let to = last.min(base + Blocks::IN_PIECE) - base;
+            for w in from / 64..to.div_ceil(64) {
+                let mask = in_word(w * 64, from, to);
+                let word = &mut words[w];
+                let added = (mask & !*word).count_ones() as usize;
+                *word |= mask;
+                self.count += added;
+            }
         }
     }
 
@@ -1772,6 +1801,40 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
         .all(|b| !g.clean.contains(b) && !g.absent.contains(b) && !g.protected.contains(b))
 }
 
+const _: () = assert!(Blocks::WORDS == Bits::WORDS);
+
+fn dirty_blocks_in_range(
+    clean: &Blocks,
+    absent: &Blocks,
+    beside: &Bits,
+    first: usize,
+    last: usize,
+) -> Vec<usize> {
+    if first >= last {
+        return Vec::new();
+    }
+    let mut written = Vec::new();
+    for piece in first / Blocks::IN_PIECE..=(last - 1) / Blocks::IN_PIECE {
+        let base = piece * Blocks::IN_PIECE;
+        let p_from = first.max(base) - base;
+        let p_to = last.min(base + Blocks::IN_PIECE) - base;
+        let clean_words = clean.pieces.get(&piece);
+        let absent_words = absent.pieces.get(&piece);
+        let beside_words = beside.piece(piece * Blocks::WORDS);
+        for w in p_from / 64..p_to.div_ceil(64) {
+            let c = clean_words.map_or(0, |p| p[w]);
+            let a = absent_words.map_or(0, |p| p[w]);
+            let b = beside_words.map_or(0, |p| p[w].load(std::sync::atomic::Ordering::SeqCst));
+            let known = (c & !b) | a;
+            let dirty = !known & in_word(w * 64, p_from, p_to);
+            if dirty != 0 {
+                written.extend(BitsOf(dirty).map(|bit| base + w * 64 + bit));
+            }
+        }
+    }
+    written
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
@@ -1785,61 +1848,74 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
-        && (PROTECTED.any(first, first + 1) || {
+    let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    let rest = rest();
+    let mut g = if !ask {
+        if PROTECTED.any(first, first + 1) {
+            install();
+            guards_timed()
+        } else {
             let g = guards_timed();
-            g.protected.contains(first) || g.absent.contains(first)
-        });
-    if !known && !is_view(start, end) {
-        return None;
+            if g.protected.contains(first) || g.absent.contains(first) {
+                install();
+                g
+            } else {
+                drop(g);
+                if !is_view(start, end) {
+                    return None;
+                }
+                install();
+                guards_timed()
+            }
+        }
+    } else {
+        if !is_view(start, end) {
+            return None;
+        }
+        install();
+        guards_timed()
+    };
+    if g.clean.all(first, last) && !BESIDE.any(first, last) {
+        // Nothing written, mapped or new since the range was last taken.
+        #[cfg(feature = "diagnostics")]
+        tally(3, 1);
+        return Some(Vec::new());
     }
-    install();
     // The holes that an ordinary commit may have filled, with no word of the
     // runtime's. Windows is asked with the lock not held (the range is, no
     // other thread asks about it: `ASKING`); what the runtime tells meanwhile
     // takes the block out of the set, and it is looked at as any other.
-    let unsure: Vec<usize> = {
-        let g = guards_timed();
-        if g.clean.all(first, last) && !BESIDE.any(first, last) {
-            // Nothing written, mapped or new since the range was last taken.
-            #[cfg(feature = "diagnostics")]
-            tally(3, 1);
-            return Some(Vec::new());
+    let unsure = g.absent.diff_range(&g.held, first, last);
+    if !unsure.is_empty() {
+        drop(g);
+        let mut came: Vec<(usize, bool)> = Vec::new();
+        let mut uncommitted_until = first;
+        for block in unsure {
+            // One question for the blocks of a region.
+            if block >= uncommitted_until {
+                uncommitted_until = uncommitted_end(block);
+                #[cfg(feature = "diagnostics")]
+                tally(9, 1);
+            }
+            if block >= uncommitted_until {
+                // The hole may have been given up, and its address be the
+                // title's heap's, or code's, now: not ours to guard.
+                came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
+            }
         }
-        g.absent.diff_range(&g.held, first, last)
-    };
-    let mut came: Vec<(usize, bool)> = Vec::new();
-    let mut uncommitted_until = first;
-    for block in unsure {
-        // One question for the blocks of a region.
-        if block >= uncommitted_until {
-            uncommitted_until = uncommitted_end(block);
-            #[cfg(feature = "diagnostics")]
-            tally(9, 1);
-        }
-        if block >= uncommitted_until {
-            // The hole may have been given up, and its address be the
-            // title's heap's, or code's, now: not ours to guard.
-            came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
+        g = guards_timed();
+        for &(block, view) in &came {
+            if g.absent.remove(block) && !view {
+                g.foreign.insert(block);
+            }
         }
     }
-    let rest = rest();
-    let mut g = guards_timed();
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
-    for &(block, view) in &came {
-        if g.absent.remove(block) && !view {
-            g.foreign.insert(block);
-        }
-    }
     // The range's blocks that are neither clean nor known to be holes. A
     // frame asks about some 10 GB of view memory, 150,000 blocks, nearly all
     // clean.
-    let mut written = Vec::new();
-    for word in first / 64..last.div_ceil(64) {
-        let known = g.clean.word(word) & !BESIDE.word(word) | g.absent.word(word);
-        written.extend(BitsOf(!known & in_word(word * 64, first, last)).map(|bit| word * 64 + bit));
-    }
+    let written = dirty_blocks_in_range(&g.clean, &g.absent, &BESIDE, first, last);
     let mut run: Option<(usize, usize)> = None;
     for &block in &written {
         if let Some((from, to)) = run
@@ -2067,23 +2143,42 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         return;
     }
     let mut uncommitted_until = from;
-    for block in from..to {
+    let mut block = from;
+    while block < to {
         // (Not one question a block of a region that is not there.)
         if block >= uncommitted_until && set(block, block + 1) {
             note(g, block, block + 1);
+            block += 1;
             continue;
         }
-        PROTECTED.clear(block);
         if block >= uncommitted_until {
             uncommitted_until = uncommitted_end(block);
             #[cfg(feature = "diagnostics")]
             tally(9, 1);
         }
         if block < uncommitted_until {
-            g.absent.insert(block);
-            if known_holes() && placeholder(block) {
-                g.held.insert(block);
+            let run_end = uncommitted_until.min(to);
+            let held_end = if known_holes() {
+                placeholder_end(block).map_or(block, |end| end.min(run_end))
+            } else {
+                block
+            };
+            let next_block = if held_end > block && held_end < run_end {
+                held_end
+            } else {
+                run_end
+            };
+            for b in block..next_block {
+                PROTECTED.clear(b);
             }
+            g.absent.insert_all(block..next_block);
+            if held_end > block {
+                g.held.insert_all(block..held_end);
+            }
+            block = next_block;
+        } else {
+            PROTECTED.clear(block);
+            block += 1;
         }
     }
 }
@@ -4610,5 +4705,48 @@ mod many_askers_tests {
         assert!(written.iter().any(|&(page, _)| page == p / PAGE));
         // SAFETY: `VirtualAlloc` base from above.
         unsafe { windows_sys::Win32::System::Memory::VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn blocks_insert_all_and_piecewise_dirty_scan_match_wordwise() {
+        let mut clean = super::Blocks::new();
+        let mut absent = super::Blocks::new();
+        static BESIDE: super::Bits = super::Bits::new();
+
+        let spans = [
+            0..0,
+            60..135,
+            120..260,
+            super::Blocks::IN_PIECE - 5..super::Blocks::IN_PIECE + 12,
+        ];
+        let mut naive_set = std::collections::BTreeSet::new();
+        for span in spans {
+            clean.insert_all(span.clone());
+            for blk in span {
+                naive_set.insert(blk);
+            }
+        }
+        assert_eq!(clean.len(), naive_set.len());
+        assert!(clean.all(60, 260));
+        assert!(clean.all(super::Blocks::IN_PIECE - 5, super::Blocks::IN_PIECE + 12));
+        assert!(!clean.all(super::Blocks::IN_PIECE - 6, super::Blocks::IN_PIECE + 12));
+
+        absent.insert_all(250..super::Blocks::IN_PIECE - 2);
+        for blk in [70usize, 130, super::Blocks::IN_PIECE + 3] {
+            BESIDE.set(blk);
+        }
+
+        let first = 50usize;
+        let last = super::Blocks::IN_PIECE + 20;
+        let got = super::dirty_blocks_in_range(&clean, &absent, &BESIDE, first, last);
+        let mut expected = Vec::new();
+        for word in first / 64..last.div_ceil(64) {
+            let known = clean.word(word) & !BESIDE.word(word) | absent.word(word);
+            expected.extend(
+                super::BitsOf(!known & super::in_word(word * 64, first, last)).map(|bit| word * 64 + bit),
+            );
+        }
+        assert_eq!(got, expected);
+        assert!(super::dirty_blocks_in_range(&clean, &absent, &BESIDE, 100, 100).is_empty());
     }
 }

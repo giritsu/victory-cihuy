@@ -1301,23 +1301,24 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
 #[cfg(windows)]
 pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
-    if first == 0 || !held_only() {
-        return placed_bytes(desc);
-    }
+    let level = if held_only() { first } else { 0 };
     type Known = std::collections::HashMap<([u32; 14], u32), Option<u64>>;
     thread_local! {
         static KNOWN: std::cell::RefCell<Known> = std::cell::RefCell::default();
     }
     KNOWN.with(|known| {
-        *known.borrow_mut().entry((*desc, first)).or_insert_with(|| {
+        *known.borrow_mut().entry((*desc, level)).or_insert_with(|| {
             let whole = placed_bytes(desc)?;
+            if level == 0 {
+                return Some(whole);
+            }
             // SAFETY: 56 bytes in the description's layout.
             let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
             let Some(t) = texture_layout(&d).filter(|t| t.planes.len() == 1) else {
                 return Some(whole);
             };
             let layout = &t.planes[0].layout;
-            Some(layout.bytes_from(read_from(layout, first)).min(whole))
+            Some(layout.bytes_from(read_from(layout, level)).min(whole))
         })
     })
 }

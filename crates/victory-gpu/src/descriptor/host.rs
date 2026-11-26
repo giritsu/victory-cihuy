@@ -3274,16 +3274,14 @@ impl HostHeap {
     /// The slots that have waited long enough at `frame`
     /// ([`HostHeap::copied_wait`]), filtered before sorting to exclude
     /// slots already read through a draw's table, each once, plus the count skipped.
+    /// Overdue batches (`written + COPIED_GRACE < frame`) drain completely; just-due
+    /// batches are paced to `COPIED_BEFORE_PACE` per round to prevent Frame-Start spikes.
     pub(crate) fn copied_before(&self, frame: u64) -> (Vec<u32>, u64) {
+        const COPIED_BEFORE_PACE: usize = 512;
         let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-        let mut batches = Vec::new();
-        while waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame) {
-            if let Some((_, slots)) = waiting.pop_front() {
-                batches.push(slots);
-            }
-        }
-        drop(waiting);
-        partition_copied_before(batches, |index| self.copied_tabled(index, frame))
+        drain_copied_before(&mut waiting, frame, COPIED_GRACE, COPIED_BEFORE_PACE, |index| {
+            self.copied_tabled(index, frame)
+        })
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -4760,7 +4758,56 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
+/// Drains due `waiting` batches: flushes overdue (`written + grace < frame`) completely,
+/// paces just-due (`written + grace == frame`) to at most `pace` un-tabled slots per round,
+/// and leaves unconsumed/future slots at the front of `waiting`.
+fn drain_copied_before(
+    waiting: &mut std::collections::VecDeque<(u64, Vec<u32>)>,
+    frame: u64,
+    grace: u64,
+    pace: usize,
+    is_tabled: impl Fn(u32) -> bool,
+) -> (Vec<u32>, u64) {
+    let mut out = Vec::new();
+    let mut skipped_tabled = 0u64;
+    while waiting.front().is_some_and(|(written, _)| written + grace < frame) {
+        if let Some((_, slots)) = waiting.pop_front() {
+            for index in slots {
+                if is_tabled(index) {
+                    skipped_tabled += 1;
+                } else {
+                    out.push(index);
+                }
+            }
+        }
+    }
+    while out.len() < pace && waiting.front().is_some_and(|(written, _)| written + grace == frame) {
+        let Some((written, slots)) = waiting.pop_front() else {
+            break;
+        };
+        let mut iter = slots.into_iter();
+        for index in &mut iter {
+            if is_tabled(index) {
+                skipped_tabled += 1;
+            } else {
+                out.push(index);
+                if out.len() >= pace {
+                    break;
+                }
+            }
+        }
+        let rest: Vec<u32> = iter.collect();
+        if !rest.is_empty() {
+            waiting.push_front((written, rest));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    (out, skipped_tabled)
+}
+
 /// Filters out `tabled` slots before sorting and deduplicating queued slots.
+#[cfg(test)]
 fn partition_copied_before(batches: Vec<Vec<u32>>, is_tabled: impl Fn(u32) -> bool) -> (Vec<u32>, u64) {
     let mut out = Vec::new();
     let mut skipped_tabled = 0u64;
@@ -5468,6 +5515,29 @@ mod tests {
         let (remaining, skipped) = partition_copied_before(batches, |slot| slot == 2 || slot == 8);
         assert_eq!(skipped, 4);
         assert_eq!(remaining, vec![1, 3, 5, 9]);
+    }
+
+    #[test]
+    fn drain_copied_before_paces_just_due_and_flushes_overdue() {
+        let mut q = std::collections::VecDeque::from([
+            (1u64, vec![10, 11, 99, 12]), // overdue at frame=6, grace=4 -> flush all even > pace=2
+            (2u64, vec![20, 99, 21, 22, 23]), // just-due at frame=6, grace=4 -> paused cleanly
+            (3u64, vec![30]), // future at frame=6 -> untouched
+        ]);
+        let (batch1, skip1) = super::drain_copied_before(&mut q, 6, 4, 2, |s| s == 99);
+        assert_eq!(batch1, vec![10, 11, 12]);
+        assert_eq!(skip1, 1);
+        assert_eq!(q.front().map(|x| x.0), Some(2));
+
+        let (batch2, skip2) = super::drain_copied_before(&mut q, 6, 4, 2, |s| s == 99);
+        assert_eq!(batch2, vec![20, 21]);
+        assert_eq!(skip2, 1);
+        assert_eq!(q, std::collections::VecDeque::from([(2, vec![22, 23]), (3, vec![30])]));
+
+        let (batch3, skip3) = super::drain_copied_before(&mut q, 6, 4, 2, |s| s == 99);
+        assert_eq!(batch3, vec![22, 23]);
+        assert_eq!(skip3, 0);
+        assert_eq!(q, std::collections::VecDeque::from([(3, vec![30])]));
     }
 
     #[test]

@@ -497,7 +497,7 @@ const SYNC_PAGES: usize = 8;
 
 /// Records [`sync_heaps`] gives a thread at a time.
 #[cfg(windows)]
-const SYNC_AT_A_TIME: usize = 256;
+const SYNC_AT_A_TIME: usize = 64;
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was

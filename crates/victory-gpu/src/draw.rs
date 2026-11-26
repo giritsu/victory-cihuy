@@ -899,6 +899,8 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         ranges.forget_part(part, parts);
         let mut slots = host.buffer_slots_of(part, parts);
         slots.extend(changed);
+        slots.sort_unstable();
+        slots.dedup();
         slots
     } else {
         changed
@@ -939,7 +941,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         Some(((shadow, address, address + len), written))
     };
     // Some slots at a time, on several threads.
-    const AT_A_TIME: usize = 256;
+    const AT_A_TIME: usize = 64;
     let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
     let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
     crate::land::each_view(false, parts.len(), &|n| {

@@ -863,6 +863,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 
 /// Copies of memory (from, to, bytes: apart), on several threads if they are
 /// many.
+#[allow(dead_code)]
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
     if bytes > 4 << 20 {
