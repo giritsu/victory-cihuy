@@ -266,11 +266,20 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
     let mut taken_count = 0usize;
     let (mut read, mut written) = (Vec::new(), Vec::new());
     let mut more = Vec::new();
+    let mut has_copies = false;
+    let mut has_placed = false;
     for (i, d) in does.iter().enumerate() {
         match *d {
             Does::Run => return Err("a step of ours runs"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
-            Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
+            Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => {
+                if matches!(*d, Does::Copy { .. }) {
+                    has_copies = true;
+                }
+                more.push(i);
+            }
+            Does::Copy { .. } => has_copies = true,
+            Does::Placed { .. } => has_placed = true,
             _ => {}
         }
     }
@@ -288,46 +297,71 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
                 if w.0 < w.1 && meet(r, w) {
                     return Err("a copy onto itself");
                 }
-                reads.push(r);
-                writes.push(w);
+                if has_copies || has_placed {
+                    reads.push(r);
+                }
+                if w.0 < w.1 {
+                    writes.push(w);
+                }
             }
         }
-        join_ranges(&mut read, reads);
-        if writes.iter().any(|w| w.0 < w.1) {
+        if !reads.is_empty() {
+            join_ranges(&mut read, reads);
+        }
+        if !writes.is_empty() {
             join_ranges(&mut written, writes);
         }
         if taken_count > MOST {
             return Err("too many steps depend on it");
         }
-        for (i, d) in does.iter().enumerate() {
-            // A fill that cannot be taken is looked at below.
-            if taken[i] || matches!(d, Does::Fill { to: false, .. }) {
-                continue;
+        if !has_copies {
+            break;
+        }
+        if written.is_empty() {
+            for (i, d) in does.iter().enumerate() {
+                if !taken[i]
+                    && let Does::Copy { dst, len, .. } = *d
+                    && touched(&read, (dst, dst + len))
+                {
+                    more.push(i);
+                }
             }
-            if let Some((r, w)) = reads_writes(d)
-                && (touched(&written, r) || touched(&written, w) || touched(&read, w))
-            {
-                more.push(i);
+        } else {
+            for (i, d) in does.iter().enumerate() {
+                // A fill that cannot be taken is looked at below.
+                if taken[i] || matches!(d, Does::Fill { to: false, .. }) {
+                    continue;
+                }
+                if let Some((r, w)) = reads_writes(d)
+                    && (touched(&written, r) || touched(&written, w) || touched(&read, w))
+                {
+                    more.push(i);
+                }
             }
         }
     }
     // A copy at its place in a list comes after what is done in front of all
     // of them: as it should after the steps ahead of it, but not after those
     // behind it that read or write its bytes.
-    for (p, d) in does.iter().enumerate() {
-        if let Does::Placed { dst, src, len } = *d
-            && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
-        {
-            let (to, from) = ((dst, dst + len), (src, src + len));
-            let in_the_way = |i: usize| {
-                reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
-            };
-            let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
-            *behind = found.map(|i| (p, i));
-            if !by_order || found.is_some() {
-                return Err(BEHIND_PLACED);
+    if has_placed {
+        for (p, d) in does.iter().enumerate() {
+            if let Does::Placed { dst, src, len } = *d
+                && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
+            {
+                let (to, from) = ((dst, dst + len), (src, src + len));
+                let in_the_way = |i: usize| {
+                    reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
+                };
+                let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
+                *behind = found.map(|i| (p, i));
+                if !by_order || found.is_some() {
+                    return Err(BEHIND_PLACED);
+                }
             }
         }
+    }
+    if written.is_empty() {
+        return Ok((0..does.len()).filter(|&i| taken[i]).map(|i| (i, 0)).collect());
     }
     let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
     // What stays on the CPU and reads what an earlier taken copy writes
@@ -397,6 +431,173 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
         Does::Refresh { shadow: s, from: a, to: b } => s != shadow && meet((a, b), (from, to)),
         _ => false,
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum IntervalHit<T> {
+    One(T),
+    Conflict(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexedSpan<T> {
+    from: usize,
+    to: usize,
+    hit: IntervalHit<T>,
+}
+
+fn build_interval_spans<T: Clone + Eq>(
+    writers: &[(usize, usize, Option<(T, u64, u64, bool)>)],
+) -> Vec<IndexedSpan<T>> {
+    let mut points: Vec<usize> = Vec::with_capacity(writers.len() * 2);
+    for (from, to, target) in writers {
+        if *from < *to {
+            points.push(*from);
+            points.push(*to);
+            if let Some((_, start, len, false)) = target {
+                let end = start.saturating_add(*len);
+                let s0 = usize::try_from(*start).unwrap_or(usize::MAX);
+                let s1 = usize::try_from(end).unwrap_or(usize::MAX);
+                if *from < s0 && s0 < *to {
+                    points.push(s0);
+                }
+                if *from < s1 && s1 < *to {
+                    points.push(s1);
+                }
+            }
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+    let mut spans: Vec<IndexedSpan<T>> = Vec::with_capacity(points.len().saturating_sub(1));
+    for win in points.windows(2) {
+        let (a, b) = (win[0], win[1]);
+        let mut found: Option<(&T, u64, u64, bool)> = None;
+        let mut conflict: Option<&'static str> = None;
+        for (wf, wt, target) in writers {
+            if !(*wf < b && a < *wt) {
+                continue;
+            }
+            match (target, &found) {
+                (None, _) => {
+                    conflict = Some("a read-back or a value behind a flight is written there");
+                    break;
+                }
+                (Some((s, _, _, _)), Some((f, _, _, _))) if s != *f => {
+                    conflict = Some("flights write it through two host copies");
+                    break;
+                }
+                (Some((s, start, len, in_place)), None) => {
+                    found = Some((s, *start, *len, *in_place));
+                }
+                _ => {}
+            }
+        }
+        let hit = if let Some(msg) = conflict {
+            IntervalHit::Conflict(msg)
+        } else if let Some((s, start, len, in_place)) = found {
+            if in_place || (a as u64) < start || (b as u64) > start + len {
+                IntervalHit::Conflict("no host copy holds all of it")
+            } else {
+                IntervalHit::One(s.clone())
+            }
+        } else {
+            continue;
+        };
+        if let Some(last) = spans.last_mut()
+            && last.to == a
+            && last.hit == hit
+        {
+            last.to = b;
+        } else {
+            spans.push(IndexedSpan { from: a, to: b, hit });
+        }
+    }
+    spans
+}
+
+fn lookup_interval_spans<'a, T>(
+    spans: &'a [IndexedSpan<T>],
+    from: usize,
+    to: usize,
+) -> Option<(usize, usize, Result<&'a T, &'static str>)> {
+    let idx = spans.partition_point(|s| s.from <= from);
+    let span = idx.checked_sub(1).and_then(|i| spans.get(i))?;
+    if to <= span.to {
+        let res = match &span.hit {
+            IntervalHit::One(v) => Ok(v),
+            IntervalHit::Conflict(msg) => Err(*msg),
+        };
+        Some((span.from, span.to, res))
+    } else {
+        None
+    }
+}
+
+#[derive(Clone)]
+struct ShadowKey(Arc<Shadow>);
+
+impl PartialEq for ShadowKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ShadowKey {}
+
+/// Disjoint partition of `writers` intervals for O(log N) + MRU [`holder`] lookups.
+struct WriterIndex {
+    spans: Vec<IndexedSpan<ShadowKey>>,
+    last: Option<(usize, usize, Arc<Shadow>)>,
+    last_miss: Option<(usize, usize, Arc<Shadow>)>,
+}
+
+impl WriterIndex {
+    fn build(writers: &[Writer]) -> Self {
+        let raw: Vec<(usize, usize, Option<(ShadowKey, u64, u64, bool)>)> = writers
+            .iter()
+            .map(|w| {
+                let target = w.shadow.as_ref().map(|s| {
+                    let (start, len) = s.span();
+                    (ShadowKey(s.clone()), start, len, s.in_place())
+                });
+                (w.from, w.to, target)
+            })
+            .collect();
+        Self {
+            spans: build_interval_spans(&raw),
+            last: None,
+            last_miss: None,
+        }
+    }
+
+    fn lookup(&mut self, writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+        if let Some((a, b, s)) = &self.last
+            && *a <= from
+            && to <= *b
+        {
+            return Ok(s.clone());
+        }
+        if let Some((sf, st, res)) = lookup_interval_spans(&self.spans, from, to) {
+            return match res {
+                Ok(key) => {
+                    let s = key.0.clone();
+                    self.last = Some((sf, st, s.clone()));
+                    Ok(s)
+                }
+                Err(msg) => Err(msg),
+            };
+        }
+        if let Some((mf, mt, s)) = &self.last_miss
+            && *mf == from
+            && *mt == to
+        {
+            return Ok(s.clone());
+        }
+        let s = holder(writers, from, to)?;
+        self.last_miss = Some((from, to, s.clone()));
+        Ok(s)
+    }
 }
 
 /// The host copy that holds `[from, to)` on the card once what `writers`
@@ -514,20 +715,37 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     (step_lists[reader] >= cut).then_some(cut)
 }
 
+/// Per-submission cache of mapped 4 KiB pages checked via `read_into`.
+struct MappedCache {
+    last: usize,
+    pages: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
+}
+
+impl MappedCache {
+    fn new() -> Self {
+        Self {
+            last: usize::MAX,
+            pages: Default::default(),
+        }
+    }
+}
+
 /// Whether every page of `[from, to)` can be read (through the kernel:
 /// asking Windows walks the page tables, milliseconds in the title's heap).
 /// `known`: pages that could be, of the same submission: its fills' places
 /// lie eight to a page, and each was read whole to find out.
-fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
+fn mapped(from: usize, to: usize, known: &mut MappedCache) -> bool {
     const PAGE: usize = 4096;
     (from / PAGE..to.div_ceil(PAGE)).all(|page| {
-        known.contains_key(&page) || {
-            let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
-            if there {
-                known.insert(page, ());
-            }
-            there
+        if page == known.last || known.pages.contains(&page) {
+            return true;
         }
+        let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
+        if there {
+            known.last = page;
+            known.pages.insert(page);
+        }
+        there
     })
 }
 
@@ -755,14 +973,12 @@ impl Host {
             }));
             all
         };
+        let mut writer_index = WriterIndex::build(&writers);
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
         let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
-        // Some 2,800 fills a frame, of a few hundred places: what holds each
-        // is looked for once, as long as no copy is added to the writers.
-        let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = HashMap::default();
+        let mut room = MappedCache::new();
         let mut end = 0u64;
         for (pos, &(i, level)) in chosen.iter().enumerate() {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
@@ -774,14 +990,7 @@ impl Host {
             if len == 0 {
                 return Err("nothing to read");
             }
-            let from = match held.get(&(src, len)) {
-                Some(from) => from.clone(),
-                None => {
-                    let from = holder(&writers, src, src + len)?;
-                    held.insert((src, len), from.clone());
-                    from
-                }
-            };
+            let from = writer_index.lookup(&writers, src, src + len)?;
             let place = (Arc::as_ptr(&from) as usize, src, len, level);
             let at = match places.get(&place) {
                 Some(&at) => at,
@@ -800,7 +1009,7 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
+                    let to = writer_index.lookup(&writers, dst, dst + len)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
@@ -815,7 +1024,7 @@ impl Host {
                         to: dst + len,
                         copy: true,
                     });
-                    held.clear();
+                    writer_index = WriterIndex::build(&writers);
                     To::Copy(to, dst)
                 }
                 _ => match fill_tos[pos].take() {
@@ -1403,5 +1612,39 @@ mod tests {
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
+    }
+
+    #[test]
+    fn interval_spans_partition_matches_conflicts_and_merges() {
+        let writers = vec![
+            (100, 300, Some((1u32, 100u64, 300u64, false))),
+            (200, 400, Some((1u32, 100u64, 300u64, false))),
+            (350, 450, Some((2u32, 350u64, 150u64, false))),
+            (500, 600, None),
+            (700, 800, Some((3u32, 700u64, 100u64, true))),
+            (900, 1000, Some((4u32, 920u64, 80u64, false))),
+        ];
+        let spans = build_interval_spans(&writers);
+        assert_eq!(lookup_interval_spans(&spans, 100, 350).map(|(_, _, r)| r), Some(Ok(&1)));
+        assert_eq!(
+            lookup_interval_spans(&spans, 360, 390).map(|(_, _, r)| r),
+            Some(Err("flights write it through two host copies"))
+        );
+        assert_eq!(lookup_interval_spans(&spans, 400, 450).map(|(_, _, r)| r), Some(Ok(&2)));
+        assert_eq!(
+            lookup_interval_spans(&spans, 520, 560).map(|(_, _, r)| r),
+            Some(Err("a read-back or a value behind a flight is written there"))
+        );
+        assert_eq!(
+            lookup_interval_spans(&spans, 710, 750).map(|(_, _, r)| r),
+            Some(Err("no host copy holds all of it"))
+        );
+        assert_eq!(
+            lookup_interval_spans(&spans, 900, 910).map(|(_, _, r)| r),
+            Some(Err("no host copy holds all of it"))
+        );
+        assert_eq!(lookup_interval_spans(&spans, 920, 1000).map(|(_, _, r)| r), Some(Ok(&4)));
+        assert!(lookup_interval_spans(&spans, 620, 650).is_none());
+        assert!(lookup_interval_spans(&spans, 390, 410).is_none());
     }
 }

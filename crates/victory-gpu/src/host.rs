@@ -7846,6 +7846,62 @@ fn refresh_front() -> bool {
     ahead_of_writes() && (joins_asked().0 > 1 || *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_FRONT")))
 }
 
+struct FrontSpans {
+    at: ByCopy<usize>,
+    spans: Vec<(usize, usize, usize)>,
+    given: Vec<u32>,
+    part: u32,
+    last: usize,
+}
+
+impl FrontSpans {
+    fn new() -> Self {
+        Self {
+            at: ByCopy::default(),
+            spans: Vec::new(),
+            given: Vec::new(),
+            part: 1,
+            last: usize::MAX,
+        }
+    }
+
+    fn push_refresh(&mut self, copy: usize, from: usize, to: usize) {
+        // (Most come several times on end.)
+        let i = if self.spans.get(self.last).is_some_and(|s| s.0 == copy) {
+            self.last
+        } else {
+            *self.at.entry(copy).or_insert_with(|| {
+                self.spans.push((copy, usize::MAX, 0));
+                self.given.push(0);
+                self.spans.len() - 1
+            })
+        };
+        self.last = i;
+        if self.given[i] != self.part {
+            let span = &mut self.spans[i];
+            (span.1, span.2) = (span.1.min(from), span.2.max(to));
+        }
+    }
+
+    fn push_write(&mut self, copy: usize) {
+        let i = *self.at.entry(copy).or_insert_with(|| {
+            self.spans.push((copy, usize::MAX, 0));
+            self.given.push(0);
+            self.spans.len() - 1
+        });
+        self.given[i] = self.part;
+    }
+
+    fn push_part(&mut self) {
+        self.part += 1;
+    }
+
+    fn finish(mut self) -> Vec<(usize, usize, usize)> {
+        self.spans.retain(|s| s.1 < s.2);
+        self.spans
+    }
+}
+
 /// Per copy what is refreshed in front of a submission's steps, as
 /// [`written_spans`]'s but of all copies, up to the copy's first write by
 /// shaders in each part of the submission (`Touch::Part`: another begins).
@@ -7853,45 +7909,16 @@ fn refresh_front() -> bool {
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    let mut at: ByCopy<usize> = ByCopy::default();
-    // (Copy, from, to), in the order they come, and the part that gave it to
-    // shaders last.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    let mut given: Vec<u32> = Vec::new();
-    let (mut part, mut last) = (1, usize::MAX);
+    let mut front = FrontSpans::new();
     for step in steps {
         match step {
-            Touch::Refresh(copy, from, to) => {
-                // (Most come several times on end.)
-                let i = if spans.get(last).is_some_and(|s| s.0 == copy) {
-                    last
-                } else {
-                    *at.entry(copy).or_insert_with(|| {
-                        spans.push((copy, usize::MAX, 0));
-                        given.push(0);
-                        spans.len() - 1
-                    })
-                };
-                last = i;
-                if given[i] != part {
-                    let span = &mut spans[i];
-                    (span.1, span.2) = (span.1.min(from), span.2.max(to));
-                }
-            }
-            Touch::Write(copy) => {
-                let i = *at.entry(copy).or_insert_with(|| {
-                    spans.push((copy, usize::MAX, 0));
-                    given.push(0);
-                    spans.len() - 1
-                });
-                given[i] = part;
-            }
-            Touch::Part => part += 1,
+            Touch::Refresh(copy, from, to) => front.push_refresh(copy, from, to),
+            Touch::Write(copy) => front.push_write(copy),
+            Touch::Part => front.push_part(),
             Touch::Title | Touch::Nothing => {}
         }
     }
-    spans.retain(|s| s.1 < s.2);
-    spans
+    front.finish()
 }
 
 /// What a step is to the copies' refreshes, for [`written_spans`].
@@ -8114,10 +8141,10 @@ impl Batch {
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut due = Vec::new();
-        let mut touches = Vec::new();
+        let mut front = FrontSpans::new();
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
-                touches.push(Touch::Part);
+                front.push_part();
             }
             let mut last = 0;
             for step in &list.deferred().copies {
@@ -8128,9 +8155,9 @@ impl Batch {
                             copies.entry(key).or_insert_with(|| shadow.clone());
                             last = key;
                         }
-                        touches.push(Touch::Refresh(key, *at, *at + *len));
+                        front.push_refresh(key, *at, *at + *len);
                     }
-                    Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
+                    Step::GpuWrite(shadow, ..) => front.push_write(std::sync::Arc::as_ptr(shadow) as usize),
                     Step::Texture(staging) if wide_textures() => {
                         if self.texture_due(staging) {
                             due.push(staging.clone());
@@ -8140,7 +8167,8 @@ impl Batch {
                 }
             }
         }
-        let spans: Vec<_> = front_spans(touches.into_iter())
+        let spans: Vec<_> = front
+            .finish()
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
@@ -8178,7 +8206,7 @@ impl Batch {
         crate::shadow::wide_each_chunked(
             due.len(),
             spans.len(),
-            if many { 16 } else { 1 },
+            if many { 32 } else { 1 },
             move |i| due[i].refresh(),
             move |from, to| {
                 for (shadow, a, b) in &spans[from..to] {
@@ -8330,8 +8358,8 @@ impl Batch {
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy (`ask_once` already covers the whole submission).
+        let ahead = self.refreshes.len() > 1 && crate::watch::ask_ahead_needed();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
@@ -8352,17 +8380,24 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
-                // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
-                    let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        return;
-                    }
-                    Self::update(shadow, *from, *to);
-                });
+                let many = refreshes.len() > FEW;
+                crate::shadow::wide_each_chunked(
+                    0,
+                    refreshes.len(),
+                    if many { 32 } else { 4 },
+                    |_| {},
+                    move |from, to| {
+                        for (shadow, a, b) in &refreshes[from..to] {
+                            if many && shadow.nothing_new(*a, *b - *a) {
+                                #[cfg(feature = "diagnostics")]
+                                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            Self::update(shadow, *a, *b);
+                        }
+                    },
+                );
             } else {
                 let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                     .refreshes

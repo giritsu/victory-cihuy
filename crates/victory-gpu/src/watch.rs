@@ -315,6 +315,31 @@ pub(crate) fn ask_ahead_needed() -> bool {
     !JOURNAL_KEPT.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Coalesces `spans` in place into sorted disjoint `[from, to)` intervals.
+fn merge_spans(spans: &mut Vec<(usize, usize)>) {
+    if spans.len() <= 1 {
+        return;
+    }
+    spans.sort_unstable();
+    let mut write = 0;
+    for i in 1..spans.len() {
+        let (a, b) = spans[i];
+        if a <= spans[write].1 {
+            spans[write].1 = spans[write].1.max(b);
+        } else {
+            write += 1;
+            spans[write] = (a, b);
+        }
+    }
+    spans.truncate(write + 1);
+}
+
+/// Whether sorted merged `spans` contain a span covering `[first, last)`.
+fn spans_cover(spans: &[(usize, usize)], first: usize, last: usize) -> bool {
+    let idx = spans.partition_point(|&(a, _)| a <= first);
+    idx > 0 && spans[idx - 1].1 >= last
+}
+
 /// Asks Windows' write watch once for all `ranges`, then [`writes`] tells from
 /// the journal without asking the kernel again, until [`ask_ahead_done`].
 ///
@@ -330,11 +355,16 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     if !ask_ahead_needed() {
         return;
     }
+    let light = light();
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
-        // Not view memory known by its bits: the kernel would refuse the
-        // asking (and, asked together with others, theirs).
-        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        // Not view memory known by its bits or guarded read-only: the kernel
+        // would refuse the asking (and, asked together with others, theirs).
+        .filter(|r| {
+            r.0 < r.1
+                && !published(r.0, r.1)
+                && !(light && PROTECTED.any(r.0 / PAGE, r.1.div_ceil(PAGE)))
+        })
         .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
         .collect();
     if pieces.len() < 2 {
@@ -364,6 +394,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         i = k;
     }
     note_hot(&written);
+    merge_spans(&mut asked);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
@@ -564,24 +595,33 @@ fn ask_rest(ranges: &[(usize, usize)]) {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
     };
+    merge_spans(&mut ahead);
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
     // once per flush: with one asking for the submission that was every
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    let light = light();
+    let mut added = Vec::new();
     let mut written = Vec::new();
     for &(start, end) in ranges {
         if start >= end || published(start, end) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if light && PROTECTED.any(first, last) {
+            continue;
+        }
+        if !spans_cover(&ahead, first, last)
+            && !added.iter().any(|&(a, b)| a <= first && last <= b)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
-            ahead.push((first, last));
+            added.push((first, last));
         }
     }
+    ahead.extend(added);
+    merge_spans(&mut ahead);
     note_hot(&written);
     let mut j = journal_mut();
     // A number of its own, and the one this asking stands under: between
@@ -672,9 +712,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    spans_cover(&j.ahead, first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -684,12 +722,25 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_with_hint(start, end, guarded, false).map(|(now, pages, _)| (now, pages))
+}
+
+/// Like [`writes`], plus whether the range was resolved as guarded view
+/// memory (`true`) rather than write-watched or journal-covered memory
+/// (`false`). When `known_view` and `guarded` are both true, skips the failing
+/// `GetWriteWatch` syscall and checks guards directly first.
+pub(crate) fn writes_with_hint(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    known_view: bool,
+) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
-    if let Some(known) = ahead(&journal()) {
-        return Some(known);
+    let ahead = |j: &Journal| spans_cover(&j.ahead, first, last).then(|| (j.ahead_asked, of(j)));
+    if let Some((now, pages)) = ahead(&journal()) {
+        return Some((now, pages, false));
     }
     // Read-only since an asking noted it: the bits first, then the journal.
     if guarded && published(start, end) {
@@ -699,45 +750,59 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some((next_asking(), of(&j), true));
     }
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
-        return Some(known);
+    if let Some((now, pages)) = ahead(&journal()) {
+        return Some((now, pages, false));
     }
-    let mut guards_asked = false;
-    // (View memory read-only by our hand: the kernel would refuse.)
-    let refused = guarded && light() && PROTECTED.any(first, last);
-    let pages = match if refused { None } else { kernel_written(first, last) } {
-        Some(pages) => pages,
-        None => {
-            guards_asked = true;
-            if !guarded {
-                return None;
+    let ask_guard = || -> Option<Vec<(usize, u16)>> {
+        #[cfg(feature = "diagnostics")]
+        let guarding = std::time::Instant::now();
+        let written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let us = guarding.elapsed().as_micros() as u64;
+            add(C::GuardUs, us);
+            if written.is_some() {
+                add(C::Watches, 1);
+                add(C::WatchUs, us);
+                slow(us);
             }
-            #[cfg(feature = "diagnostics")]
-            let guarding = std::time::Instant::now();
-            let written = guard(first * PAGE, last * PAGE).map(|pages| pages.into_iter().map(|p| (p, WHOLE)).collect::<Vec<_>>());
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                let us = guarding.elapsed().as_micros() as u64;
-                add(C::GuardUs, us);
-                if written.is_some() {
-                    add(C::Watches, 1);
-                    add(C::WatchUs, us);
-                    slow(us);
-                }
-            }
-            written?
         }
+        written
+    };
+    let protected = light() && PROTECTED.any(first, last);
+    let skip_kernel = protected || (guarded && known_view);
+    let mut guards_asked = false;
+    let pages = if skip_kernel {
+        if !guarded {
+            return None;
+        }
+        if let Some(pages) = ask_guard() {
+            guards_asked = true;
+            pages
+        } else if known_view && !protected {
+            kernel_written(first, last)?
+        } else {
+            return None;
+        }
+    } else if let Some(pages) = kernel_written(first, last) {
+        pages
+    } else {
+        if !guarded {
+            return None;
+        }
+        guards_asked = true;
+        ask_guard()?
     };
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
         let j = journal();
-        return Some((next_asking(), of(&j)));
+        return Some((next_asking(), of(&j), guards_asked));
     }
     let answer = {
         let mut j = journal_mut();
@@ -753,16 +818,17 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     if guards_asked && light() {
         publish(&pages.iter().map(|p| p.0).collect::<Vec<_>>());
     }
-    Some(answer)
+    Some((answer.0, answer.1, guards_asked))
 }
 
 /// Whether nothing of `[start, end)` was written that a copy with the notes
-/// `copied` (the asking after which each page from page `base` on was taken)
-/// and `ranged` (the asking after which a range that holds this one was
-/// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
-/// asked: the submission's asking covers the range, or its blocks are known
-/// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+/// `copied` (the asking after which each page from page `base` on was taken),
+/// `ranged` (the asking after which a range that holds this one was taken
+/// whole, or 0), and `all_taken` (every page of the copy has been taken at
+/// least once) does not hold, as [`writes`] would answer with nothing asked:
+/// the submission's asking covers the range, or its blocks are known by
+/// their bits. `false` if something would have to be asked.
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64, all_taken: bool) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -771,13 +837,13 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !spans_cover(&j.ahead, first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
+    (ranged != 0 || all_taken || taken.iter().all(|&at| at != 0))
         && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
 }
 
@@ -1243,7 +1309,10 @@ fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
 /// A set of blocks, a bit each: a fault, or a look at a range of thousands of
 /// blocks, is a few words of it and no walk through a tree of every guarded
 /// block there is.
-struct Blocks(BTreeMap<usize, Box<[u64; Blocks::WORDS]>>);
+struct Blocks {
+    pieces: BTreeMap<usize, Box<[u64; Blocks::WORDS]>>,
+    count: usize,
+}
 
 impl Blocks {
     /// The words of 4 GiB.
@@ -1251,35 +1320,83 @@ impl Blocks {
     const IN_PIECE: usize = Blocks::WORDS * 64;
 
     const fn new() -> Blocks {
-        Blocks(BTreeMap::new())
+        Blocks {
+            pieces: BTreeMap::new(),
+            count: 0,
+        }
     }
 
     fn word(&self, word: usize) -> u64 {
-        self.0.get(&(word / Blocks::WORDS)).map_or(0, |piece| piece[word % Blocks::WORDS])
+        self.pieces.get(&(word / Blocks::WORDS)).map_or(0, |piece| piece[word % Blocks::WORDS])
     }
 
     fn contains(&self, block: usize) -> bool {
         self.word(block / 64) >> (block % 64) & 1 != 0
     }
 
+    /// Whether every block in `[first, last)` is present.
+    fn all(&self, first: usize, last: usize) -> bool {
+        if first >= last {
+            return true;
+        }
+        for word in first / 64..last.div_ceil(64) {
+            let mask = in_word(word * 64, first, last);
+            if self.word(word) & mask != mask {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Blocks in `self` within `[first, last)` that are not in `exclude`.
+    fn diff_range(&self, exclude: &Blocks, first: usize, last: usize) -> Vec<usize> {
+        if first >= last {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (&piece, words) in self.pieces.range(first / Blocks::IN_PIECE..=(last - 1) / Blocks::IN_PIECE) {
+            let excl = exclude.pieces.get(&piece);
+            let base = piece * Blocks::IN_PIECE;
+            let from = first.max(base) - base;
+            let to = last.min(base + Blocks::IN_PIECE) - base;
+            for w in from / 64..to.div_ceil(64) {
+                let bits = words[w] & !excl.map_or(0, |e| e[w]) & in_word(w * 64, from, to);
+                if bits != 0 {
+                    out.extend(BitsOf(bits).map(|bit| base + w * 64 + bit));
+                }
+            }
+        }
+        out
+    }
+
     /// Whether it was not there.
     fn insert(&mut self, block: usize) -> bool {
-        let piece = self.0.entry(block / Blocks::IN_PIECE).or_insert_with(|| Box::new([0; Blocks::WORDS]));
+        let piece = self.pieces.entry(block / Blocks::IN_PIECE).or_insert_with(|| Box::new([0; Blocks::WORDS]));
         let word = &mut piece[block % Blocks::IN_PIECE / 64];
         let was = *word;
         *word |= 1 << (block % 64);
-        was != *word
+        if was != *word {
+            self.count += 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Whether it was there.
     fn remove(&mut self, block: usize) -> bool {
-        let Some(piece) = self.0.get_mut(&(block / Blocks::IN_PIECE)) else {
+        let Some(piece) = self.pieces.get_mut(&(block / Blocks::IN_PIECE)) else {
             return false;
         };
         let word = &mut piece[block % Blocks::IN_PIECE / 64];
         let was = *word;
         *word &= !(1 << (block % 64));
-        was != *word
+        if was != *word {
+            self.count -= 1;
+            true
+        } else {
+            false
+        }
     }
 
     fn insert_all(&mut self, blocks: std::ops::Range<usize>) {
@@ -1302,7 +1419,7 @@ impl Blocks {
             Bound::Unbounded => usize::MAX,
         }
         .max(first);
-        self.0.range(first / Blocks::IN_PIECE..=last / Blocks::IN_PIECE).flat_map(move |(&piece, words)| {
+        self.pieces.range(first / Blocks::IN_PIECE..=last / Blocks::IN_PIECE).flat_map(move |(&piece, words)| {
             let base = piece * Blocks::IN_PIECE;
             let from = first.max(base) - base;
             let to = last.min(base + Blocks::IN_PIECE).saturating_sub(base);
@@ -1315,7 +1432,7 @@ impl Blocks {
     }
 
     fn len(&self) -> usize {
-        self.0.values().flat_map(|piece| piece.iter()).map(|word| word.count_ones() as usize).sum()
+        self.count
     }
 }
 
@@ -1683,13 +1800,13 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // takes the block out of the set, and it is looked at as any other.
     let unsure: Vec<usize> = {
         let g = guards_timed();
-        if g.clean.range(first..last).count() == last - first && !BESIDE.any(first, last) {
+        if g.clean.all(first, last) && !BESIDE.any(first, last) {
             // Nothing written, mapped or new since the range was last taken.
             #[cfg(feature = "diagnostics")]
             tally(3, 1);
             return Some(Vec::new());
         }
-        g.absent.range(first..last).filter(|block| !g.held.contains(*block)).collect()
+        g.absent.diff_range(&g.held, first, last)
     };
     let mut came: Vec<(usize, bool)> = Vec::new();
     let mut uncommitted_until = first;
@@ -2184,7 +2301,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
             return;
         }
     }
-    {
+    if !light() || PROTECTED.any(at / BLOCK, end.div_ceil(BLOCK)) {
         let mut g = guards();
         let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
         if pages {
@@ -4425,6 +4542,72 @@ mod many_askers_tests {
         assert!(!super::ask_ahead_needed());
         super::ask_once_end();
         assert!(super::ask_ahead_needed());
+        // SAFETY: `VirtualAlloc` base from above.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn blocks_count_all_and_diff_range() {
+        let mut a = super::Blocks::new();
+        let mut b = super::Blocks::new();
+        assert_eq!(a.len(), 0);
+        assert!(a.all(0, 0));
+        let pts = [0usize, 1, 63, 64, 65, super::Blocks::IN_PIECE - 1, super::Blocks::IN_PIECE, super::Blocks::IN_PIECE + 70];
+        for &p in &pts {
+            assert!(a.insert(p));
+            assert!(!a.insert(p));
+        }
+        assert_eq!(a.len(), pts.len());
+        a.insert_all(120..260);
+        assert_eq!(a.len(), pts.len() + 140);
+        assert!(a.all(120, 260));
+        assert!(!a.all(119, 260));
+        assert!(!a.all(120, 261));
+        assert!(a.remove(190));
+        assert!(!a.remove(190));
+        assert!(!a.all(120, 260));
+        assert!(a.all(120, 190) && a.all(191, 260));
+
+        b.insert(1);
+        b.insert(128);
+        b.insert(200);
+        b.insert(super::Blocks::IN_PIECE);
+        let first = 0;
+        let last = super::Blocks::IN_PIECE + 100;
+        let naive: Vec<usize> = a.range(first..last).filter(|blk| !b.contains(*blk)).collect();
+        assert_eq!(a.diff_range(&b, first, last), naive);
+        assert!(a.diff_range(&b, 50, 50).is_empty());
+    }
+
+    #[test]
+    fn merge_spans_and_spans_cover() {
+        let mut spans = vec![(10, 20), (30, 40), (15, 30), (50, 55), (5, 8)];
+        super::merge_spans(&mut spans);
+        assert_eq!(spans, [(5, 8), (10, 40), (50, 55)]);
+        assert!(super::spans_cover(&spans, 10, 40));
+        assert!(super::spans_cover(&spans, 12, 35));
+        assert!(!super::spans_cover(&spans, 9, 40));
+        assert!(!super::spans_cover(&spans, 10, 41));
+        assert!(super::spans_cover(&spans, 50, 55));
+        assert!(!super::spans_cover(&spans, 40, 50));
+    }
+
+    #[test]
+    fn writes_with_hint_reports_view_vs_watch() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: fresh write-watched allocation freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (_, _, is_view) = super::writes_with_hint(p, p + 2 * PAGE, true, false).expect("watched");
+        assert!(!is_view);
+        // `known_view = true` still falls back to kernel write-watch if not guarded view memory.
+        // SAFETY: committed write-watched memory.
+        unsafe { ((p + 16) as *mut u8).write(9) };
+        let (_, written, is_view2) = super::writes_with_hint(p, p + 2 * PAGE, true, true).expect("fallback");
+        assert!(!is_view2);
+        assert!(written.iter().any(|&(page, _)| page == p / PAGE));
         // SAFETY: `VirtualAlloc` base from above.
         unsafe { windows_sys::Win32::System::Memory::VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

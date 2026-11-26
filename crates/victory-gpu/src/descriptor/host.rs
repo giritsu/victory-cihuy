@@ -2981,6 +2981,17 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        let raw = resource.as_ref().map(windows::core::Interface::as_raw);
+        self.keep_with(index, raw, || resource)
+    }
+
+    /// Slot `index` now views `resource`, cloning only if the slot changed.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        let raw = resource.map(windows::core::Interface::as_raw);
+        self.keep_with(index, raw, || resource.cloned())
+    }
+
+    fn keep_with(&self, index: u32, raw: Option<*mut std::ffi::c_void>, next: impl FnOnce() -> Option<ID3D12Resource>) {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -2988,10 +2999,10 @@ impl HostHeap {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
-            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+            if slot.as_ref().map(Interface::as_raw) == raw {
                 return;
             }
-            std::mem::replace(&mut *slot, resource)
+            std::mem::replace(&mut *slot, next())
         };
         // A running submission may still read the old resource through
         // this slot.
@@ -3160,7 +3171,7 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep_ref(index, holds.then_some(buffer));
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:

@@ -41,13 +41,9 @@ pub(crate) struct Shadow {
     start: u64,
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
-    /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
-    /// Two ranges of title memory taken whole, the last one and the longest,
-    /// and the asking after which each was ([`Shadow::copy_stale`]). A page
-    /// a range holds in part cannot say so in `copied`. Locked inside
-    /// `copied`'s lock.
-    ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// after which it was last copied (0: never), the number of uncopied zero
+    /// pages, and the two ranges taken whole ([`Shadow::copy_stale`]).
+    copied: Mutex<CopiedState>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -104,6 +100,45 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+/// Per-page copy stamps plus whole-range timestamps kept under one lock on [`Shadow`].
+struct CopiedState {
+    pages: Vec<u64>,
+    zero_pages: usize,
+    ranged: [(usize, usize, u64); 2],
+}
+
+impl CopiedState {
+    fn new(pages: usize) -> Self {
+        Self {
+            pages: vec![0; pages],
+            zero_pages: pages,
+            ranged: [(0, 0, 0); 2],
+        }
+    }
+
+    #[inline]
+    fn set_page(&mut self, index: usize, value: u64) {
+        let slot = &mut self.pages[index];
+        let was = *slot;
+        if was == 0 && value != 0 {
+            self.zero_pages -= 1;
+        } else if was != 0 && value == 0 {
+            self.zero_pages += 1;
+        }
+        *slot = value;
+    }
+
+    #[inline]
+    fn ranged_for(&self, from: usize, to: usize) -> u64 {
+        self.ranged
+            .iter()
+            .filter(|r| r.0 <= from && to <= r.1)
+            .map(|r| r.2)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// Backing storage for the CPU mirror of a card-backed copy: either a host
@@ -794,7 +829,7 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
             continue;
         };
         let written: std::collections::HashMap<usize, u64> = written.into_iter().collect();
-        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).pages.clone();
         for (i, &at) in copied.iter().enumerate() {
             let page = start / PAGE + i;
             if at == 0 || written.get(&page).is_some_and(|&w| w > at) {
@@ -2957,8 +2992,10 @@ pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
-        let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = {
+            let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
+            (copied.pages.len() - copied.zero_pages) as u64
+        };
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -3160,8 +3197,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
-            ranged: Mutex::default(),
+            copied: Mutex::new(CopiedState::new(pages as usize)),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             pending_any: AtomicBool::new(false),
@@ -3660,7 +3696,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => !stale_pages_in(base, &copied.pages, a, e, &written).is_empty(),
             None => true,
         })
     }
@@ -3721,7 +3757,7 @@ impl Shadow {
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                stale_pages_in(base, &copied.pages, a, e, &written)
             };
             if stale.is_empty() {
                 continue;
@@ -3795,9 +3831,10 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let len = copied.pages.len();
                 for page in taken {
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
+                    if let Some(idx) = page.checked_sub(base).filter(|&idx| idx < len) {
+                        copied.set_page(idx, now);
                     }
                 }
             }
@@ -3934,7 +3971,14 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(
+            from,
+            to,
+            start / PAGE,
+            &copied.pages,
+            copied.ranged_for(from, to),
+            copied.zero_pages == 0,
+        );
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3944,20 +3988,14 @@ impl Shadow {
         same
     }
 
-    /// The latest asking after which a range that holds `[from, to)` was
-    /// taken whole (0: none is known). The caller holds `copied`'s lock.
-    fn ranged(&self, from: usize, to: usize) -> u64 {
-        let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-        ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
-    }
-
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+        let watched = self.watched.load(Ordering::Relaxed);
+        if watched != NOT_WATCHED {
+            if let Some((now, written, is_view)) = crate::watch::writes_with_hint(from, to, true, watched == GUARDED) {
                 // (A range whose blocks rest after a write has no guard now.)
-                let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
+                let guarded = is_view || crate::watch::guarded(from, to) || watched == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
@@ -4050,7 +4088,7 @@ impl Shadow {
         // of the heap's buffer views alone two ends for each of 4,400
         // copies, every frame. A range that was taken whole, and not written
         // since, is as it was.
-        let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
+        let ranged = if crate::watch::light() { copied.ranged_for(from, to) } else { 0 };
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
@@ -4063,14 +4101,13 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
-            let taken = (*at).max(ranged);
+            let taken = copied.pages[page - base].max(ranged);
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+                    copied.set_page(page - base, now);
                 }
                 // Cut where pages taken before meet pages never taken.
                 let again = taken != 0;
@@ -4096,10 +4133,9 @@ impl Shadow {
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
-            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
-            ranged[0] = (from, to, now);
-            if to - from >= ranged[1].1 - ranged[1].0 {
-                ranged[1] = (from, to, now);
+            copied.ranged[0] = (from, to, now);
+            if to - from >= copied.ranged[1].1 - copied.ranged[1].0 {
+                copied.ranged[1] = (from, to, now);
             }
         }
         bytes
@@ -4751,12 +4787,12 @@ impl Shadow {
             return false;
         };
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(at) = copied.get_mut(page) else {
+        let Some(&at) = copied.pages.get(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        let held = at != 0 && at >= before && crate::watch::block_published(block);
         if held {
-            *at = (*at).max(now);
+            copied.set_page(page, at.max(now));
         }
         held
     }
@@ -5889,6 +5925,29 @@ mod window_tests {
             assert!(first_seen.iter().all(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 1));
             assert!(rest_seen.iter().all(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 1));
         }
+    }
+
+    #[test]
+    fn copied_state_tracks_zero_pages_and_ranged() {
+        let mut state = super::CopiedState::new(4);
+        assert_eq!(state.zero_pages, 4);
+        assert_eq!(state.ranged_for(100, 200), 0);
+
+        state.set_page(0, 10);
+        state.set_page(0, 12);
+        assert_eq!(state.zero_pages, 3);
+        state.set_page(1, 5);
+        state.set_page(2, 6);
+        state.set_page(3, 7);
+        assert_eq!(state.zero_pages, 0);
+        state.set_page(2, 0);
+        assert_eq!(state.zero_pages, 1);
+
+        state.ranged[0] = (100, 300, 20);
+        state.ranged[1] = (50, 400, 15);
+        assert_eq!(state.ranged_for(100, 300), 20);
+        assert_eq!(state.ranged_for(50, 350), 15);
+        assert_eq!(state.ranged_for(40, 100), 0);
     }
 }
 
