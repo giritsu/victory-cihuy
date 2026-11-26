@@ -1,6 +1,6 @@
 # Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p).
 #   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-s|series-x]
-#                        [-Panel] [-DebugLayer] [-DredLight] [-RayTracing] [-LevelsOnDemand] [-Safe]
+#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
 # Run from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified.
 param(
@@ -10,6 +10,7 @@ param(
     [switch]$Panel,
     [switch]$DebugLayer,
     [switch]$DredLight,
+    [switch]$MemoryMap,
     [switch]$RayTracing,
     [switch]$LevelsOnDemand,
     [switch]$Safe,
@@ -71,8 +72,7 @@ $settings = @{
 if ($Build -eq 'diag') {
     $settings.VICTORY_LOG = 'info'
     $settings.VICTORY_D3D12_DRED = if ($DredLight) { 'light' } else { 'faults' }
-    $settings.VICTORY_MEMORY_MAP = '1'
-    $settings.VICTORY_SKIP_PIPELINES = 'none'
+    $settings.VICTORY_MEMORY_MAP = if ($MemoryMap) { '1' } else { '0' }
 } else {
     $settings.VICTORY_LOG = 'warn'
 }

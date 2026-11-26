@@ -262,17 +262,61 @@ impl Recording {
     }
 }
 
+fn backs_most_for(compact: bool, pressured: bool, critical: bool) -> usize {
+    if critical {
+        if compact { 16 } else { 32 }
+    } else if pressured {
+        if compact { 32 } else { 64 }
+    } else if compact {
+        64
+    } else {
+        128
+    }
+}
+
+fn backs_most() -> usize {
+    backs_most_for(
+        crate::residency::compact_host_ram(),
+        crate::residency::pressured(),
+        crate::residency::critical_commit(),
+    )
+}
+
+/// Releases cold pooled back lists when host or Shared GPU memory is pressured.
+pub(crate) fn trim_idle() {
+    let keep = backs_most();
+    let drained: Vec<usize> = {
+        let mut backs = held(&BACKS);
+        if backs.len() <= keep {
+            return;
+        }
+        let excess = backs.len() - keep;
+        backs.drain(..excess).collect()
+    };
+    for back in drained {
+        super::release_back(back as This);
+    }
+}
+
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
         give_back(inner.chunks.drain(..).chain(std::mem::take(&mut inner.kept)).collect());
         if inner.back != 0 {
             if !inner.closed {
-                // Left in the middle.
+                // Left in the middle: release rather than pooling un-detached state.
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
+                super::release_back(inner.back as This);
+            } else {
+                let mut backs = held(&BACKS);
+                if backs.len() < backs_most() {
+                    backs.push(inner.back);
+                } else {
+                    drop(backs);
+                    super::release_back(inner.back as This);
+                }
             }
-            held(&BACKS).push(inner.back);
         }
     }
 }
@@ -916,5 +960,15 @@ mod tests {
         slot[1] = 99;
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    #[test]
+    fn backs_cap_tightens_on_compact_ram_and_pressure() {
+        assert_eq!(backs_most_for(false, false, false), 128);
+        assert_eq!(backs_most_for(false, true, false), 64);
+        assert_eq!(backs_most_for(false, true, true), 32);
+        assert_eq!(backs_most_for(true, false, false), 64);
+        assert_eq!(backs_most_for(true, true, false), 32);
+        assert_eq!(backs_most_for(true, true, true), 16);
     }
 }

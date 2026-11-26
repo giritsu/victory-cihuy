@@ -109,3 +109,27 @@ each commit naming its source. In short:
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
   constant buffer bookkeeping (romainhedouin).
 - ZJOU: render targets not set again; some shader corrections are being looked at.
+
+## Windows 10 + 16 GB RAM + RX 7600 XT 16 GB (2026-11-26)
+
+Local workstation telemetry (`Ryzen 5 5600` 6C/12T, 16 GB RAM + 32 GB pagefile, RX 7600 XT 16 GB VRAM, 1080p, `--console series-s`):
+
+### Platform constraints measured
+
+- **Windows 10 D3D12 inbox runtime lacks SM 6.6 dynamic resource flags (`0xC00`):** fixed by shipping Agility SDK `1.614.1` (`D3D12SDKVersion=614` + `.\D3D12\D3D12Core.dll` beside the binary).
+- **WDDM Shared GPU Memory hard cap (~7,490 MiB on 16 GB RAM):** expanding `C:\pagefile.sys` to 32 GB raises process commit headroom (~15–24 GB free) and prevents Rust heap aborts, **but does not raise WDDM `NON_LOCAL` budget** (fixed at 50% of physical RAM). Exhausting `NON_LOCAL` triggers `0x8007000E` (`E_OUTOFMEMORY`) on upload/shared buffers and command list closes even while ~2.8 GB of local VRAM remains free.
+- **`card memory the CPU maps supported=false` without BIOS ReBAR/SAM:** when `GPUUploadHeapSupported` is false, all loose windows remain in `NON_LOCAL` Shared GPU Memory rather than VRAM BAR.
+
+### Measured wins vs. regressions (16 GB RAM tuning)
+
+| Change tested | Outcome | Evidence (`dev-run.log`) |
+|---|---|---|
+| Disable `VICTORY_LEVELS_ON_DEMAND` default (`held_only()` active) + 16 MiB staging pool + 100 ms `NON_LOCAL` polling | **Major win** | Session runtime **~1 min -> ~7 min**; `texture_staging_mib` **2,104 MB -> 54 MB**; `changed=` texture re-uploads **4,001+ -> 142**. |
+| Unbounded `thin::BACKS` pool (upstream `VICTORY_THIN=1`) | **Leak (~1.5–2 GB)** | Grew to **1,183 `host lists alive`** while `list::trim_idle()` thrashed `IDLE` (52,929 lists / 9,137 MB churn). Capped in Pass 3 (`64/32/16` + `thin::trim_idle()`). |
+| Compact-RAM `window_kb=256` + `VICTORY_WINDOW_TAILS=1` | **Regression** | Created **6,408 overlapping windows** (`3,404 MB` covering `1,934 MB` = +1,470 MB pure duplication) and `34,682` window reallocations (`28,680 MB` churn). Reverted to `4 MiB` grid / tails off in Pass 3. |
+
+### Next steps on this PC
+
+1. **Re-test Pass 3 live in `diag`** (`.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Panel`) to confirm `host lists alive`, `windows outside buffers`, `shared_gpu_used_mib`, and sustained gameplay FPS without `0x8007000E`.
+2. **Pre-warm driver pipelines** (`target\diag\victory.exe warm --used` after gameplay sessions) to eliminate shader/pipeline compilation stutters (`dropped without a host pipeline: being made`).
+3. **Optional BIOS tuning:** enabling **Above 4G Decoding + Re-Size BAR / Smart Access Memory** on Ryzen 5 5600 / RX 7600 XT can unlock `D3D12_HEAP_TYPE_GPU_UPLOAD` (`mapped_card_memory=true`), letting `shadow.rs` offload up to `1,536 MiB` of loose windows from Shared GPU Memory into 16 GB VRAM.

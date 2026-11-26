@@ -252,13 +252,14 @@ fn idle_most() -> (usize, u64) {
 /// Drops excess idle command lists when host or Shared GPU memory is pressured.
 #[cfg(windows)]
 pub(crate) fn trim_idle() {
-    const KEEP_UNDER_PRESSURE: usize = 32;
+    thin::trim_idle();
+    let keep = if crate::residency::critical_commit() { 32 } else { 64 };
     let gone: Vec<Idle> = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() <= KEEP_UNDER_PRESSURE {
+        if idle.0.len() <= keep {
             return;
         }
-        let drain = idle.0.len() - KEEP_UNDER_PRESSURE;
+        let drain = idle.0.len() - keep;
         let drained: Vec<Idle> = idle.0.drain(..drain).collect();
         for Idle(_, bytes) in &drained {
             idle.1 = idle.1.saturating_sub(*bytes);
@@ -266,6 +267,20 @@ pub(crate) fn trim_idle() {
         drained
     };
     drop(gone);
+}
+
+#[cfg(windows)]
+fn release_back(this: This) {
+    if this.is_null() {
+        return;
+    }
+    VALUE_WAITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|&(list, _)| list != this as usize);
+    // SAFETY: `this` is an internal back list created by `Box::into_raw(boxed(...))`
+    // in `thin::back_list` and exclusively owned by `Recording` / `BACKS`.
+    unsafe { drop(Box::from_raw(this.cast_mut().cast::<List>())) };
 }
 
 /// Whether host lists that have run are used again (on by default;

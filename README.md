@@ -49,6 +49,37 @@ What is known to be wrong:
   pipelines (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
+## Local PC Profile & Progress (2026-11-26)
+
+Target workstation profile added in this checkout:
+
+- **OS & Display:** Windows 10 Pro (22H2, Build 19045), 1920x1080, Xbox Series S console profile (`--console series-s`).
+- **CPU:** AMD Ryzen 5 5600 (6 Cores / 12 Threads, Zen 3 with AVX2).
+- **RAM / Pagefile:** 16 GB physical RAM + 32 GB system pagefile (**note:** Windows WDDM hard-caps Shared GPU Memory `NON_LOCAL` at 50% of physical RAM, ~7,490 MiB).
+- **GPU:** AMD Radeon RX 7600 XT 16 GB VRAM (RDNA 3; native Wave32/Wave64, `views=2097152`, `raw_twins=true`, `mapped_card_memory=false` when BIOS ReBAR/SAM is disabled).
+- **Windows 10 DirectX 12 Agility SDK:** `apps/victory` exports `D3D12SDKVersion=614` and `D3D12SDKPath=".\\D3D12\\"`; copy `D3D12Core.dll` and `d3d12SDKLayers.dll` (`1.614.x`) into `target\diag\D3D12\` and `target\release\D3D12\` on Windows 10 hosts so SM 6.6 `0xC00` root signatures initialize cleanly.
+
+| Milestone | Status | Measured Result / Notes |
+|---|---|---|
+| Win10 Agility SDK 1.614.1 (`apps/victory`) | Done | Fixed Win10 `0x80070057` (`c00/c01`) and startup `0xc0000005`; 29/29 upscaler compute pipelines created. |
+| Shader cache (`cache-pareto`) | Ready | 25,782 shaders pre-compiled (`victory shaders`) into `%LOCALAPPDATA%\VIctory\cache-pareto`. |
+| Pass 1: 16 GB RAM & 6C/12T scaling | Done | Added WDDM `NON_LOCAL` pressure tracking, compact `STAGING_SPARES`, `bury_lag=6`, 32 MiB spare scratch cap, and 6C/12T worker counts (`thin=4`, `under=4`, `pipeline=4`, `dstorage=6`). |
+| Pass 2: Staging bloat & 16 MiB staging pool | Done | Disabled `VICTORY_LEVELS_ON_DEMAND` default (`held_only()` active), added 16 MiB staging blocks, 100 ms `NON_LOCAL` sampling, and fast idle eviction. Runtime rose from ~1 min to **~7 min**; live texture staging dropped **2,104 MB -> 54 MB**; spurious texture re-uploads dropped **4,001+ -> 142**. |
+| Pass 3: `thin::BACKS` cap & 4 MiB loose windows | Built & tested | Bounded `thin::BACKS` (`64/32/16` on compact RAM) with `thin::trim_idle()` (down from 1,183 leaked alive host lists), reverted `256 KiB` + `tails=1` window fragmentation (+1,470 MB overlap duplication / 28.7 GB churn). Ready for live re-test. |
+
+To run locally from a normal (non-Administrator) PowerShell window with your own dump path and external cache:
+
+```powershell
+cargo build --locked --profile diag -p victory --features diagnostics
+.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Panel
+
+# Faster release profile once verified:
+cargo build --release --locked -p victory
+.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build release -Panel
+```
+
+Detailed chronological measurements and findings are recorded in [docs/bug-journal.md](docs/bug-journal.md) and [docs/findings.md](docs/findings.md).
+
 ## How to run it
 
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
