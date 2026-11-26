@@ -123,7 +123,13 @@ fn kept() -> u64 {
     if on_card() {
         256 << 20
     } else if crate::residency::compact_host_ram() {
-        128 << 20
+        if crate::residency::critical_commit() {
+            0
+        } else if crate::residency::shared_pressured() {
+            128 << 20
+        } else {
+            256 << 20
+        }
     } else {
         768 << 20
     }

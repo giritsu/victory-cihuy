@@ -15,16 +15,16 @@ Chronological logs and deep technical notes live in [bug-journal.md](bug-journal
 
 | Area | Progress | Current State |
 |---|---|---|
-| **Boot, Loader, Win10 Agility SDK & Shader Cache** | **95%** | Boots cleanly on Windows 10 (`0xC00` root signatures fixed, 29/29 upscaler pipelines created, `25,782` shaders cached; `203` unsupported containers remain). |
-| **Visual & Rendering Core (RDNA 3)** | **75–80%** | World, characters, textures, and lighting render; open upstream issues include occasional outdoor/distant flicker, late texture streaming, and dark indoor areas without `-RayTracing`. |
+| **Boot, Loader, Win10 Agility SDK & Shader Cache** | **95%** | Boots cleanly on Windows 10 (`0xC00` root signatures fixed, 29/29 upscaler pipelines created, `25,805` shader files / `914.3 MB` in `cache-pareto`). |
+| **Visual & Rendering Core (RDNA 3)** | **75–80%** | World, characters, textures, and lighting render through full 46-min campaign; Pass 7 targets remaining blur, late texture pop-in, eviction (`574k` let go), and random purple/glitch artifacts. |
 | **Input & Controls (XInput + Keyboard Stand-in)** | **85%** | XInput pads (slots 0–3, low/high rumble), merged `VICTORY_ONE_PAD=1` mode, full keyboard-to-pad mapping, and `F3` performance panel toggle; trigger rumble and mouse-to-camera mapping not yet implemented. |
-| **16 GB RAM / WDDM Shared GPU Stability** | **70–75%** | Improved from ~1 min crash → ~7 min (Pass 2) → 8m22s / frame 4,757 (Pass 3) → **8m01s / frame 6,584** (Pass 5: `host lists` **-92%**, staging **352 → 56 MB**); Pass 6 moves card-buffer CPU mirrors to RAM (`CardStaging::Ram`) and offloads **2,560 MiB** of loose windows into free local VRAM (pending live Pass 6 verification). |
-| **FPS Performance vs. 30 FPS Target (6C/12T CPU)** | **45–55%** | Measured **10.3–18.0 FPS** in `diag` gameplay during Pass 5 (**+41% frame throughput**, `HostList` creation `107.5 → 7.3 ms/frame`, `MakeResident`+`mapped()` `206.6 → 89.6 s`); RX 7600 XT GPU busy was only 16–22% with ~5 GB VRAM free, confirming CPU submission/descriptor work is the main wall before switching to `release`. |
+| **16 GB RAM / WDDM Shared GPU Stability** | **90–95%** | **Pass 6 verified live (46 min full main mission, 0 crashes, 0 OOMs):** Shared GPU held flat at **2,771–3,850 / 7,490 MiB** (~3.6 GiB headroom) and VRAM at **12,289–12,569 / 14,956 MiB**. Pass 7 rebalances loose windows (`1,792 MiB`) and strips `shape` filler words to stop minute-31 RAM/view growth. |
+| **FPS Performance vs. 30 FPS Target (6C/12T CPU)** | **55–65%** | **Pass 6 (`diag`):** **10.1–16.3 FPS** (min 4–31, median 10.2), dropping to **6.3–8.7 FPS** at min 34–46 from `4,194,304` `Shape` overflow + `1.95M` upload-buffer (`858.7 s` `MakeResident`) churn + false `PRESSURED` throttling. **Pass 7** eliminates all three bottlenecks and unlocks `release` benchmarking. |
 
-- **Overall "Playable & Stabil di PC ini": ~70–75%**
-- **Overall "100% Mulus 30 FPS Konstan di Semua Scene": ~50–55%**
+- **Overall "Playable & Stabil di PC ini": ~80–85%**
+- **Overall "100% Mulus 30 FPS Konstan di Semua Scene": ~55–65%**
 
-## Optimization Passes Summary (Pass 1–6)
+## Optimization Passes Summary (Pass 1–7)
 
 | Pass | Focus | Key Result / Status |
 |---|---|---|
@@ -34,7 +34,8 @@ Chronological logs and deep technical notes live in [bug-journal.md](bug-journal
 | **Pass 3** | Bounded `thin::BACKS` + revert `256 KiB` / `tails=1` loose window fragmentation | Reached **8m22s (frame 4,757)** at **8.5–10.7 FPS** (`diag`), holding Shared GPU flat at **6.1–6.4 GB** for 6 min. |
 | **Pass 4** | `detach_take` + `finish_back()` + `VICTORY_CARD_BUFFERS_MIN_KB=256` | Ran **7m41s (frame 4,662)** and isolated remaining 640→849 `HostList` + `243k` card-buffer churn root cause. |
 | **Pass 5** | Lazy `Front::recording`, `boxed -> fresh_list()`, 1-frame pool size, `8 MiB`/`500 ms` staging, `make_prelude` OOM retry | Ran **8m01s / frame 6,584** (**10.3–18.0 FPS** `diag`); startup `HostList` **640 → 23**, total lists **-92%**, staging **352 → 56 MB**. |
-| **Pass 6** | `CardStaging::Ram` demand-zero RAM mirrors, **2,560 MiB** VRAM loose-window offload, `send::SPARE` 128 MiB cap, `320` `IDLE` pool | Built & unit-tested; cuts ~3.3+ GiB from WDDM `NON_LOCAL` into free VRAM & system pagefile. |
+| **Pass 6** | `CardStaging::Ram` demand-zero RAM mirrors, VRAM loose-window offload, `send::SPARE` cap, `320` `IDLE` pool | **Verified live (46 min full main mission, 0 crash):** Shared GPU flat at **2.8–3.8 / 7.49 GB**, VRAM **12.3–12.6 / 14.95 GB**, `diag` **10.1–16.3 FPS** (min 4–31). |
+| **Pass 7** | Compact RAM pressure threshold (`512 MiB`/commit), `192 MiB` scratch / `256 MiB` send caps, strip `Shape` filler words, `1,792 MiB` (`80%`) VRAM window balance, `left_out` diagnostic fix, `-NoKeepShown`/`-Warm` flags | **Built & unit-tested (`37/37` passed):** stops false pressure lock, eliminates `1.95M` upload-buffer / `858.7 s` `MakeResident` churn & `4.19M` shape overflow, reclaims 768 MiB VRAM for textures. |
 
 Details: [bug-journal.md](bug-journal.md) | Hardware findings: [findings.md](findings.md).
 
@@ -59,7 +60,8 @@ Details: [bug-journal.md](bug-journal.md) | Hardware findings: [findings.md](fin
 
 ## Next Milestones
 
-- [ ] Uji live **Pass 6** di `diag` (`-Panel`) dan verifikasi penurunan `shared_gpu` (`windows` VRAM offload aktif), nol `HostList` churn di frame 222, serta sesi stabil panjang.
-- [ ] Benchmark build `release` (`-Build release`) dan jalankan `victory warm --used` untuk pre-warm pipeline driver.
-- [ ] Opsional BIOS tuning: aktifkan **Above 4G Decoding + Resizable BAR / AMD SAM** untuk membuka `mapped_card_memory=true` (offload otomatis hingga `1,536 MiB` loose window ke 16 GB VRAM).
-- [ ] Optimasi lanjutan CPU submission/descriptor untuk FPS stabil lebih tinggi pada CPU 6C/12T, serta uji `-InplaceProbe` jika loose window masih menekan `NON_LOCAL`.
+- [x] Uji live **Pass 6** (`46 menit` penuh tamat misi utama, **0 crash**, Shared GPU flat `2.8–3.8 / 7.49 GB`).
+- [ ] Uji live **Pass 7** di `release` (`.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build release -Panel`) dan `diag` untuk verifikasi FPS baru, turunnya `MakeResident` (`858.7 s -> ~0`), `shapes` tetap di bawah 4.19M, dan berkurangnya blur/eviction tekstur.
+- [ ] Uji ketajaman visual & tekstur ungu dengan `-Console series-x` (16 GB VRAM lega setelah rebalance 1,792 MiB) serta A/B test `-NoKeepShown` bila masih ada tekstur ungu acak.
+- [ ] Aktifkan `VICTORY_PIPELINE_BOOK=1` pada satu sesi (`-More @{ VICTORY_PIPELINE_BOOK = '1' }`), lalu jalankan `victory warm --used --jobs 6` (atau `-Warm`) agar `known-pipelines.bin` terisi dan driver pipeline tidak lagi terkompilasi saat bermain (`0` diketahui sebelumnya).
+- [ ] Opsional BIOS tuning: aktifkan **Above 4G Decoding + Re-Size BAR / AMD SAM** untuk membuka `mapped_card_memory=true` (offload otomatis hingga `1,536 MiB` loose window langsung via PCIe BAR tanpa mirror RAM).

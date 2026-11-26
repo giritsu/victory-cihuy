@@ -526,7 +526,7 @@ fn window_card_most_for(
         && let Some(budget) = vram_budget
     {
         if budget >= 14 << 30 {
-            return 2560 << 20;
+            return 1792 << 20;
         }
         if budget >= 12 << 30 {
             return 1536 << 20;
@@ -620,9 +620,8 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let host = host()?;
-    let hundredths = if card_ram_staging() { 84 } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
+        && used + size > budget / 100 * 80
     {
         return None;
     }
@@ -657,9 +656,8 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    let hundredths = if card_ram_staging() { 84 } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 100 * hundredths
+        && used + size > budget / 100 * 80
     {
         return None;
     }
@@ -5765,7 +5763,7 @@ mod window_tests {
     fn compact_ram_offloads_loose_windows_to_vram_when_bar_unavailable() {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
-        assert_eq!(window_card_most_for(None, true, true, true, false, Some(16 * GIB)), 2560 * MIB);
+        assert_eq!(window_card_most_for(None, true, true, true, false, Some(16 * GIB)), 1792 * MIB);
         assert_eq!(window_card_most_for(None, true, true, true, false, Some(12 * GIB)), 1536 * MIB);
         assert_eq!(window_card_most_for(None, true, true, true, false, Some(8 * GIB)), 0);
         assert_eq!(window_card_most_for(None, true, true, true, true, Some(16 * GIB)), 0);

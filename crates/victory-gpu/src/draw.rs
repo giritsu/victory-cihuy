@@ -2636,7 +2636,9 @@ impl State {
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
         let throttle_catchup = crate::residency::compact_host_ram()
-            && (crate::residency::pressured() || crate::texture::live_staging_bytes() >= (256 << 20));
+            && (crate::residency::shared_pressured()
+                || crate::residency::critical_commit()
+                || crate::texture::live_staging_bytes() >= (256 << 20));
         let (per_frame, span) = if catchup && !throttle_catchup && on_time >= 1024 {
             (per_frame * 3, span * 3)
         } else {

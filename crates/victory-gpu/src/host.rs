@@ -1939,6 +1939,28 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     })
 }
 
+fn scratch_spare_limit(
+    compact: bool,
+    limited: bool,
+    keep_freed: bool,
+    shared_pressured: bool,
+    critical: bool,
+) -> u64 {
+    if compact {
+        if critical {
+            0
+        } else if shared_pressured {
+            64 << 20
+        } else {
+            192 << 20
+        }
+    } else if keep_freed && !limited {
+        SPARE_KEPT
+    } else {
+        SPARE_MOST
+    }
+}
+
 /// A list is done with `chunks` (it was reset after its submissions ran,
 /// or dropped): kept for the next list, or freed past [`SPARE_MOST`] and
 /// without the pool.
@@ -1948,16 +1970,16 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     }
     let mut freed = Vec::new();
     {
+        let limit = scratch_spare_limit(
+            crate::residency::compact_host_ram(),
+            crate::residency::limited_host_ram(),
+            keep_freed(),
+            crate::residency::shared_pressured(),
+            crate::residency::critical_commit(),
+        );
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if crate::residency::compact_host_ram() {
-                    32 << 20
-                } else if keep_freed() && !crate::residency::limited_host_ram() {
-                    SPARE_KEPT
-                } else {
-                    SPARE_MOST
-                };
                 spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
@@ -10760,6 +10782,16 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn scratch_spare_limit_scales_for_compact_ram_and_pressure() {
+        assert_eq!(super::scratch_spare_limit(true, true, false, false, false), 192 << 20);
+        assert_eq!(super::scratch_spare_limit(true, true, true, false, false), 192 << 20);
+        assert_eq!(super::scratch_spare_limit(true, true, false, true, false), 64 << 20);
+        assert_eq!(super::scratch_spare_limit(true, true, false, false, true), 0);
+        assert_eq!(super::scratch_spare_limit(false, true, true, false, false), super::SPARE_MOST);
+        assert_eq!(super::scratch_spare_limit(false, false, true, false, false), super::SPARE_KEPT);
     }
 }
 

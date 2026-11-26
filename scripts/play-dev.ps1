@@ -1,7 +1,8 @@
 # Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p).
 #   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-s|series-x]
-#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-InplaceProbe] [-Safe]
+#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-Warm] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
+# Note: -Console series-x is now viable to test on 16 GB VRAM for sharper visuals.
 # Run from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified.
 param(
     [string]$GameDir = $env:VICTORY_GAME_DIR,
@@ -14,6 +15,8 @@ param(
     [switch]$RayTracing,
     [switch]$LevelsOnDemand,
     [switch]$InplaceProbe,
+    [switch]$NoKeepShown,
+    [switch]$Warm,
     [switch]$Safe,
     [string]$LogFile = (Join-Path $env:LOCALAPPDATA 'victory\dev-run.log'),
     [hashtable]$More = @{}
@@ -92,9 +95,18 @@ if ($DebugLayer) { $settings.VICTORY_D3D12_DEBUG = '1' }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
 if ($InplaceProbe) { $settings.VICTORY_INPLACE_PROBE = '1' }
+if ($NoKeepShown) { $settings.VICTORY_KEEP_SHOWN = '0' }
 
 foreach ($k in $More.Keys) { $settings[$k] = [string]$More[$k] }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+
+if ($Warm) {
+    Write-Host "Pre-warming driver pipelines (`$env:VICTORY_CACHE_DIR = $($env:VICTORY_CACHE_DIR))..."
+    & $victory warm --used --jobs 6
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "warning: victory warm returned exit code $LASTEXITCODE"
+    }
+}
 
 $logDir = Split-Path -Parent $LogFile
 if ($logDir) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }

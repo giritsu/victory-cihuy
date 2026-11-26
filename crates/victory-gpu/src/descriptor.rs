@@ -938,13 +938,36 @@ fn constant_of(i: u32, generation: u32) -> View {
     View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
 }
 
+/// Whether placed view descriptions strip alignment padding (`resource[1]`, `resource[13]`)
+/// and unread trailing words (`desc[12..16]`) before deduplicating `Shape`s (`VICTORY_PLACED_FILLER=1` keeps them).
+fn strip_placed_filler() -> bool {
+    static STRIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRIP.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_none_or(|v| v != "1"))
+}
+
+fn normalize_placed(resource: &mut [u32; 14], desc: &mut [u32; 16]) {
+    if strip_placed_filler() {
+        // Words 1 and 13 of `ResourceDesc` are struct alignment padding (stack garbage);
+        // `desc[12..16]` are unused trailing console words past the 40-byte PC desc + 64-bit address.
+        resource[1] = 0;
+        resource[13] = 0;
+        desc[12..16].fill(0);
+    }
+}
+
 /// A placed view's shape and its address.
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    let mut res = *resource;
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
+    if strip_placed_filler() {
+        res[1] = 0;
+        res[13] = 0;
+        rest[10..14].fill(0);
+    }
     (
-        (unordered, *resource, rest),
+        (unordered, res, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }
@@ -1330,7 +1353,8 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
+        normalize_placed(&mut resource, &mut desc);
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1341,7 +1365,8 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
+        normalize_placed(&mut resource, &mut desc);
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1735,33 +1760,56 @@ mod tests {
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        let mut expected_resource = resource;
+        if strip_placed_filler() {
+            expected_resource[1] = 0;
+            expected_resource[13] = 0;
+        }
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        let mut expected_desc = desc;
+        if strip_placed_filler() {
+            expected_desc[12..16].fill(0);
+        }
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-            View::Placed(_, r, _) => *r == resource,
+            View::Placed(_, r, _) => *r == expected_resource,
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == expected_resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
             assert_eq!(view(at), Some(View::Constant(address, 512)));
             let placed = 0xd_4940_0000 + n * 0x1_0000;
             (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
+            (expected_desc[10], expected_desc[11]) = (desc[10], desc[11]);
             create_placed_srv(null, &resource, &desc, at);
-            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+            assert_eq!(view(at), Some(View::Placed(false, expected_resource, expected_desc)));
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
+        // Varying padding/filler words also fold into that single shape.
+        for n in 0..1_000u32 {
+            let mut dirty_res = resource;
+            dirty_res[1] = 0xdead_0000 + n;
+            dirty_res[13] = 0xbeef_0000 + n;
+            let mut dirty_desc = desc;
+            dirty_desc[12..16].copy_from_slice(&[n, n ^ 1, n ^ 2, n ^ 3]);
+            create_placed_srv(null, &dirty_res, &dirty_desc, at);
+            assert_eq!(view(at), Some(View::Placed(false, expected_resource, expected_desc)));
+        }
+        assert_eq!(entries(), 0, "no table entries after filler variation");
+        assert_eq!(shapes(), 1, "still one shape across filler variations");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        assert_eq!(view(at), Some(View::Placed(true, expected_resource, expected_desc)));
         assert_eq!(shapes(), 2);
         // Placed memory past 1 TiB (not title memory) is a table entry.
         (desc[10], desc[11]) = (0, 0x100);
+        (expected_desc[10], expected_desc[11]) = (0, 0x100);
         create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(view(at), Some(View::Placed(false, expected_resource, expected_desc)));
         assert_eq!(entries(), 1);
         // A record's words are the same for the same view (the host knows
         // a slot's view by them), and differ with the address.

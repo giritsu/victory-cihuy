@@ -138,12 +138,26 @@ pub(crate) fn compact_host_ram() -> bool {
     *COMPACT.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 18 * GIB))
 }
 
-fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
-    if was {
+fn next_pressure_for(was: bool, physical: u64, commit: u64, compact: bool) -> bool {
+    if compact {
+        // On <= 18 GiB RAM hosts, Windows keeps active working sets near physical RAM
+        // while a large pagefile handles commit and WDDM NON_LOCAL is tracked separately
+        // by `next_shared_pressure`. Only signal RAM pressure on low commit or very low
+        // physical headroom.
+        if was {
+            physical < 768 * MIB || commit < 4 * GIB
+        } else {
+            physical <= 512 * MIB || commit <= 3 * GIB
+        }
+    } else if was {
         physical < 5 * GIB || commit < 6 * GIB
     } else {
         physical <= 3 * GIB || commit <= 4 * GIB
     }
+}
+
+fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
+    next_pressure_for(was, physical, commit, false)
 }
 
 /// Evaluates WDDM Shared GPU Memory (`DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL`)
@@ -176,7 +190,7 @@ pub(crate) fn refresh(video_memory: Option<[u64; 4]>) {
     let was_shared = SHARED_PRESSURED.load(Ordering::Relaxed);
     let was = was_ram || was_shared;
 
-    let ram_pressure = next_pressure(was_ram, physical, commit);
+    let ram_pressure = next_pressure_for(was_ram, physical, commit, compact_host_ram());
     let (shared_pressure, shared_critical) = match video_memory {
         Some([_, _, sb, su]) => next_shared_pressure(was_shared, sb, su),
         None => (false, false),
@@ -223,6 +237,10 @@ pub(crate) fn refresh(video_memory: Option<[u64; 4]>) {
 pub(crate) fn headroom() -> Option<u64> {
     let bytes = HEADROOM.load(Ordering::Relaxed);
     (bytes != u64::MAX).then_some(bytes)
+}
+
+pub(crate) fn shared_pressured() -> bool {
+    SHARED_PRESSURED.load(Ordering::Relaxed)
 }
 
 pub(crate) fn pressured() -> bool {
@@ -289,6 +307,20 @@ mod tests {
         assert!(next_pressure(true, 6 * GIB, 5 * GIB));
         assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
         assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+    }
+
+    #[test]
+    fn compact_ram_pressure_tracks_commit_and_low_physical_floor() {
+        // 3 GiB physical free with ample commit does not falsely trigger on 16 GiB RAM.
+        assert!(!next_pressure_for(false, 3 * GIB, 20 * GIB, true));
+        assert!(!next_pressure_for(false, 513 * MIB, 3 * GIB + 1, true));
+        // Enters on low physical (<= 512 MiB) or low commit (<= 3 GiB).
+        assert!(next_pressure_for(false, 512 * MIB, 20 * GIB, true));
+        assert!(next_pressure_for(false, 3 * GIB, 3 * GIB, true));
+        // Hysteresis keeps pressure until both physical >= 768 MiB and commit >= 4 GiB.
+        assert!(next_pressure_for(true, 700 * MIB, 20 * GIB, true));
+        assert!(next_pressure_for(true, 2 * GIB, 3900 * MIB, true));
+        assert!(!next_pressure_for(true, 768 * MIB, 4 * GIB, true));
     }
 
     #[test]

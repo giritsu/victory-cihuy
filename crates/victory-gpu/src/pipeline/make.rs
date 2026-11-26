@@ -150,10 +150,13 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a pipeline has no host pipeline (diagnostics): its skip reason, shaders
+/// that do not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(why.into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
