@@ -446,71 +446,142 @@ struct IndexedSpan<T> {
     hit: IntervalHit<T>,
 }
 
-fn build_interval_spans<T: Clone + Eq>(
+fn build_interval_spans<T: Clone + Eq + std::hash::Hash>(
     writers: &[(usize, usize, Option<(T, u64, u64, bool)>)],
 ) -> Vec<IndexedSpan<T>> {
-    let mut points: Vec<usize> = Vec::with_capacity(writers.len() * 2);
+    #[derive(Clone, Copy)]
+    enum SweepEvent {
+        AddNone,
+        RemoveNone,
+        AddGood(usize),
+        RemoveGood(usize),
+        AddBad(usize),
+        RemoveBad(usize),
+    }
+
+    if writers.is_empty() {
+        return Vec::new();
+    }
+    let mut ids: std::collections::HashMap<T, usize> = std::collections::HashMap::new();
+    let mut unique: Vec<T> = Vec::new();
+    let mut events: Vec<(usize, SweepEvent)> = Vec::with_capacity(writers.len() * 2);
     for (from, to, target) in writers {
-        if *from < *to {
-            points.push(*from);
-            points.push(*to);
-            if let Some((_, start, len, false)) = target {
-                let end = start.saturating_add(*len);
-                let s0 = usize::try_from(*start).unwrap_or(usize::MAX);
-                let s1 = usize::try_from(end).unwrap_or(usize::MAX);
-                if *from < s0 && s0 < *to {
-                    points.push(s0);
-                }
-                if *from < s1 && s1 < *to {
-                    points.push(s1);
-                }
+        if *from >= *to {
+            continue;
+        }
+        let Some((s, start, len, in_place)) = target else {
+            events.push((*from, SweepEvent::AddNone));
+            events.push((*to, SweepEvent::RemoveNone));
+            continue;
+        };
+        let id = match ids.get(s) {
+            Some(&id) => id,
+            None => {
+                let id = unique.len();
+                unique.push(s.clone());
+                ids.insert(s.clone(), id);
+                id
             }
+        };
+        if *in_place {
+            events.push((*from, SweepEvent::AddBad(id)));
+            events.push((*to, SweepEvent::RemoveBad(id)));
+            continue;
+        }
+        let s0 = usize::try_from(*start).unwrap_or(usize::MAX);
+        let s1 = usize::try_from(start.saturating_add(*len)).unwrap_or(usize::MAX);
+        let g0 = (*from).max(s0).min(*to);
+        let g1 = (*to).min(s1).max(g0);
+        if *from < g0 {
+            events.push((*from, SweepEvent::AddBad(id)));
+            events.push((g0, SweepEvent::RemoveBad(id)));
+        }
+        if g0 < g1 {
+            events.push((g0, SweepEvent::AddGood(id)));
+            events.push((g1, SweepEvent::RemoveGood(id)));
+        }
+        if g1 < *to {
+            events.push((g1, SweepEvent::AddBad(id)));
+            events.push((*to, SweepEvent::RemoveBad(id)));
         }
     }
-    points.sort_unstable();
-    points.dedup();
-    let mut spans: Vec<IndexedSpan<T>> = Vec::with_capacity(points.len().saturating_sub(1));
-    for win in points.windows(2) {
-        let (a, b) = (win[0], win[1]);
-        let mut found: Option<(&T, u64, u64, bool)> = None;
-        let mut conflict: Option<&'static str> = None;
-        for (wf, wt, target) in writers {
-            if !(*wf < b && a < *wt) {
-                continue;
+    if events.is_empty() {
+        return Vec::new();
+    }
+    events.sort_unstable_by_key(|e| e.0);
+
+    let mut active_count = vec![0usize; unique.len()];
+    let mut bad_count = vec![0usize; unique.len()];
+    let mut none_count = 0usize;
+    let mut distinct_active = 0usize;
+    let mut active_id_sum = 0usize;
+    let mut spans: Vec<IndexedSpan<T>> = Vec::with_capacity(events.len() / 2);
+
+    let mut i = 0;
+    while i < events.len() {
+        let x = events[i].0;
+        while i < events.len() && events[i].0 == x {
+            match events[i].1 {
+                SweepEvent::AddNone => none_count += 1,
+                SweepEvent::RemoveNone => none_count -= 1,
+                SweepEvent::AddGood(id) => {
+                    if active_count[id] == 0 {
+                        distinct_active += 1;
+                        active_id_sum += id;
+                    }
+                    active_count[id] += 1;
+                }
+                SweepEvent::RemoveGood(id) => {
+                    active_count[id] -= 1;
+                    if active_count[id] == 0 {
+                        distinct_active -= 1;
+                        active_id_sum -= id;
+                    }
+                }
+                SweepEvent::AddBad(id) => {
+                    if active_count[id] == 0 {
+                        distinct_active += 1;
+                        active_id_sum += id;
+                    }
+                    active_count[id] += 1;
+                    bad_count[id] += 1;
+                }
+                SweepEvent::RemoveBad(id) => {
+                    active_count[id] -= 1;
+                    bad_count[id] -= 1;
+                    if active_count[id] == 0 {
+                        distinct_active -= 1;
+                        active_id_sum -= id;
+                    }
+                }
             }
-            match (target, &found) {
-                (None, _) => {
-                    conflict = Some("a read-back or a value behind a flight is written there");
-                    break;
-                }
-                (Some((s, _, _, _)), Some((f, _, _, _))) if s != *f => {
-                    conflict = Some("flights write it through two host copies");
-                    break;
-                }
-                (Some((s, start, len, in_place)), None) => {
-                    found = Some((s, *start, *len, *in_place));
-                }
-                _ => {}
-            }
+            i += 1;
         }
-        let hit = if let Some(msg) = conflict {
-            IntervalHit::Conflict(msg)
-        } else if let Some((s, start, len, in_place)) = found {
-            if in_place || (a as u64) < start || (b as u64) > start + len {
+        if i >= events.len() {
+            break;
+        }
+        let next_x = events[i].0;
+        let hit = if none_count > 0 {
+            IntervalHit::Conflict("a read-back or a value behind a flight is written there")
+        } else if distinct_active > 1 {
+            IntervalHit::Conflict("flights write it through two host copies")
+        } else if distinct_active == 1 {
+            let id = active_id_sum;
+            if bad_count[id] > 0 {
                 IntervalHit::Conflict("no host copy holds all of it")
             } else {
-                IntervalHit::One(s.clone())
+                IntervalHit::One(unique[id].clone())
             }
         } else {
             continue;
         };
         if let Some(last) = spans.last_mut()
-            && last.to == a
+            && last.to == x
             && last.hit == hit
         {
-            last.to = b;
+            last.to = next_x;
         } else {
-            spans.push(IndexedSpan { from: a, to: b, hit });
+            spans.push(IndexedSpan { from: x, to: next_x, hit });
         }
     }
     spans
@@ -544,6 +615,12 @@ impl PartialEq for ShadowKey {
 }
 
 impl Eq for ShadowKey {}
+
+impl std::hash::Hash for ShadowKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.0) as usize).hash(state);
+    }
+}
 
 /// Disjoint partition of `writers` intervals for O(log N) + MRU [`holder`] lookups.
 struct WriterIndex {
@@ -1646,5 +1723,80 @@ mod tests {
         assert_eq!(lookup_interval_spans(&spans, 920, 1000).map(|(_, _, r)| r), Some(Ok(&4)));
         assert!(lookup_interval_spans(&spans, 620, 650).is_none());
         assert!(lookup_interval_spans(&spans, 390, 410).is_none());
+    }
+
+    #[test]
+    fn interval_spans_fuzz_matches_bruteforce_and_scales_linearly() {
+        let mut seed = 0x5EED_1234u64;
+        let mut next = |n: u64| -> usize {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 16) % n) as usize
+        };
+        let brute = |writers: &[(usize, usize, Option<(u32, u64, u64, bool)>)], from: usize, to: usize| {
+            let mut found: Option<(u32, u64, u64, bool)> = None;
+            for (wf, wt, target) in writers {
+                if !(*wf < to && from < *wt) {
+                    continue;
+                }
+                match (target, found) {
+                    (None, _) => return Some(Err("a read-back or a value behind a flight is written there")),
+                    (Some((s, _, _, _)), Some((f, _, _, _))) if *s != f => {
+                        return Some(Err("flights write it through two host copies"));
+                    }
+                    (Some(t), None) => found = Some(*t),
+                    _ => {}
+                }
+            }
+            found.map(|(s, start, len, in_place)| {
+                if in_place || (from as u64) < start || (to as u64) > start.saturating_add(len) {
+                    Err("no host copy holds all of it")
+                } else {
+                    Ok(s)
+                }
+            })
+        };
+
+        for _ in 0..200 {
+            let shadows = [
+                (1u32, next(60) as u64, (40 + next(120)) as u64, next(8) == 0),
+                (2u32, next(80) as u64, (50 + next(120)) as u64, next(8) == 0),
+                (3u32, next(100) as u64, (50 + next(140)) as u64, next(8) == 0),
+            ];
+            let count = 1 + next(30);
+            let mut writers = Vec::with_capacity(count);
+            for _ in 0..count {
+                let from = next(200);
+                let to = from + 1 + next(80);
+                let target = if next(6) == 0 {
+                    None
+                } else {
+                    Some(shadows[next(3)])
+                };
+                writers.push((from, to, target));
+            }
+            let spans = build_interval_spans(&writers);
+            for _ in 0..40 {
+                let a = next(220);
+                let b = a + 1 + next(40);
+                if let Some((_, _, res)) = lookup_interval_spans(&spans, a, b) {
+                    let expected = brute(&writers, a, b);
+                    match (res.copied(), expected) {
+                        (Ok(got), Some(Ok(exp))) => assert_eq!(got, exp, "a={a} b={b}"),
+                        (Err(_), Some(Err(_))) => {}
+                        _ => panic!("mismatch a={a} b={b} got={res:?} expected={expected:?}"),
+                    }
+                }
+            }
+        }
+
+        // 4,000 overlapping writers complete instantaneously and merge cleanly.
+        let stress: Vec<_> = (0..4000)
+            .map(|i| {
+                let at = (i * 23) % 90_000;
+                (at, at + 500, Some((1u32, 0u64, 100_000u64, false)))
+            })
+            .collect();
+        let spans = build_interval_spans(&stress);
+        assert_eq!(lookup_interval_spans(&spans, 100, 900).map(|(_, _, r)| r), Some(Ok(&1)));
     }
 }

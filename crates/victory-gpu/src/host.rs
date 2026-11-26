@@ -8206,7 +8206,7 @@ impl Batch {
         crate::shadow::wide_each_chunked(
             due.len(),
             spans.len(),
-            if many { 32 } else { 1 },
+            if many { 8 } else { 1 },
             move |i| due[i].refresh(),
             move |from, to| {
                 for (shadow, a, b) in &spans[from..to] {
@@ -8385,7 +8385,7 @@ impl Batch {
                 crate::shadow::wide_each_chunked(
                     0,
                     refreshes.len(),
-                    if many { 32 } else { 4 },
+                    if many { 8 } else { 1 },
                     |_| {},
                     move |from, to| {
                         for (shadow, a, b) in &refreshes[from..to] {

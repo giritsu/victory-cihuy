@@ -2536,9 +2536,11 @@ impl State {
         };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
+        static SPENT_US: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
+            SPENT_US.store(0, Ordering::Relaxed);
         }
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
@@ -2627,31 +2629,34 @@ impl State {
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
         static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
+        let base_ms = *SPAN_MS.get_or_init(|| {
             std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
-        }));
+        });
         // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
-        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
-        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        // surfaces at 192 MB a frame) gets extra bytes and time until it drains;
+        // `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let throttle_catchup = crate::residency::compact_host_ram()
+        let compact = crate::residency::compact_host_ram();
+        let throttle_catchup = compact
             && (crate::residency::shared_pressured()
                 || crate::residency::critical_commit()
                 || crate::texture::live_staging_bytes() >= (256 << 20));
-        let (per_frame, span) = if catchup && !throttle_catchup && on_time >= 1024 {
-            (per_frame * 3, span * 3)
+        let budget_us = texture_stage_budget_us(base_ms, compact, catchup, throttle_catchup, on_time);
+        let per_frame = if catchup && !throttle_catchup && on_time >= 1024 {
+            per_frame * if compact { 2 } else { 3 }
         } else {
-            (per_frame, span)
+            per_frame
         };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
-        let (span, bytes_at_most) = match PASS_BUDGET.get() {
-            Some((ms, bytes, _)) => {
-                (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
-            }
-            None => (span, per_frame),
+        let (early_span, bytes_at_most) = match PASS_BUDGET.get() {
+            Some((ms, bytes, _)) => (
+                Some(std::time::Duration::from_millis(ms)),
+                SPENT.load(Ordering::Relaxed).saturating_add(bytes),
+            ),
+            None => (None, per_frame),
         };
         // Apply the shared frame ceiling after early-pass and catch-up budgets.
         // A bake samples its inputs immediately and cannot retry that draw.
@@ -2663,18 +2668,30 @@ impl State {
                 crate::residency::pressured(),
                 crate::residency::critical_commit(),
                 crate::residency::limited_host_ram(),
-                crate::residency::compact_host_ram(),
+                compact,
                 crate::texture::live_staging_bytes(),
             )
         };
 
+        struct SpentUsGuard<'a>(&'a AtomicU64, std::time::Instant);
+        impl Drop for SpentUsGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
         let began = std::time::Instant::now();
+        let _spent_us_guard = early_span.is_none().then(|| SpentUsGuard(&SPENT_US, began));
+        let already_spent_us = SPENT_US.load(Ordering::Relaxed);
         if sync.is_none() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
         let mut served = true;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            let timed_out = match early_span {
+                Some(span) => began.elapsed() > span,
+                None => already_spent_us.saturating_add(began.elapsed().as_micros() as u64) >= budget_us,
+            };
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || timed_out {
                 served = false;
                 break;
             }
@@ -4879,6 +4896,22 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// Per-frame texture staging time budget in microseconds.
+fn texture_stage_budget_us(
+    base_ms: u64,
+    compact: bool,
+    catchup: bool,
+    throttle_catchup: bool,
+    on_time: usize,
+) -> u64 {
+    let mult = if catchup && !throttle_catchup && on_time >= 1024 {
+        if compact { 2 } else { 3 }
+    } else {
+        1
+    };
+    base_ms.saturating_mul(mult).saturating_mul(1000)
+}
+
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
 /// budget (`None` keeps the 192 MiB 12 GiB baseline).
 fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
@@ -4911,6 +4944,16 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    #[test]
+    fn texture_stage_budget_respects_compact_catchup() {
+        use super::texture_stage_budget_us;
+        assert_eq!(texture_stage_budget_us(12, true, true, false, 500), 12_000);
+        assert_eq!(texture_stage_budget_us(12, true, true, false, 1024), 24_000);
+        assert_eq!(texture_stage_budget_us(12, false, true, false, 1024), 36_000);
+        assert_eq!(texture_stage_budget_us(12, true, true, true, 2000), 12_000);
+        assert_eq!(texture_stage_budget_us(12, false, false, false, 2000), 12_000);
     }
 }
 
