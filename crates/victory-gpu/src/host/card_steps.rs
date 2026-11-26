@@ -108,10 +108,10 @@ const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads,
 
 /// The bytes of our buffer between reading and writing: what one submission
 /// may do this way (each place read once, however many fills take it).
-const BETWEEN: u64 = 4 << 20;
+const BETWEEN: u64 = 8 << 20;
 
 /// The most steps of a submission done this way.
-const MOST: usize = 12288;
+const MOST: usize = 32768;
 
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.

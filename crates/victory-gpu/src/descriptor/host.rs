@@ -31,6 +31,13 @@ impl Slots {
         }
     }
 
+    /// Lock-free membership test for `slot`.
+    fn has(&self, slot: u32) -> bool {
+        self.0
+            .get(slot as usize / 64)
+            .is_some_and(|bits| bits.load(std::sync::atomic::Ordering::Acquire) & (1 << (slot % 64)) != 0)
+    }
+
     /// Whether it was there.
     fn remove(&self, slot: u32) -> bool {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
@@ -194,6 +201,8 @@ pub(crate) struct HostHeap {
     /// table; one a shader picks by a computed index is brought up to date
     /// from here ([`HostHeap::texture_slots_due`]).
     textures: Mutex<TextureQueue>,
+    /// Conservative lock-free membership bitset matching `textures`.
+    in_textures: Slots,
     /// Per title slot, the frame (plus one; 0: never) in which a draw last
     /// read it through a table, or made a table it lies in (with
     /// [`TABLED_READ`] set if the draw read it). The draw that
@@ -212,6 +221,8 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Conservative lock-free membership bitset matching `placed`.
+    in_placed: Slots,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1618,6 +1629,7 @@ impl HostHeap {
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::default(),
+            in_textures: Slots::new(if sampler { 0 } else { count as usize }),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -1631,6 +1643,7 @@ impl HostHeap {
                 }
                 spans
             },
+            in_placed: Slots::new(if sampler { 0 } else { count as usize }),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1851,7 +1864,12 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         match again {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
-            None => textures.done(index, write),
+            None => {
+                textures.done(index, write);
+                if !textures.slots.contains_key(&index) {
+                    self.in_textures.remove(index);
+                }
+            }
         }
     }
 
@@ -1928,6 +1946,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
+            self.in_textures.put(slot);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
@@ -1953,6 +1972,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
+            self.in_textures.put(slot);
         }
         slots.len()
     }
@@ -2014,6 +2034,7 @@ impl HostHeap {
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
         for &slot in &slots {
             textures.changed(slot, frame, frame);
+            self.in_textures.put(slot);
         }
         slots.len()
     }
@@ -2042,6 +2063,7 @@ impl HostHeap {
         }
         for &slot in &slots {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+            self.in_textures.put(slot);
         }
         [held, slots.len(), slots.len()]
     }
@@ -2124,6 +2146,7 @@ impl HostHeap {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
+            self.in_textures.put(slot);
         }
         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
         slots.len()
@@ -2613,11 +2636,12 @@ impl HostHeap {
         // Once per slot and frame: tables are read by every draw.
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
-            if tabled_out() {
+            if tabled_out() && self.in_textures.has(index) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
                 if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
+                self.in_textures.remove(index);
             }
         }
     }
@@ -2650,7 +2674,6 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
-        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2658,9 +2681,13 @@ impl HostHeap {
             } else {
                 0
             };
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             textures.written(index, frame, due, seen);
-        } else {
+            self.in_textures.put(index);
+        } else if self.in_textures.has(index) {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             textures.remove(index);
+            self.in_textures.remove(index);
         }
     }
 
@@ -2734,7 +2761,7 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let stale = if placed_view.is_some() || self.in_placed.has(index) {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
@@ -2747,21 +2774,29 @@ impl HostHeap {
                     placed.rule = stale_rule();
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
+                    self.in_placed.put(index);
+                    for &slot in &stale {
+                        self.in_placed.remove(slot);
+                    }
                     // (Under the lock of `placed`: a later write of one of
                     // them comes by here before it makes the slot.)
                     stale.into_iter().map(|slot| (slot, self.made.get(slot).unwrap_or(0))).collect()
                 }
                 None => {
                     placed.forget(index);
+                    self.in_placed.remove(index);
                     Vec::new()
                 }
             }
+        } else {
+            Vec::new()
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
             let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
             for &(slot, _) in &stale {
                 textures.remove(slot);
+                self.in_textures.remove(slot);
             }
         }
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
@@ -4163,7 +4198,7 @@ fn twin_uav(
 /// whole 256s, and at most the 64 KiB a shader can index. The host removes
 /// the device for a larger view, and the title's heap holds such sizes in
 /// slots it does not use.
-fn constant_bytes(size: u32) -> u32 {
+pub(crate) fn constant_bytes(size: u32) -> u32 {
     const LARGEST: u32 = 64 << 10;
     size.min(LARGEST).next_multiple_of(256)
 }
@@ -5395,6 +5430,25 @@ mod tests {
         null_for(&view, heap.cpu(0));
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn slots_has_tracks_put_and_remove() {
+        let slots = Slots::new(130);
+        assert!(!slots.has(0));
+        assert!(!slots.has(65));
+        assert!(!slots.has(999));
+        slots.put(0);
+        slots.put(65);
+        slots.put(129);
+        assert!(slots.has(0));
+        assert!(slots.has(65));
+        assert!(slots.has(129));
+        assert!(slots.remove(65));
+        assert!(!slots.has(65));
+        assert!(!slots.remove(65));
+        assert!(slots.has(0));
+        assert!(slots.has(129));
     }
 
     #[test]

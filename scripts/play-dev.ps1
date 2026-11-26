@@ -19,9 +19,13 @@ param(
     [switch]$LearnWriteSites,
     [switch]$Warm,
     [switch]$Safe,
-    [string]$LogFile = (Join-Path $env:LOCALAPPDATA 'victory\dev-run.log'),
+    [string]$LogFile,
     [hashtable]$More = @{}
 )
+
+if (-not $LogFile) {
+    $LogFile = Join-Path $env:LOCALAPPDATA "victory\dev-run-$Console-$Build.log"
+}
 
 if (-not $GameDir) {
     Write-Host "Set -GameDir or `$env:VICTORY_GAME_DIR to your game dump folder containing game_scarlett_master.exe."
@@ -72,6 +76,7 @@ $settings = @{
     VICTORY_AMBIENT              = '0.8'
     VICTORY_AMBIENT_AIR          = '1.5'
     VICTORY_CARD_BUFFERS_MIN_KB  = '256'
+    VICTORY_TEXTURE_STAGE_MS     = '12'
 }
 
 if ($Build -eq 'diag') {

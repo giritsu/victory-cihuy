@@ -1208,6 +1208,10 @@ pub(crate) struct HostList {
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// Device-local constant buffer fed inline on the GPU for draws reading
+    /// ranges written by an earlier [`place`] copy in this same list:
+    /// `(buffer, capacity, used_bytes, in_read_state)`.
+    inline_cbv: Mutex<Option<(ID3D12Resource, u64, u64, bool)>>,
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
@@ -2314,6 +2318,9 @@ struct Deferred {
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
+    /// Title memory ranges (`dst..dst+len`) written by an earlier [`place`]
+    /// copy in this recording, with the destination host copy.
+    placed_ranges: Vec<(usize, usize, std::sync::Arc<crate::shadow::Shadow>)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -3707,11 +3714,12 @@ fn late_line(frames: f64) {
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.2} inline constant copies",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            t[4],
         );
     }
     card_steps::log(frames);
@@ -4190,6 +4198,7 @@ impl Host {
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
+                inline_cbv: Mutex::default(),
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
@@ -6459,6 +6468,10 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if let Some(slot) = &mut *self.inline_cbv.lock().unwrap_or_else(|e| e.into_inner()) {
+            slot.2 = 0;
+            slot.3 = false;
+        }
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]

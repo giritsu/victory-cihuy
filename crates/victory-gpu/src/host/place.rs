@@ -47,8 +47,8 @@ pub(super) fn on() -> bool {
 const MOST: usize = 8 << 20;
 
 /// Since the last frame-rate line: copies at their place, their bytes, those
-/// out of a host copy, and texture copies out of one.
-pub(super) static STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// out of a host copy, texture copies out of one, and inline placed CBV copies.
+pub(super) static STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What the CPU does at submission for a copy at its place in a list.
 pub(super) struct Placed {
@@ -253,9 +253,10 @@ impl HostList {
             dst,
             src,
             len,
-            shadow: to,
+            shadow: to.clone(),
             from: scratch.map(|s| s.2 as usize),
         }));
+        deferred.placed_ranges.push((dst, dst.saturating_add(len), to));
         deferred.title_written();
         self.changed_something();
         true
@@ -290,6 +291,113 @@ impl HostList {
         self.keep(&buffer);
         Some(buffer)
     }
+
+    /// If `[address, address + size)` overlaps a range written by an earlier
+    /// [`HostList::place_copy`] in this recording (and all overlapping placed
+    /// writes target the same host copy), copies those bytes inline on the GPU
+    /// into a reusable device-local buffer for a constant buffer view instead
+    /// of queuing a CPU `Step::Fill`.
+    pub(crate) fn constant_from_placed(&self, address: u64, size: u64) -> Option<(ID3D12Resource, u64)> {
+        if !on() || size == 0 {
+            return None;
+        }
+        let shadow = {
+            let deferred = self.deferred();
+            if deferred.placed_ranges.is_empty() {
+                return None;
+            }
+            let addr = usize::try_from(address).ok()?;
+            let len = usize::try_from(size).ok()?;
+            find_placed_shadow(&deferred.placed_ranges, addr, len, std::sync::Arc::ptr_eq)?.clone()
+        };
+        if shadow.in_place() {
+            return None;
+        }
+        let (start, span_len) = shadow.span();
+        let end = address.checked_add(size)?;
+        if address < start || end > start + span_len {
+            return None;
+        }
+        let aligned = u64::from(crate::descriptor::host::constant_bytes(u32::try_from(size).ok()?));
+        if aligned == 0 || aligned > (64 << 10) {
+            return None;
+        }
+        let host = host()?;
+        shadow.refresh(self, address, size);
+        let (buf, dst_offset, was_read, prev_buf) = {
+            let mut slot = self.inline_cbv.lock().unwrap_or_else(|e| e.into_inner());
+            let mut prev = None;
+            let needs_new = match &*slot {
+                Some((_, cap, used, _)) => *used + aligned > *cap,
+                None => true,
+            };
+            if needs_new {
+                let prev_cap = slot.as_ref().map_or(0, |(_, cap, _, _)| *cap);
+                let cap = prev_cap
+                    .saturating_mul(2)
+                    .max(aligned)
+                    .max(64 << 10)
+                    .next_multiple_of(64 << 10);
+                let buffer = host.uav_buffer(cap)?;
+                name(&buffer, || format!("inline placed constant buffer {cap:#x}"));
+                if let Some((old, ..)) = slot.replace((buffer, cap, 0, false)) {
+                    prev = Some(old);
+                }
+            }
+            let (buffer, _, used, in_read_state) = slot.as_mut()?;
+            let dst_offset = *used;
+            *used += aligned;
+            let was_read = *in_read_state;
+            *in_read_state = true;
+            (buffer.clone(), dst_offset, was_read, prev)
+        };
+        if let Some(old) = prev_buf {
+            self.keep(&old);
+        }
+        const CBV_READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATES(
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0
+                | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0
+                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0,
+        );
+        // SAFETY: open list, live host shadow & inline buffers, validated offsets.
+        let gpu = unsafe {
+            wait_for_all(host, &self.list);
+            if was_read {
+                self.list.ResourceBarrier(&[transition(&buf, CBV_READ, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
+            self.list.CopyBufferRegion(&buf, dst_offset, &shadow.buffer, shadow.offset(address), size);
+            self.list.ResourceBarrier(&[transition(&buf, D3D12_RESOURCE_STATE_COPY_DEST, CBV_READ)]);
+            wait_for_all(host, &self.list);
+            buf.GetGPUVirtualAddress() + dst_offset
+        };
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        Some((buf, gpu))
+    }
+}
+
+/// Returns the latest placed-copy target overlapping `[address, address + len)`
+/// when all overlapping placed writes share the same underlying copy.
+fn find_placed_shadow<'a, T>(
+    ranges: &'a [(usize, usize, T)],
+    address: usize,
+    len: usize,
+    same: impl Fn(&T, &T) -> bool,
+) -> Option<&'a T> {
+    if len == 0 {
+        return None;
+    }
+    let end = address.checked_add(len)?;
+    let mut found: Option<&'a T> = None;
+    for (dst, dst_end, shadow) in ranges.iter().rev() {
+        if *dst < end && address < *dst_end {
+            match found {
+                None => found = Some(shadow),
+                Some(prev) if !same(prev, shadow) => return None,
+                Some(_) => {}
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]
@@ -318,5 +426,21 @@ mod tests {
             after.saturating_sub(before)
         );
         drop((card, pc));
+    }
+
+    #[test]
+    fn find_placed_shadow_picks_latest_matching_or_bails_on_conflict() {
+        let empty: Vec<(usize, usize, u32)> = Vec::new();
+        assert_eq!(super::find_placed_shadow(&empty, 0x1000, 64, |a, b| a == b), None);
+
+        let same = [(0x1000usize, 0x1200usize, 1u32), (0x1200, 0x1400, 1u32)];
+        assert_eq!(super::find_placed_shadow(&same, 0x0f00, 0x100, |a, b| a == b), None);
+        assert_eq!(super::find_placed_shadow(&same, 0x1000, 0x400, |a, b| a == b), Some(&1));
+        assert_eq!(super::find_placed_shadow(&same, 0x1100, 0, |a, b| a == b), None);
+        assert_eq!(super::find_placed_shadow(&same, usize::MAX - 10, 32, |a, b| a == b), None);
+
+        let mixed = [(0x1000usize, 0x1200usize, 1u32), (0x1100, 0x1300, 2u32)];
+        assert_eq!(super::find_placed_shadow(&mixed, 0x1200, 64, |a, b| a == b), Some(&2));
+        assert_eq!(super::find_placed_shadow(&mixed, 0x1180, 64, |a, b| a == b), None);
     }
 }
