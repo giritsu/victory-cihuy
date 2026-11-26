@@ -1323,6 +1323,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Bumped only on [`HostList::reset`] or when the list records work that
+    /// writes title memory (`defer_copy` / `defer`), so cached buffer SRV
+    /// refreshes remain valid across unrelated texture state transitions.
+    refresh_epoch: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4466,6 +4470,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                refresh_epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6761,6 +6766,7 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.changed_something();
+        self.bump_refresh_epoch();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
@@ -6811,6 +6817,16 @@ impl HostList {
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    fn bump_refresh_epoch(&self) {
+        self.refresh_epoch.store(next_epoch(), Ordering::Relaxed);
+    }
+
+    /// Epoch for cached buffer SRV refreshes on this list (unrelated texture
+    /// transitions only bump [`HostList::epoch`]).
+    pub(crate) fn refresh_epoch(&self) -> u64 {
+        self.refresh_epoch.load(Ordering::Relaxed)
     }
 
     /// Whether any deferred steps or texture state transitions have been
@@ -7303,6 +7319,7 @@ impl HostList {
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.title_written();
         self.changed_something();
+        self.bump_refresh_epoch();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7353,6 +7370,24 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
+        if len > 0
+            && let Some(Step::Refresh(prev_shadow, prev_addr, prev_len)) = deferred.copies.last_mut()
+            && *prev_len > 0
+            && std::sync::Arc::ptr_eq(prev_shadow, shadow)
+            && let (Some(prev_end), Some(end)) = (prev_addr.checked_add(*prev_len), address.checked_add(len))
+        {
+            if *prev_addr <= address && end <= prev_end {
+                return;
+            }
+            if (*prev_addr >> 12) == (address >> 12)
+                && ((prev_end - 1) >> 12) == ((end - 1) >> 12)
+            {
+                let new_addr = (*prev_addr).min(address);
+                *prev_len = prev_end.max(end) - new_addr;
+                *prev_addr = new_addr;
+                return;
+            }
+        }
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             deferred
@@ -7737,6 +7772,7 @@ impl HostList {
         deferred.title_written();
         drop(deferred);
         self.changed_something();
+        self.bump_refresh_epoch();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.

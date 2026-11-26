@@ -3018,6 +3018,20 @@ impl HostHeap {
         index: u32,
         batch: &mut CopyBatch,
     ) -> Option<Listed> {
+        self.apply_listed_batched(frame, words, index, batch, |listed, _| *listed)
+    }
+
+    /// Single-lookup variant of [`HostHeap::make_listed_batched`] that passes mutable
+    /// [`Listed`] state and pre-resolved [`CachedReadable`] metadata directly to `on_hit`,
+    /// avoiding follow-up `listed_view` / `note_listed` hash lookups and view clones.
+    pub(crate) fn apply_listed_batched<R>(
+        &self,
+        frame: u64,
+        words: [u32; 3],
+        index: u32,
+        batch: &mut CopyBatch,
+        on_hit: impl FnOnce(&mut Listed, &CachedReadable) -> R,
+    ) -> Option<R> {
         if self.sampler {
             return None;
         }
@@ -3048,94 +3062,115 @@ impl HostHeap {
                 views.tex_epoch = tex_epoch;
                 views.tex_made.clear();
             }
-            let cached_tex = views.tex_epoch == tex_epoch && views.tex_made.contains_key(&words);
-            let is_tex = if cached_tex {
-                true
-            } else if views.buf_epoch == buf_epoch && views.buf_made.contains_key(&words) {
-                false
-            } else {
-                let view = super::view_at(words[1], words[2])?;
-                // (A constant buffer's bytes are copied for each draw.)
-                if matches!(view, View::Constant(..)) {
-                    return None;
-                }
-                let is_tex = is_texture_view(&view);
-                if is_tex {
-                    if views.tex_epoch != tex_epoch {
-                        return None;
-                    }
-                    let at = ListViews::TEX_BASE + views.tex_made.len() as u32;
-                    if at >= ListViews::SLOTS {
-                        return None;
-                    }
-                    let kept = make_twinned(&view, views.slot(at), None)?;
-                    let stride_word = view_stride_word(&view);
-                    let listed = Listed {
-                        kind: crate::draw::view_kind(&view),
-                        texture: true,
-                        ready: (0, 0, false),
-                        tabled: None,
-                    };
-                    views.tex_made.insert(
-                        words,
-                        ListView { view, at, twin: false, stride_word, kept, listed },
-                    );
-                } else {
-                    if views.buf_epoch != buf_epoch {
-                        return None;
-                    }
-                    let at = 2 * views.buf_made.len() as u32;
-                    if at + 1 >= ListViews::BUF_SLOTS {
-                        return None;
-                    }
-                    let twin = twinned(&view);
-                    let kept = make_twinned(&view, views.slot(at), Some((views.slot(at + 1), true)))?;
-                    let stride_word = view_stride_word(&view);
-                    let listed = Listed {
-                        kind: crate::draw::view_kind(&view),
-                        texture: false,
-                        ready: (0, 0, false),
-                        tabled: None,
-                    };
-                    views.buf_made.insert(
-                        words,
-                        ListView { view, at, twin, stride_word, kept, listed },
-                    );
-                }
-                is_tex
-            };
-            let made = if is_tex { &views.tex_made[&words] } else { &views.buf_made[&words] };
-            batch.dst.push(self.cpu(index));
-            batch.src.push(views.slot(made.at));
-            #[cfg(feature = "diagnostics")]
-            if !self.written.is_empty() {
-                batch.written_slots.push(index);
-            }
-            if made.twin && twins {
-                batch.dst.push(self.cpu(self.raw + index));
-                batch.src.push(views.slot(made.at + 1));
+            let (views_start, views_step) = (views.start, views.step);
+            let enqueue = |made: &mut ListView| {
+                let slot_at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: views_start + i as usize * views_step,
+                };
+                batch.dst.push(self.cpu(index));
+                batch.src.push(slot_at(made.at));
                 #[cfg(feature = "diagnostics")]
                 if !self.written.is_empty() {
-                    batch.written_slots.push(self.raw + index);
+                    batch.written_slots.push(index);
                 }
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else if let Some(twin_flag) = self.twins.get(index as usize)
-                && twin_flag.swap(false, std::sync::atomic::Ordering::Relaxed)
-            {
-                if let Some(bank) = null_bank() {
+                if made.twin && twins {
                     batch.dst.push(self.cpu(self.raw + index));
-                    batch.src.push(bank.view(NullViewKind::BufferSrv));
+                    batch.src.push(slot_at(made.at + 1));
                     #[cfg(feature = "diagnostics")]
                     if !self.written.is_empty() {
                         batch.written_slots.push(self.raw + index);
                     }
-                } else {
-                    self.put_null_kind(self.raw + index, NullViewKind::BufferSrv);
+                    self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+                } else if let Some(twin_flag) = self.twins.get(index as usize)
+                    && twin_flag.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Some(bank) = null_bank() {
+                        batch.dst.push(self.cpu(self.raw + index));
+                        batch.src.push(bank.view(NullViewKind::BufferSrv));
+                        #[cfg(feature = "diagnostics")]
+                        if !self.written.is_empty() {
+                            batch.written_slots.push(self.raw + index);
+                        }
+                    } else {
+                        self.put_null_kind(self.raw + index, NullViewKind::BufferSrv);
+                    }
                 }
+                self.write_stride(index, made.stride_word);
+                self.keep_ref_retire(index, made.kept.as_ref(), &mut batch.retired);
+                on_hit(&mut made.listed, &made.readable)
+            };
+            if views.tex_epoch == tex_epoch
+                && let Some(made) = views.tex_made.get_mut(&words)
+            {
+                return Some(enqueue(made));
             }
-            self.write_stride(index, made.stride_word);
-            self.keep_ref_retire(index, made.kept.as_ref(), &mut batch.retired);
-            Some(made.listed)
+            if views.buf_epoch == buf_epoch
+                && let Some(made) = views.buf_made.get_mut(&words)
+            {
+                return Some(enqueue(made));
+            }
+            let view = super::view_at(words[1], words[2])?;
+            // (A constant buffer's bytes are copied for each draw.)
+            if matches!(view, View::Constant(..)) {
+                return None;
+            }
+            let is_tex = is_texture_view(&view);
+            if is_tex {
+                if views.tex_epoch != tex_epoch {
+                    return None;
+                }
+                let at = ListViews::TEX_BASE + views.tex_made.len() as u32;
+                if at >= ListViews::SLOTS {
+                    return None;
+                }
+                let kept = make_twinned(&view, views.slot(at), None)?;
+                let stride_word = view_stride_word(&view);
+                let listed = Listed {
+                    kind: crate::draw::view_kind(&view),
+                    texture: true,
+                    ready: (0, 0, false),
+                    tabled: None,
+                };
+                let readable = resolve_cached_readable(&view);
+                let made = views.tex_made.entry(words).or_insert(ListView {
+                    view,
+                    at,
+                    twin: false,
+                    stride_word,
+                    kept,
+                    listed,
+                    readable,
+                });
+                Some(enqueue(made))
+            } else {
+                if views.buf_epoch != buf_epoch {
+                    return None;
+                }
+                let at = 2 * views.buf_made.len() as u32;
+                if at + 1 >= ListViews::BUF_SLOTS {
+                    return None;
+                }
+                let twin = twinned(&view);
+                let kept = make_twinned(&view, views.slot(at), Some((views.slot(at + 1), true)))?;
+                let stride_word = view_stride_word(&view);
+                let listed = Listed {
+                    kind: crate::draw::view_kind(&view),
+                    texture: false,
+                    ready: (0, 0, false),
+                    tabled: None,
+                };
+                let readable = resolve_cached_readable(&view);
+                let made = views.buf_made.entry(words).or_insert(ListView {
+                    view,
+                    at,
+                    twin,
+                    stride_word,
+                    kept,
+                    listed,
+                    readable,
+                });
+                Some(enqueue(made))
+            }
         })
     }
 
@@ -3287,6 +3322,8 @@ impl HostHeap {
     }
 
     fn keep_ref_retire(&self, index: u32, resource: Option<&ID3D12Resource>, retired: &mut Vec<ID3D12Resource>) {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3295,6 +3332,8 @@ impl HostHeap {
             use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             if slot.as_ref().map(Interface::as_raw) == raw {
+                #[cfg(feature = "diagnostics")]
+                KEEP_REF_NS.fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
             std::mem::replace(&mut *slot, resource.cloned())
@@ -3302,6 +3341,8 @@ impl HostHeap {
         if let Some(old) = old {
             retired.push(old);
         }
+        #[cfg(feature = "diagnostics")]
+        KEEP_REF_NS.fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn keep_with(&self, index: u32, raw: Option<*mut std::ffi::c_void>, next: impl FnOnce() -> Option<ID3D12Resource>) {
@@ -6813,16 +6854,30 @@ mod tests {
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
 
-        // `prepare_list_views`, batched copies, and split epoch/frame invalidation work together.
-        let s1 = heap.dynamic(2).unwrap();
+        // `prepare_list_views`, batched copies, `apply_listed_batched`, and split epoch/frame invalidation work together.
+        let s1 = heap.dynamic(3).unwrap();
         let mut batch = CopyBatch::default();
         let frame = 999u64;
-        heap.prepare_list_views(frame, 2);
+        heap.prepare_list_views(frame, 3);
         assert!(heap.make_listed_batched(frame, rec, s1, &mut batch).is_some());
-        heap.make_null_batched(s1 + 1, &mut batch);
+        let mut saw_kind = None;
+        assert!(heap.apply_listed_batched(frame, rec, s1 + 1, &mut batch, |listed, readable| {
+            listed.ready = (42, 0, false);
+            saw_kind = listed.kind;
+            matches!(readable, CachedReadable::Buffer { .. } | CachedReadable::None)
+        }).unwrap_or(false));
+        assert!(saw_kind.is_some());
+        let mut persisted = false;
+        assert!(heap.apply_listed_batched(frame, rec, s1 + 1, &mut batch, |listed, _| {
+            persisted = listed.ready == (42, 0, false);
+            true
+        }).is_some());
+        assert!(persisted);
+        heap.make_null_batched(s1 + 2, &mut batch);
         heap.flush_copy_batch(&mut batch);
         assert_eq!(read_stride(s1), 8 | VIEW_INTEGER);
-        assert_eq!(read_stride(s1 + 1), 0);
+        assert_eq!(read_stride(s1 + 1), 8 | VIEW_INTEGER);
+        assert_eq!(read_stride(s1 + 2), 0);
         assert!(listed_view(frame, rec).is_some());
         // Texture invalidation must NOT evict cached buffer views.
         invalidate_texture_views();
@@ -6839,7 +6894,39 @@ mod tests {
             heap.free.load(std::sync::atomic::Ordering::Relaxed),
             free_before + 5
         );
-        heap.release_many([(s0, 4), (s1, 2)]);
+        heap.release_many([(s0, 4), (s1, 3)]);
+    }
+}
+
+/// Pre-resolved `readable` work cached inside [`ListView`] for `(frame, epoch)` hits.
+pub(crate) enum CachedReadable {
+    None,
+    Buffer {
+        shadow: std::sync::Arc<crate::shadow::Shadow>,
+        address: u64,
+        len: u64,
+    },
+    TextureShader {
+        resource: usize,
+        first_mip: u32,
+    },
+    TextureUav {
+        resource: usize,
+    },
+}
+
+fn resolve_cached_readable(view: &View) -> CachedReadable {
+    if let Some(View::Shader(resource, desc)) = placed_texture(view) {
+        let first_mip = desc.as_ref().map_or(0, |d| crate::resource::first_mip(d));
+        return CachedReadable::TextureShader { resource, first_mip };
+    }
+    if let Some((shadow, address, len)) = buffer_copy(view) {
+        return CachedReadable::Buffer { shadow, address, len };
+    }
+    match view {
+        View::Shader(resource, _) => CachedReadable::TextureShader { resource: *resource, first_mip: 0 },
+        View::Unordered(resource, _, _) => CachedReadable::TextureUav { resource: *resource },
+        _ => CachedReadable::None,
     }
 }
 
@@ -6864,6 +6951,7 @@ struct ListView {
     stride_word: u32,
     kept: Kept,
     listed: Listed,
+    readable: CachedReadable,
 }
 
 /// The descriptors a thread made for one frame, split across independent buffer
@@ -6923,6 +7011,41 @@ thread_local! {
     static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(feature = "diagnostics")]
+static KEEP_REF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_keep_ref_ns() -> u64 {
+    KEEP_REF_NS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Looks up `words` in this thread's `(frame, epoch)` [`ListViews`] cache and
+/// invokes `f(&mut Listed, &CachedReadable)` in one hash lookup without copying
+/// any descriptors (for `fresh_tables` hits in `draw::tables`).
+pub(crate) fn with_cached_readable<R>(
+    frame: u64,
+    words: [u32; 3],
+    f: impl FnOnce(&mut Listed, &CachedReadable) -> R,
+) -> Option<R> {
+    let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    LIST_VIEWS.with(|views| {
+        let mut views = views.borrow_mut();
+        let views = views.as_mut().filter(|v| v.frame == frame)?;
+        if views.tex_epoch == tex_epoch
+            && let Some(made) = views.tex_made.get_mut(&words)
+        {
+            return Some(f(&mut made.listed, &made.readable));
+        }
+        if views.buf_epoch == buf_epoch
+            && let Some(made) = views.buf_made.get_mut(&words)
+        {
+            return Some(f(&mut made.listed, &made.readable));
+        }
+        None
+    })
+}
+
 /// The view the record `words` names, as this thread made it for `(frame, epoch)`.
 pub(crate) fn listed_view(frame: u64, words: [u32; 3]) -> Option<View> {
     let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
@@ -6945,6 +7068,7 @@ pub(crate) fn listed_view(frame: u64, words: [u32; 3]) -> Option<View> {
 }
 
 /// Notes what is known of the record `words` in `(frame, epoch)`.
+#[cfg(test)]
 pub(crate) fn note_listed(frame: u64, words: [u32; 3], listed: Listed) {
     let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);

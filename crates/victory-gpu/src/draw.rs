@@ -45,25 +45,61 @@ struct TableGroup {
 
 #[cfg(feature = "diagnostics")]
 static TABLE_DIAG: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+#[cfg(feature = "diagnostics")]
+static TABLE_SPLIT: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+#[cfg(feature = "diagnostics")]
+static INDIRECT_SPLIT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn log_tables(frames: f64) {
     let calls = TABLE_DIAG[0].swap(0, Ordering::Relaxed);
-    if calls == 0 {
-        return;
+    if calls != 0 {
+        let vals: [u64; 7] = std::array::from_fn(|i| TABLE_DIAG[i + 1].swap(0, Ordering::Relaxed));
+        let sp: [u64; 14] = std::array::from_fn(|i| TABLE_SPLIT[i].swap(0, Ordering::Relaxed));
+        let keep_ref_ns = crate::descriptor::host::take_keep_ref_ns();
+        tracing::info!(
+            "draw::tables per frame (all threads): {:.0} calls in {:.1} ms (copy_batch {:.1} ms); slots: inline_cbv {:.0}, listed_hit {:.0}, make_at_miss {:.0}, null {:.0}, readable {:.0}",
+            calls as f64 / frames,
+            vals[0] as f64 / 1e6 / frames,
+            vals[6] as f64 / 1e6 / frames,
+            vals[1] as f64 / frames,
+            vals[2] as f64 / frames,
+            vals[3] as f64 / frames,
+            vals[4] as f64 / frames,
+            vals[5] as f64 / frames,
+        );
+        tracing::info!(
+            "draw::tables split per frame (all threads): hash {:.1}ms, fresh_hit {:.1}ms ({:.0} hits, {:.0} fast-skip), dynamic {:.1}ms, inline_cbv {:.1}ms, listed_slot {:.1}ms (keep_ref {:.1}ms), readable {:.1}ms (fresh {:.0}, buf {:.0}, tex {:.0}, uav {:.0}, miss {:.0}), make_miss {:.1}ms, flush {:.1}ms",
+            sp[0] as f64 / 1e6 / frames,
+            sp[1] as f64 / 1e6 / frames,
+            sp[2] as f64 / frames,
+            sp[13] as f64 / frames,
+            sp[3] as f64 / 1e6 / frames,
+            sp[4] as f64 / 1e6 / frames,
+            sp[5] as f64 / 1e6 / frames,
+            keep_ref_ns as f64 / 1e6 / frames,
+            sp[6] as f64 / 1e6 / frames,
+            sp[8] as f64 / frames,
+            sp[9] as f64 / frames,
+            sp[10] as f64 / frames,
+            sp[11] as f64 / frames,
+            sp[12] as f64 / frames,
+            sp[7] as f64 / 1e6 / frames,
+            vals[6] as f64 / 1e6 / frames,
+        );
     }
-    let vals: [u64; 7] = std::array::from_fn(|i| TABLE_DIAG[i + 1].swap(0, Ordering::Relaxed));
-    tracing::info!(
-        "draw::tables per frame (all threads): {:.0} calls in {:.1} ms (copy_batch {:.1} ms); slots: inline_cbv {:.0}, listed_hit {:.0}, make_at_miss {:.0}, null {:.0}, readable {:.0}",
-        calls as f64 / frames,
-        vals[0] as f64 / 1e6 / frames,
-        vals[6] as f64 / 1e6 / frames,
-        vals[1] as f64 / frames,
-        vals[2] as f64 / frames,
-        vals[3] as f64 / frames,
-        vals[4] as f64 / frames,
-        vals[5] as f64 / frames,
-    );
+    let icalls = INDIRECT_SPLIT[0].swap(0, Ordering::Relaxed);
+    if icalls != 0 {
+        let isp: [u64; 4] = std::array::from_fn(|i| INDIRECT_SPLIT[i + 1].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "indirect split per frame (all threads, {:.0} calls): args/sig {:.1}ms, clamp/batch {:.1}ms, prepare/bind {:.1}ms, d3d_exec {:.1}ms",
+            icalls as f64 / frames,
+            isp[0] as f64 / 1e6 / frames,
+            isp[1] as f64 / 1e6 / frames,
+            isp[2] as f64 / 1e6 / frames,
+            isp[3] as f64 / 1e6 / frames,
+        );
+    }
 }
 
 impl TablePlan {
@@ -499,6 +535,9 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// Last resolved indirect argument buffer bounds `(valid_start, valid_end,
+    /// buffers_epoch, shadow)` for sequential `execute_indirect` calls.
+    last_indirect_args: Option<(u64, u64, u64, std::sync::Arc<crate::shadow::Shadow>)>,
 }
 
 impl Drop for State {
@@ -517,6 +556,7 @@ impl State {
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
         if self.tables_gone && self.dynamic.is_empty() {
+            self.last_indirect_args = None;
             return;
         }
         if self.tables_gone {
@@ -530,6 +570,7 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.copy_batch.clear();
+        self.last_indirect_args = None;
         self.tables_gone = true;
     }
 }
@@ -3703,8 +3744,34 @@ impl State {
         }
         let mut made = Few::default();
         #[cfg(feature = "diagnostics")]
-        let (tables_began, mut d_inline_cbv, mut d_listed_hit, mut d_make_miss, mut d_null, mut d_readable, mut d_flush_ns) =
-            (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let (
+            tables_began,
+            mut d_inline_cbv,
+            mut d_listed_hit,
+            mut d_make_miss,
+            mut d_null,
+            mut d_readable,
+            mut d_flush_ns,
+            mut d_hash_ns,
+            mut d_fresh_ns,
+            mut d_fresh_hits,
+            mut d_fresh_skip,
+            mut d_dyn_ns,
+            mut d_inline_ns,
+            mut d_listed_slot_ns,
+            mut d_r_ns,
+            mut d_miss_ns,
+            mut d_r_fresh,
+            mut d_r_buf,
+            mut d_r_tex,
+            mut d_r_uav,
+            mut d_r_miss,
+        ) = (
+            std::time::Instant::now(),
+            0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
+            0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
+            0u64, 0u64, 0u64, 0u64, 0u64,
+        );
         for group in &plan.groups {
             let slot = group.slot;
             if !selected_slot(&fresh, slot) {
@@ -3758,6 +3825,8 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
+            #[cfg(feature = "diagnostics")]
+            let hash_began = std::time::Instant::now();
             let key = {
                 let mut h = RecordHash::default();
                 for k in 0..n {
@@ -3767,34 +3836,131 @@ impl State {
                 }
                 (table, n, h.0)
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                d_hash_ns += hash_began.elapsed().as_nanos() as u64;
+            }
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
+                #[cfg(feature = "diagnostics")]
+                let (fresh_began, r_before) = (std::time::Instant::now(), d_r_ns);
+                #[cfg(feature = "diagnostics")]
+                {
+                    d_fresh_hits += 1;
+                }
                 let first = known.first;
-                // This reader had it brought up to date, and nothing in the
+                let list_epoch = list.epoch();
+                let list_refresh_epoch = list.refresh_epoch();
+                // This reader had it brought up to date, and nothing relevant in the
                 // list changed since: nothing to do again.
                 let once = ready_once() && selected.is_empty() && !group.has_uav;
+                let epoch_ok = known.epoch == list_epoch
+                    || (!known.has_texture && known.refresh_epoch == list_refresh_epoch);
                 if once
-                    && known.epoch == list.epoch()
+                    && epoch_ok
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
                 {
                     if *depth {
                         TESTED_DEPTH.set((reader.3, true));
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        d_fresh_skip += 1;
+                        d_fresh_ns += fresh_began.elapsed().as_nanos() as u64;
                     }
                     made.push((slot, first * 32));
                     continue;
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let frame = crate::frame::current();
+                let list_views = crate::descriptor::host::list_views();
+                let mut staging_deferred = false;
+                let mut check_slot = |handle: u64, kind: ResourceType| {
+                    if list_views
+                        && let Some(words) = crate::descriptor::record_at(handle)
+                        && let Some((did_read, deferred)) = crate::descriptor::host::with_cached_readable(
+                            frame,
+                            words,
+                            |listed, cached| {
+                                if !listed.texture && kind == ResourceType::Srv {
+                                    if listed.ready.0 != list_refresh_epoch {
+                                        #[cfg(feature = "diagnostics")]
+                                        let rb = std::time::Instant::now();
+                                        readable_cached(list, kind, cached);
+                                        #[cfg(feature = "diagnostics")]
+                                        {
+                                            d_r_ns += rb.elapsed().as_nanos() as u64;
+                                            d_readable += 1;
+                                            d_r_fresh += 1;
+                                        }
+                                        listed.ready = (list_refresh_epoch, 0, false);
+                                        (true, false)
+                                    } else {
+                                        (false, false)
+                                    }
+                                } else if listed.texture && kind == ResourceType::Srv {
+                                    let tested = TESTED_DEPTH.get();
+                                    if listed.ready.0 == list_epoch && listed.ready.1 == tested.0 {
+                                        if listed.ready.2 {
+                                            TESTED_DEPTH.set((tested.0, true));
+                                        }
+                                        (false, false)
+                                    } else {
+                                        let _ = crate::residency::take_staging_deferred();
+                                        TESTED_DEPTH.set((tested.0, false));
+                                        #[cfg(feature = "diagnostics")]
+                                        let rb = std::time::Instant::now();
+                                        readable_cached(list, kind, cached);
+                                        #[cfg(feature = "diagnostics")]
+                                        {
+                                            d_r_ns += rb.elapsed().as_nanos() as u64;
+                                            d_readable += 1;
+                                            d_r_fresh += 1;
+                                        }
+                                        let depth = TESTED_DEPTH.get().1;
+                                        TESTED_DEPTH.set((tested.0, tested.1 || depth));
+                                        let def = crate::residency::take_staging_deferred();
+                                        if !def {
+                                            listed.ready = (list_epoch, tested.0, depth);
+                                        }
+                                        (true, def)
+                                    }
+                                } else {
+                                    #[cfg(feature = "diagnostics")]
+                                    let rb = std::time::Instant::now();
+                                    readable_cached(list, kind, cached);
+                                    #[cfg(feature = "diagnostics")]
+                                    {
+                                        d_r_ns += rb.elapsed().as_nanos() as u64;
+                                        d_readable += 1;
+                                        d_r_fresh += 1;
+                                    }
+                                    (true, false)
+                                }
+                            },
+                        )
+                    {
+                        let _ = did_read;
+                        staging_deferred |= deferred;
+                        return;
+                    }
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        #[cfg(feature = "diagnostics")]
+                        let rb = std::time::Instant::now();
+                        readable(list, kind, &view);
                         #[cfg(feature = "diagnostics")]
                         {
+                            d_r_ns += rb.elapsed().as_nanos() as u64;
                             d_readable += 1;
+                            d_r_fresh += 1;
                         }
                     }
+                };
+                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    check_slot(handle, u.kind);
                 }
                 for &k in &*selected {
                     if group.entry(k).is_some() {
@@ -3804,30 +3970,47 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
+                        #[cfg(feature = "diagnostics")]
+                        let rb = std::time::Instant::now();
                         readable(list, kind, &view);
                         #[cfg(feature = "diagnostics")]
                         {
+                            d_r_ns += rb.elapsed().as_nanos() as u64;
                             d_readable += 1;
+                            d_r_fresh += 1;
                         }
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
                 TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
-                if once && let Some(known) = self.fresh_tables.get_mut(&key) {
+                if once && !staging_deferred && let Some(known) = self.fresh_tables.get_mut(&key) {
                     // (The epoch as it is now: what this changed itself it
                     // need not do again.)
-                    let epoch = list.epoch();
-                    if known.epoch != epoch {
-                        known.epoch = epoch;
+                    let now_epoch = list.epoch();
+                    let now_refresh = list.refresh_epoch();
+                    let cleared = if known.has_texture {
+                        known.epoch != now_epoch
+                    } else {
+                        known.refresh_epoch != now_refresh
+                    };
+                    if cleared {
                         known.ready.clear();
                     }
-                    if known.ready.len() < 16 {
+                    known.epoch = now_epoch;
+                    known.refresh_epoch = now_refresh;
+                    if !known.ready.iter().any(|(r, _)| *r == reader) && known.ready.len() < 16 {
                         known.ready.push((reader, depth));
                     }
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    d_fresh_ns += fresh_began.elapsed().as_nanos().saturating_sub((d_r_ns - r_before) as u128) as u64;
                 }
                 made.push((slot, first * 32));
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            let dyn_began = std::time::Instant::now();
             let Some(first) = host.dynamic(n).or_else(|| {
                 crate::host::settle_for_fence();
                 host.dynamic(n)
@@ -3837,7 +4020,16 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
+            self.fresh_tables.insert(
+                key,
+                FreshTable {
+                    first,
+                    epoch: 0,
+                    refresh_epoch: 0,
+                    has_texture: false,
+                    ready: Vec::new(),
+                },
+            );
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3861,6 +4053,14 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            #[cfg(feature = "diagnostics")]
+            {
+                d_dyn_ns += dyn_began.elapsed().as_nanos() as u64;
+            }
+            let depth_before = TESTED_DEPTH.get();
+            TESTED_DEPTH.set((depth_before.0, false));
+            let _ = crate::residency::take_staging_deferred();
+            let mut table_has_texture = false;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3872,11 +4072,17 @@ impl State {
                     && let Some((address, size)) = crate::descriptor::constant_record(words)
                 {
                     #[cfg(feature = "diagnostics")]
+                    let cbv_began = std::time::Instant::now();
+                    #[cfg(feature = "diagnostics")]
                     {
                         d_inline_cbv += 1;
                     }
                     if let Some((buffer, buffer_gpu, gpu)) = list.constant_from_placed(address, u64::from(size)) {
                         host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_inline_ns += cbv_began.elapsed().as_nanos() as u64;
+                        }
                         continue;
                     }
                     let Some((buffer, buffer_gpu, gpu, to)) = list.scratch_held_base(u64::from(size)) else {
@@ -3884,71 +4090,127 @@ impl State {
                         #[cfg(feature = "diagnostics")]
                         {
                             d_null += 1;
+                            d_inline_ns += cbv_began.elapsed().as_nanos() as u64;
                         }
                         continue;
                     };
                     let slot = (std::ptr::from_ref(heap) as usize, index);
                     list.defer_constants(to, address as *const u8, size as usize, slot);
                     host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        d_inline_ns += cbv_began.elapsed().as_nanos() as u64;
+                    }
                     continue;
                 }
                 // A view this worker's `(frame, epoch)` cache has made before:
-                // queued into `copy_batch` and flushed once after the loop.
+                // queued into `copy_batch` and flushed once after the loop,
+                // in one HashMap lookup using pre-resolved `CachedReadable` work.
+                #[cfg(feature = "diagnostics")]
+                let (listed_began, r_before) = (std::time::Instant::now(), d_r_ns);
                 if list_views
                     && let Some(words) = words
-                    && let Some(mut listed) = host.make_listed_batched(frame, words, index, &mut self.copy_batch)
+                    && let Some((need_tex_tabled, is_tex)) = host.apply_listed_batched(
+                        frame,
+                        words,
+                        index,
+                        &mut self.copy_batch,
+                        |listed, cached| {
+                            let kind = group
+                                .entry(k)
+                                .map(|u| u.kind)
+                                .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                            if let Some(kind) = kind {
+                                if !listed.texture && kind == ResourceType::Srv {
+                                    let refresh_epoch = list.refresh_epoch();
+                                    if listed.ready.0 != refresh_epoch {
+                                        #[cfg(feature = "diagnostics")]
+                                        let rb = std::time::Instant::now();
+                                        readable_cached(list, kind, cached);
+                                        #[cfg(feature = "diagnostics")]
+                                        {
+                                            d_r_ns += rb.elapsed().as_nanos() as u64;
+                                            d_readable += 1;
+                                            d_r_buf += 1;
+                                        }
+                                        listed.ready = (refresh_epoch, 0, false);
+                                    }
+                                } else if listed.texture && kind == ResourceType::Srv {
+                                    let tested = TESTED_DEPTH.get();
+                                    if listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                                        if listed.ready.2 {
+                                            TESTED_DEPTH.set((tested.0, true));
+                                        }
+                                    } else {
+                                        let _ = crate::residency::take_staging_deferred();
+                                        TESTED_DEPTH.set((tested.0, false));
+                                        #[cfg(feature = "diagnostics")]
+                                        let rb = std::time::Instant::now();
+                                        readable_cached(list, kind, cached);
+                                        #[cfg(feature = "diagnostics")]
+                                        {
+                                            d_r_ns += rb.elapsed().as_nanos() as u64;
+                                            d_readable += 1;
+                                            d_r_tex += 1;
+                                        }
+                                        let depth = TESTED_DEPTH.get().1;
+                                        TESTED_DEPTH.set((tested.0, tested.1 || depth));
+                                        if !crate::residency::take_staging_deferred() {
+                                            listed.ready = (list.epoch(), tested.0, depth);
+                                        }
+                                    }
+                                } else {
+                                    #[cfg(feature = "diagnostics")]
+                                    let rb = std::time::Instant::now();
+                                    readable_cached(list, kind, cached);
+                                    #[cfg(feature = "diagnostics")]
+                                    {
+                                        d_r_ns += rb.elapsed().as_nanos() as u64;
+                                        d_readable += 1;
+                                        d_r_uav += 1;
+                                    }
+                                }
+                            }
+                            let need = if let Some(title) = title_first
+                                && listed.texture
+                                && listed.tabled != Some((recording, title + k, kind.is_some()))
+                            {
+                                let tabled = (recording, title + k, kind.is_some());
+                                listed.tabled = Some(tabled);
+                                Some((tabled.1, tabled.2))
+                            } else {
+                                None
+                            };
+                            (need, listed.texture)
+                        },
+                    )
                 {
+                    table_has_texture |= is_tex;
                     #[cfg(feature = "diagnostics")]
                     {
                         d_listed_hit += 1;
                     }
-                    let kind = group
-                        .entry(k)
-                        .map(|u| u.kind)
-                        .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
-                    let was = (listed.ready, listed.tabled);
-                    if let Some(kind) = kind {
-                        let tested = TESTED_DEPTH.get();
-                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
-                            if listed.ready.2 {
-                                TESTED_DEPTH.set((tested.0, true));
-                            }
-                        } else if let Some(view) = crate::descriptor::host::listed_view(frame, words) {
-                            let _ = crate::residency::take_staging_deferred();
-                            TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
-                            #[cfg(feature = "diagnostics")]
-                            {
-                                d_readable += 1;
-                            }
-                            let depth = TESTED_DEPTH.get().1;
-                            TESTED_DEPTH.set((tested.0, tested.1 || depth));
-                            if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
-                                listed.ready = (list.epoch(), tested.0, depth);
-                            }
+                    if let Some((title_slot, read)) = need_tex_tabled {
+                        host.texture_slot_tabled(title_slot, read);
+                        if read {
+                            host.mirror_after(list, title_slot, handle);
                         }
                     }
-                    if let Some(title) = title_first
-                        && listed.texture
-                        && listed.tabled != Some((recording, title + k, kind.is_some()))
+                    #[cfg(feature = "diagnostics")]
                     {
-                        listed.tabled = Some((recording, title + k, kind.is_some()));
-                        host.texture_slot_tabled(title + k, kind.is_some());
-                        if kind.is_some() {
-                            host.mirror_after(list, title + k, handle);
-                        }
-                    }
-                    if was != (listed.ready, listed.tabled) {
-                        crate::descriptor::host::note_listed(frame, words, listed);
+                        d_listed_slot_ns += listed_began.elapsed().as_nanos().saturating_sub((d_r_ns - r_before) as u128) as u64;
                     }
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                let miss_began = std::time::Instant::now();
                 let used = group.entry(k);
                 if words.is_none() {
                     host.make_null_batched(index, &mut self.copy_batch);
                     #[cfg(feature = "diagnostics")]
                     {
                         d_null += 1;
+                        d_miss_ns += miss_began.elapsed().as_nanos() as u64;
                     }
                     if used.is_some() {
                         once!(slot, "a table entry without a view");
@@ -3963,6 +4225,10 @@ impl State {
                         }
                         if let Some((buffer, buffer_gpu, gpu)) = list.constant_from_placed(address, u64::from(size)) {
                             host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                d_inline_ns += miss_began.elapsed().as_nanos() as u64;
+                            }
                             continue;
                         }
                         let Some((buffer, buffer_gpu, gpu, to)) = list.scratch_held_base(u64::from(size)) else {
@@ -3970,27 +4236,37 @@ impl State {
                             #[cfg(feature = "diagnostics")]
                             {
                                 d_null += 1;
+                                d_inline_ns += miss_began.elapsed().as_nanos() as u64;
                             }
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
                         host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_inline_ns += miss_began.elapsed().as_nanos() as u64;
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
                         #[cfg(feature = "diagnostics")]
                         {
                             d_make_miss += 1;
+                            d_miss_ns += miss_began.elapsed().as_nanos() as u64;
                         }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
+                            #[cfg(feature = "diagnostics")]
+                            let rb = std::time::Instant::now();
                             readable(list, kind, &view);
                             #[cfg(feature = "diagnostics")]
                             {
+                                d_r_ns += rb.elapsed().as_nanos() as u64;
                                 d_readable += 1;
+                                d_r_miss += 1;
                             }
                         }
                         // The title's slot is a table's: out of the queue
@@ -3998,12 +4274,13 @@ impl State {
                         // (its texture is up to date now), and made in
                         // place as the texture pass would have made it,
                         // for a shader that picks it by index all the same.
-                        if let Some(title) = title_first
-                            && crate::descriptor::host::is_texture_view(&view)
-                        {
-                            host.texture_slot_tabled(title + k, kind.is_some());
-                            if kind.is_some() {
-                                host.mirror_after(list, title + k, handle);
+                        if crate::descriptor::host::is_texture_view(&view) {
+                            table_has_texture = true;
+                            if let Some(title) = title_first {
+                                host.texture_slot_tabled(title + k, kind.is_some());
+                                if kind.is_some() {
+                                    host.mirror_after(list, title + k, handle);
+                                }
                             }
                         }
                     }
@@ -4012,6 +4289,7 @@ impl State {
                         #[cfg(feature = "diagnostics")]
                         {
                             d_null += 1;
+                            d_miss_ns += miss_began.elapsed().as_nanos() as u64;
                         }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
@@ -4019,12 +4297,23 @@ impl State {
                     }
                 }
             }
+            let group_depth = TESTED_DEPTH.get().1;
+            TESTED_DEPTH.set((depth_before.0, depth_before.1 || group_depth));
+            let staging_deferred = crate::residency::take_staging_deferred();
             #[cfg(feature = "diagnostics")]
             let flush_began = std::time::Instant::now();
             host.flush_copy_batch(&mut self.copy_batch);
             #[cfg(feature = "diagnostics")]
             {
                 d_flush_ns += flush_began.elapsed().as_nanos() as u64;
+            }
+            if let Some(known) = self.fresh_tables.get_mut(&key) {
+                known.has_texture = table_has_texture;
+                if ready_once() && selected.is_empty() && !group.has_uav && !staging_deferred {
+                    known.epoch = list.epoch();
+                    known.refresh_epoch = list.refresh_epoch();
+                    known.ready.push((reader, group_depth));
+                }
             }
             made.push((slot, first * 32));
         }
@@ -4038,6 +4327,20 @@ impl State {
             if d_null > 0 { TABLE_DIAG[5].fetch_add(d_null, Ordering::Relaxed); }
             if d_readable > 0 { TABLE_DIAG[6].fetch_add(d_readable, Ordering::Relaxed); }
             if d_flush_ns > 0 { TABLE_DIAG[7].fetch_add(d_flush_ns, Ordering::Relaxed); }
+            if d_hash_ns > 0 { TABLE_SPLIT[0].fetch_add(d_hash_ns, Ordering::Relaxed); }
+            if d_fresh_ns > 0 { TABLE_SPLIT[1].fetch_add(d_fresh_ns, Ordering::Relaxed); }
+            if d_fresh_hits > 0 { TABLE_SPLIT[2].fetch_add(d_fresh_hits, Ordering::Relaxed); }
+            if d_dyn_ns > 0 { TABLE_SPLIT[3].fetch_add(d_dyn_ns, Ordering::Relaxed); }
+            if d_inline_ns > 0 { TABLE_SPLIT[4].fetch_add(d_inline_ns, Ordering::Relaxed); }
+            if d_listed_slot_ns > 0 { TABLE_SPLIT[5].fetch_add(d_listed_slot_ns, Ordering::Relaxed); }
+            if d_r_ns > 0 { TABLE_SPLIT[6].fetch_add(d_r_ns, Ordering::Relaxed); }
+            if d_miss_ns > 0 { TABLE_SPLIT[7].fetch_add(d_miss_ns, Ordering::Relaxed); }
+            if d_r_fresh > 0 { TABLE_SPLIT[8].fetch_add(d_r_fresh, Ordering::Relaxed); }
+            if d_r_buf > 0 { TABLE_SPLIT[9].fetch_add(d_r_buf, Ordering::Relaxed); }
+            if d_r_tex > 0 { TABLE_SPLIT[10].fetch_add(d_r_tex, Ordering::Relaxed); }
+            if d_r_uav > 0 { TABLE_SPLIT[11].fetch_add(d_r_uav, Ordering::Relaxed); }
+            if d_r_miss > 0 { TABLE_SPLIT[12].fetch_add(d_r_miss, Ordering::Relaxed); }
+            if d_fresh_skip > 0 { TABLE_SPLIT[13].fetch_add(d_fresh_skip, Ordering::Relaxed); }
         }
         made
     }
@@ -4344,6 +4647,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        let i_began = std::time::Instant::now();
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -4397,14 +4702,30 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
-        let Some(args) = crate::shadow::find_any(arguments, len) else {
-            why("arguments outside title buffers");
+        let Some(end) = arguments.checked_add(len.max(1)) else {
+            why("arguments overflow");
             return false;
         };
+        let cached_args = match self.last_indirect_args.take() {
+            Some((vs, ve, ep, shadow))
+                if ep != 0 && ep == crate::shadow::buffers_epoch() && arguments >= vs && end <= ve =>
+            {
+                (vs, ve, ep, shadow)
+            }
+            _ => {
+                let Some((shadow, vs, ve, ep)) = crate::shadow::find_any_bounds(arguments, len) else {
+                    why("arguments outside title buffers");
+                    return false;
+                };
+                (vs, ve, ep, shadow)
+            }
+        };
+        let args = &cached_args.3;
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
+                    self.last_indirect_args = Some(cached_args);
                     why("count outside title buffers");
                     return false;
                 }
@@ -4415,17 +4736,21 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
+            self.last_indirect_args = Some(cached_args);
             why("no host signature");
             return false;
         };
         if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            self.last_indirect_args = Some(cached_args);
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        let i_clamp = std::time::Instant::now();
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            self.batched(list, args, arguments, kind)
         } else {
             None
         };
@@ -4495,6 +4820,7 @@ impl State {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
                 let Some(bounded) = bounded else {
+                    self.last_indirect_args = Some(cached_args);
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
@@ -4513,6 +4839,9 @@ impl State {
                 (bounded, 0)
             }
         };
+        self.last_indirect_args = Some(cached_args);
+        #[cfg(feature = "diagnostics")]
+        let i_prep = std::time::Instant::now();
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED).is_some(),
             MESH => self.prepare_for(list, false, true).is_some(),
@@ -4523,6 +4852,8 @@ impl State {
             why("prepare failed");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        let i_exec = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
@@ -4536,7 +4867,7 @@ impl State {
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
-                &signature,
+                signature,
                 max,
                 &bounded,
                 at,
@@ -4559,6 +4890,15 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let now = std::time::Instant::now();
+            INDIRECT_SPLIT[0].fetch_add(1, Ordering::Relaxed);
+            INDIRECT_SPLIT[1].fetch_add(i_clamp.duration_since(i_began).as_nanos() as u64, Ordering::Relaxed);
+            INDIRECT_SPLIT[2].fetch_add(i_prep.duration_since(i_clamp).as_nanos() as u64, Ordering::Relaxed);
+            INDIRECT_SPLIT[3].fetch_add(i_exec.duration_since(i_prep).as_nanos() as u64, Ordering::Relaxed);
+            INDIRECT_SPLIT[4].fetch_add(now.duration_since(i_exec).as_nanos() as u64, Ordering::Relaxed);
         }
         true
     }
@@ -4605,40 +4945,61 @@ mod thread_tests {
 
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
+/// once and cached per-thread for lock-free lookups.
+fn host_signature(kind: u32, stride: u32) -> Option<&'static ID3D12CommandSignature> {
+    struct SyncSig(&'static ID3D12CommandSignature);
+    // SAFETY: ID3D12CommandSignature is free-threaded and leaked for process lifetime.
+    unsafe impl Send for SyncSig {}
+    // SAFETY: ID3D12CommandSignature is free-threaded and leaked for process lifetime.
+    unsafe impl Sync for SyncSig {}
+
+    thread_local! {
+        static LOCAL: std::cell::RefCell<Vec<((u32, u32), &'static ID3D12CommandSignature)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(sig) = LOCAL.with(|local| {
+        local.borrow().iter().find(|(k, _)| *k == (kind, stride)).map(|&(_, s)| s)
+    }) {
+        return Some(sig);
+    }
+
+    static MADE: std::sync::Mutex<Vec<((u32, u32), SyncSig)>> =
         std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
+    let sig = {
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+            s.0
+        } else {
+            let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+                ..Default::default()
+            };
+            let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                ByteStride: stride,
+                NumArgumentDescs: 1,
+                pArgumentDescs: &argument,
+                NodeMask: 0,
+            };
+            let mut signature: Option<ID3D12CommandSignature> = None;
+            // SAFETY: a description of one argument; no root arguments.
+            let result = unsafe {
+                crate::host::host()?.device.CreateCommandSignature(
+                    &desc,
+                    None::<&ID3D12RootSignature>,
+                    &mut signature,
+                )
+            };
+            if let Err(e) = result {
+                once!(error = %e, kind, stride, "host command signature refused");
+                return None;
+            }
+            let signature: &'static ID3D12CommandSignature = Box::leak(Box::new(signature?));
+            made.push(((kind, stride), SyncSig(signature)));
+            signature
+        }
     };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
+    LOCAL.with(|local| local.borrow_mut().push(((kind, stride), sig)));
+    Some(sig)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data
@@ -4737,6 +5098,11 @@ struct FreshTable {
     /// tested depth target) read were brought up to date, and whether that read the
     /// tested depth target.
     epoch: u64,
+    /// [`HostList::refresh_epoch`] at which a buffer-only table was brought up to date
+    /// (persists across unrelated texture state transitions).
+    refresh_epoch: u64,
+    /// Whether any non-CBV slot of this table is a texture view.
+    has_texture: bool,
     ready: Vec<((usize, usize, bool, usize), bool)>,
 }
 
@@ -4761,6 +5127,79 @@ impl RecordHash {
         let words = u64::from(a) << 32 | u64::from(b);
         let first = fold(self.0 ^ words ^ 0x2d35_8dcc_aa6c_78a5, 0x8bb8_4b93_962e_acc9 ^ u64::from(c));
         self.0 = fold(first ^ 0x4b33_a62e_d433_d4a3, 0x4d5a_2da5_1de1_aa47 ^ self.0.rotate_left(23)) ^ first;
+    }
+}
+
+fn readable_cached(
+    list: &HostList,
+    kind: ResourceType,
+    cached: &crate::descriptor::host::CachedReadable,
+) {
+    const UNORDERED_ACCESS: u32 = 0x8;
+    match (cached, kind) {
+        (crate::descriptor::host::CachedReadable::Buffer { shadow, address, len }, _) => {
+            shadow.refresh(list, *address, *len);
+            if kind == ResourceType::Uav {
+                // A shader that cannot store to buffers leaves the range as
+                // the title has it: nothing to find afterwards.
+                if STORES.get() || !write_skip() {
+                    #[cfg(feature = "diagnostics")]
+                    crate::host::wide_write(*address, *len, 0);
+                    shadow.gpu_writes(list, *address, *len);
+                } else {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        crate::copystat::add(crate::copystat::C::GpuWritesLeftOut, 1);
+                        crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, *len);
+                    }
+                }
+            }
+        }
+        (
+            crate::descriptor::host::CachedReadable::TextureShader { resource, first_mip },
+            ResourceType::Srv,
+        ) => {
+            let aliased = crate::resource::alias_of(*resource as This)
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+            if !aliased
+                && let Some(t) = crate::resource::host_copy(*resource as This)
+                && t.flags() & 0x7 == 0
+            {
+                crate::texture::upload_from(list, *resource as This, *first_mip);
+            }
+            list.twin_use(*resource as This, false, false);
+            let (tested, _) = TESTED_DEPTH.get();
+            let state = if tested != 0 && tested == *resource {
+                TESTED_DEPTH.set((tested, true));
+                DEPTH_READ | SHADER_RESOURCE
+            } else {
+                SHADER_RESOURCE
+            };
+            crate::list::ensure_state(list, *resource as This, state);
+            #[cfg(feature = "diagnostics")]
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(t) = crate::resource::host_resource(*resource as This)
+            {
+                // SAFETY: a live resource.
+                let d = unsafe { t.GetDesc() };
+                if d.Flags.0 & 7 == 0 {
+                    tracing::debug!(
+                        resource = format_args!("{resource:#x}"),
+                        ?d,
+                        "a shader reads a texture the title fills"
+                    );
+                }
+            }
+        }
+        (crate::descriptor::host::CachedReadable::TextureUav { resource }, ResourceType::Uav) => {
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_target(*resource as This);
+            list.texture_written(*resource as This);
+            if !list.twin_use(*resource as This, true, true) {
+                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+            }
+        }
+        _ => {}
     }
 }
 

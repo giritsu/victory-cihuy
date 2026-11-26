@@ -171,13 +171,13 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
 static WAITS: [[std::sync::atomic::AtomicU64; 2]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4];
 
 /// Guards lock waits broken down by operation (`0: guard`, `1: unguard`,
-/// `2: query`, `3: land/fault`, `4: other`).
+/// `2: query`, `3: land`, `4: fault`, `5: other`).
 #[cfg(feature = "diagnostics")]
-static GUARD_CAT_WAITS: [[std::sync::atomic::AtomicU64; 2]; 5] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 5];
+static GUARD_CAT_WAITS: [[std::sync::atomic::AtomicU64; 2]; 6] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 6];
 
 #[cfg(feature = "diagnostics")]
 thread_local! {
-    static CURRENT_GUARD_CAT: std::cell::Cell<usize> = const { std::cell::Cell::new(4) };
+    static CURRENT_GUARD_CAT: std::cell::Cell<usize> = const { std::cell::Cell::new(5) };
 }
 
 #[cfg(feature = "diagnostics")]
@@ -231,7 +231,7 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn guard_wait_breakdown(frames: f64) -> String {
-    const NAMES: [&str; 5] = ["guard", "unguard", "query", "land", "other"];
+    const NAMES: [&str; 6] = ["guard", "unguard", "query", "land", "fault", "other"];
     let mut parts = Vec::with_capacity(NAMES.len());
     for (i, name) in NAMES.iter().enumerate() {
         let n = GUARD_CAT_WAITS[i][0].swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -1663,10 +1663,12 @@ thread_local! {
     static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
-/// 64 address stripes of 4 MiB each (`64 * 64 KiB`), sharding [`GUARDS`]
-/// so disjoint faults and refreshes never serialize on one global lock.
-const GUARD_SHARDS: usize = 64;
-const GUARD_STRIPE_SHIFT: u32 = 6; // 64 blocks = 4 MiB per stripe
+/// 256 address stripes of 512 KiB each (`8 * 64 KiB`), sharding [`GUARDS`]
+/// so `guard()` (`VirtualProtect`) and game-thread `on_write` faults rarely
+/// touch the same shard.
+const GUARD_SHARDS: usize = 256;
+const GUARD_WORDS: usize = GUARD_SHARDS / 64;
+const GUARD_STRIPE_SHIFT: u32 = 3; // 8 blocks = 512 KiB per stripe
 
 #[inline]
 const fn guard_shard(block: usize) -> usize {
@@ -3006,7 +3008,7 @@ pub fn title_memory_splitting(at: usize, len: usize) {
                 let ob = other / BLOCK;
                 let s = guard_shard(ob);
                 locks.get_mut(s).changing.push((ob, ob + 1));
-                mask |= 1u64 << s;
+                mask[s >> 6] |= 1u64 << (s & 63);
             }
             CHANGING.set((true, mask));
         }
@@ -3035,11 +3037,13 @@ pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()
 impl Drop for Remapping {
     fn drop(&mut self) {
         // The change is done: what is there now may be guarded.
-        let (_, mut mask) = CHANGING.replace((false, 0));
-        while mask != 0 {
-            let s = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            guard_write(s).changing.clear();
+        let (_, mask) = CHANGING.replace((false, [0; GUARD_WORDS]));
+        for (w, mut word) in mask.into_iter().enumerate() {
+            while word != 0 {
+                let tz = word.trailing_zeros() as usize;
+                word &= word - 1;
+                guard_write((w << 6) + tz).changing.clear();
+            }
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
@@ -3052,7 +3056,8 @@ static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 thread_local! {
     /// This thread holds [`Remapping`], and bitmask of shards with entries
     /// pushed into `Guards::changing`.
-    static CHANGING: std::cell::Cell<(bool, u64)> = const { std::cell::Cell::new((false, 0)) };
+    static CHANGING: std::cell::Cell<(bool, [u64; GUARD_WORDS])> =
+        const { std::cell::Cell::new((false, [0; GUARD_WORDS])) };
 }
 
 /// For [`again_after_change`]: to be asked before what may fail.
@@ -3192,7 +3197,7 @@ pub fn title_memory_remapping() -> Remapping {
     }
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    CHANGING.set((true, 0));
+    CHANGING.set((true, [0; GUARD_WORDS]));
     Remapping(changing)
 }
 
@@ -3267,7 +3272,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
             g.aliased.remove(block);
         }
         if active {
-            mask |= 1u64 << s;
+            mask[s >> 6] |= 1u64 << (s & 63);
             match g.changing.last_mut() {
                 Some(before) if before.1 == a => before.1 = b,
                 _ => g.changing.push((a, b)),
@@ -3398,7 +3403,7 @@ pub(crate) fn install() {
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         #[cfg(feature = "diagnostics")]
-        let _op = GuardOpScope::enter(3);
+        let _op = GuardOpScope::enter(4);
         let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
@@ -5550,8 +5555,8 @@ mod many_askers_tests {
     #[test]
     fn sharded_guards_cross_shard_aliases_and_concurrent_stripes() {
         super::install();
-        const STRIDE_BYTES: usize = (1 << super::GUARD_STRIPE_SHIFT) * PAGE; // 4 MiB
-        // Reserve two distinct 4 MiB regions so two views are guaranteed to land in different shards.
+        const STRIDE_BYTES: usize = (1 << super::GUARD_STRIPE_SHIFT) * PAGE; // 512 KiB
+        // Reserve two distinct stripe regions so two views are guaranteed to land in different shards.
         // SAFETY: test-owned placeholder + section mappings, unmapped and freed below.
         let (section, base_a, view_a, base_b, view_b) = unsafe {
             let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null());
