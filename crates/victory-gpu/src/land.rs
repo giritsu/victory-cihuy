@@ -241,6 +241,8 @@ impl Pool {
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::register_worker(name);
                 if name == "victory-land" {
                     crate::cores::keep_helper_on_fast_cores(name);
                 } else {

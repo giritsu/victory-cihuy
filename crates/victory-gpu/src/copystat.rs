@@ -1000,6 +1000,74 @@ fn thread_times() -> (u64, u64) {
     (micros(user), micros(kernel))
 }
 
+static WORKERS: Mutex<Vec<(&'static str, usize, u64, u64)>> = Mutex::new(Vec::new());
+
+/// Registers the calling background worker thread under `group` for periodic
+/// per-pool `GetThreadTimes` reporting in `copystat`.
+pub(crate) fn register_worker(group: &'static str) {
+    use windows_sys::Win32::Foundation::{DuplicateHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread, THREAD_QUERY_INFORMATION};
+    let mut dup: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicating the calling thread pseudo-handle into a queryable handle.
+    let ok = unsafe {
+        let proc = GetCurrentProcess();
+        DuplicateHandle(proc, GetCurrentThread(), proc, &mut dup, THREAD_QUERY_INFORMATION, 0, 0)
+    };
+    if ok != 0 && !dup.is_null() {
+        WORKERS.lock().unwrap_or_else(|e| e.into_inner()).push((group, dup as usize, 0, 0));
+    }
+}
+
+fn worker_cpu_line(frames: f64, total_user_ms: f64, total_kernel_ms: f64) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, HANDLE};
+    use windows_sys::Win32::System::Threading::GetThreadTimes;
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let mut workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut groups: Vec<(&'static str, u64, u64)> = Vec::new();
+    for (group, handle, last_u, last_k) in workers.iter_mut() {
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        // SAFETY: duplicated thread handle with `THREAD_QUERY_INFORMATION` access.
+        let ok = unsafe { GetThreadTimes(*handle as HANDLE, &mut created, &mut exited, &mut kernel, &mut user) };
+        if ok != 0 {
+            let (u, k) = (micros(user), micros(kernel));
+            let du = u.saturating_sub(*last_u);
+            let dk = k.saturating_sub(*last_k);
+            *last_u = u;
+            *last_k = k;
+            match groups.iter_mut().find(|g| g.0 == *group) {
+                Some(entry) => {
+                    entry.1 += du;
+                    entry.2 += dk;
+                }
+                None => groups.push((group, du, dk)),
+            }
+        }
+    }
+    drop(workers);
+    let mut v_u = 0.0f64;
+    let mut v_k = 0.0f64;
+    let mut items: Vec<(&'static str, f64, f64)> = groups
+        .into_iter()
+        .map(|(g, du, dk)| {
+            let u = du as f64 / 1e3 / frames;
+            let k = dk as f64 / 1e3 / frames;
+            v_u += u;
+            v_k += k;
+            (g, u, k)
+        })
+        .collect();
+    items.sort_unstable_by(|a, b| (b.1 + b.2).total_cmp(&(a.1 + a.2)));
+    let title_u = (total_user_ms - v_u).max(0.0);
+    let title_k = (total_kernel_ms - v_k).max(0.0);
+    let mut out = format!("title+other {title_u:.0}+{title_k:.0}ms");
+    for (g, u, k) in items {
+        if u + k >= 0.5 {
+            out.push_str(&format!(", {g} {u:.1}+{k:.1}ms"));
+        }
+    }
+    out
+}
+
 /// The process's processor time so far (user, kernel), in microseconds.
 fn process_times() -> (u64, u64) {
     use windows_sys::Win32::Foundation::FILETIME;
@@ -1214,6 +1282,10 @@ pub(crate) fn log(frames: f64) {
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
     );
+    tracing::info!(
+        "guards lock waits by op per frame: {}",
+        crate::watch::guard_wait_breakdown(frames as f64)
+    );
     let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
@@ -1257,6 +1329,10 @@ pub(crate) fn log(frames: f64) {
         c[C::HostLists as usize],
         c[C::HostListNs as usize] / 1e6,
         c[C::PartsTogether as usize],
+    );
+    tracing::info!(
+        "  worker CPU per frame (user+kernel): {}",
+        worker_cpu_line(frames as f64, user, kernel)
     );
     // What is copied whole, largest first: memory nobody tells us about.
     let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();

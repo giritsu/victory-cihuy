@@ -471,6 +471,8 @@ pub(crate) fn queued() -> u64 {
 pub(crate) fn behind_line(frames: f64) {
     if behind::on() {
         crate::list::thin::line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::draw::log_tables(frames);
         behind::line(frames);
     }
 }

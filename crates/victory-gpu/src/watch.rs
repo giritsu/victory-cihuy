@@ -170,13 +170,47 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
 #[cfg(feature = "diagnostics")]
 static WAITS: [[std::sync::atomic::AtomicU64; 2]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4];
 
+/// Guards lock waits broken down by operation (`0: guard`, `1: unguard`,
+/// `2: query`, `3: land/fault`, `4: other`).
+#[cfg(feature = "diagnostics")]
+static GUARD_CAT_WAITS: [[std::sync::atomic::AtomicU64; 2]; 5] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 5];
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static CURRENT_GUARD_CAT: std::cell::Cell<usize> = const { std::cell::Cell::new(4) };
+}
+
+#[cfg(feature = "diagnostics")]
+struct GuardOpScope(usize);
+
+#[cfg(feature = "diagnostics")]
+impl GuardOpScope {
+    fn enter(cat: usize) -> Self {
+        let prev = CURRENT_GUARD_CAT.with(|c| c.replace(cat));
+        Self(prev)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+impl Drop for GuardOpScope {
+    fn drop(&mut self) {
+        CURRENT_GUARD_CAT.with(|c| c.set(self.0));
+    }
+}
+
 #[cfg(feature = "diagnostics")]
 fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
     use std::sync::atomic::Ordering::Relaxed;
     let began = std::time::Instant::now();
     let got = f();
+    let ns = began.elapsed().as_nanos() as u64;
     WAITS[what][0].fetch_add(1, Relaxed);
-    WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    WAITS[what][1].fetch_add(ns, Relaxed);
+    if what == 3 {
+        let cat = CURRENT_GUARD_CAT.with(|c| c.get());
+        GUARD_CAT_WAITS[cat][0].fetch_add(1, Relaxed);
+        GUARD_CAT_WAITS[cat][1].fetch_add(ns, Relaxed);
+    }
     got
 }
 
@@ -193,6 +227,18 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
     format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guard_wait_breakdown(frames: f64) -> String {
+    const NAMES: [&str; 5] = ["guard", "unguard", "query", "land", "other"];
+    let mut parts = Vec::with_capacity(NAMES.len());
+    for (i, name) in NAMES.iter().enumerate() {
+        let n = GUARD_CAT_WAITS[i][0].swap(0, std::sync::atomic::Ordering::Relaxed);
+        let ns = GUARD_CAT_WAITS[i][1].swap(0, std::sync::atomic::Ordering::Relaxed);
+        parts.push(format!("{name} {:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames));
+    }
+    parts.join(", ")
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -749,6 +795,8 @@ pub(crate) fn writes_with_hint(
     guarded: bool,
     known_view: bool,
 ) -> Option<(u64, Vec<(usize, u64)>, bool)> {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(2);
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
@@ -1852,6 +1900,8 @@ impl std::hash::Hasher for PageHash {
 
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(3);
     {
         let frame = crate::frame::current();
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
@@ -1886,6 +1936,8 @@ pub(crate) fn landing(at: usize, len: usize) {
 /// Returns the note's number, and for each 64 KiB block noted the number of
 /// the block's last write before (0: none is known).
 pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, Vec<(usize, u64)>) {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(3);
     let mut before = Vec::with_capacity(spans.len());
     let noted;
     let elsewhere: Vec<(usize, Vec<usize>)> = if view_guard() {
@@ -1947,6 +1999,8 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
 /// Batched notification for unguarded direct landings: notes `LANDED` frames
 /// and placed-texture remaps once after all jobs finish.
 pub(crate) fn landed_direct(pages: &[usize], spans: &[(usize, usize)]) {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(3);
     if pages.is_empty() && spans.is_empty() {
         return;
     }
@@ -2006,6 +2060,8 @@ pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
 /// read-only by way of another view of their page: whether they were written
 /// since is not known.)
 pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(2);
     if len == 0 {
         return false;
     }
@@ -2053,6 +2109,8 @@ fn dirty_blocks_in_range(
 
 /// Guards and refreshes view memory in `[start, end)` per 4 MiB address stripe.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(0);
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
@@ -2516,6 +2574,8 @@ fn open_range(start: usize, end: usize, timed: bool) -> usize {
 }
 
 fn open_range_inner(start: usize, end: usize, timed: bool, mark_opened_single: bool) -> usize {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(1);
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return 0;
@@ -2810,6 +2870,8 @@ pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 /// takes the guards' lock, then, alone, the lock of the ranges kept for
 /// the texture pass.
 pub fn title_memory_written(at: usize, len: usize, pages: bool) {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(1);
     use std::sync::atomic::Ordering::Relaxed;
     if len == 0 {
         return;
@@ -2848,6 +2910,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
 /// again - and are, the pages noted written, which also has the next check
 /// guard the new view ([`cover`]).
 pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(1);
     if !view_guard() {
         return;
     }
@@ -3176,6 +3240,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let _op = GuardOpScope::enter(1);
     crate::texback::remapped(at, len);
     crate::descriptor::host::remapped(at, len);
     crate::inplace::views_gone(at, len);
@@ -3331,6 +3397,8 @@ pub(crate) fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        #[cfg(feature = "diagnostics")]
+        let _op = GuardOpScope::enter(3);
         let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };

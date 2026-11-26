@@ -964,6 +964,9 @@ impl Taken {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+static STEP_DIAG: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 impl Host {
     /// With flights in the air: if what keeps `runs` from being prepared
     /// now is reads of title memory that can all be done on the card
@@ -1000,6 +1003,8 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
+        #[cfg(feature = "diagnostics")]
+        let st0 = std::time::Instant::now();
         let (does, steps, step_lists) = does_of(written, runs);
         let mut behind = None;
         let chosen = match plan(&does, stage(), placed_order(), &mut behind) {
@@ -1022,6 +1027,8 @@ impl Host {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
+        #[cfg(feature = "diagnostics")]
+        let (plan_ns, st1) = (st0.elapsed().as_nanos() as u64, std::time::Instant::now());
         // Resolve every chosen fill's destination once per list instead of locking
         // `HostList::deferred()` inside the per-op loop.
         let mut fill_tos: Vec<Option<FillTo>> = vec![None; chosen.len()];
@@ -1052,6 +1059,8 @@ impl Host {
             all
         };
         let mut writer_index = WriterIndex::build(&writers);
+        #[cfg(feature = "diagnostics")]
+        let (writers_ns, st2) = (st1.elapsed().as_nanos() as u64, std::time::Instant::now());
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         let mut shadows: Vec<Arc<Shadow>> = Vec::with_capacity(64);
         let mut last_shadow: Option<(usize, usize)> = None;
@@ -1142,6 +1151,8 @@ impl Host {
             });
         }
         spent.next("steps on the card: the list");
+        #[cfg(feature = "diagnostics")]
+        let (ops_ns, st3) = (st2.elapsed().as_nanos() as u64, std::time::Instant::now());
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
         };
@@ -1195,6 +1206,8 @@ impl Host {
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
         spent.next("steps on the card: the slots");
+        #[cfg(feature = "diagnostics")]
+        let (record_ns, st4) = (st3.elapsed().as_nanos() as u64, std::time::Instant::now());
         // (11,000 slots a frame in a street, two descriptors each: on
         // several threads, a slot always on the same one, in the steps'
         // order.)
@@ -1209,6 +1222,15 @@ impl Host {
         crate::land::each_under(parts, &|part| {
             crate::descriptor::constant_slots(&buckets[part], &own.between, gpu);
         });
+        #[cfg(feature = "diagnostics")]
+        {
+            STEP_DIAG[0].fetch_add(plan_ns, Ordering::Relaxed);
+            STEP_DIAG[1].fetch_add(writers_ns, Ordering::Relaxed);
+            STEP_DIAG[2].fetch_add(ops_ns, Ordering::Relaxed);
+            STEP_DIAG[3].fetch_add(record_ns, Ordering::Relaxed);
+            STEP_DIAG[4].fetch_add(st4.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            STEP_DIAG[5].fetch_add(1, Ordering::Relaxed);
+        }
         let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
         DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
@@ -1279,6 +1301,18 @@ pub(super) fn log(frames: f64) {
     );
     #[cfg(feature = "diagnostics")]
     {
+        let st: [u64; 6] = std::array::from_fn(|i| STEP_DIAG[i].swap(0, Ordering::Relaxed));
+        if st[5] > 0 {
+            tracing::info!(
+                "card_steps breakdown per frame ({:.0} calls): plan {:.2} ms, writers {:.2} ms, ops/map {:.2} ms, record {:.2} ms, slots {:.2} ms",
+                st[5] as f64 / frames,
+                st[0] as f64 / 1e6 / frames,
+                st[1] as f64 / 1e6 / frames,
+                st[2] as f64 / 1e6 / frames,
+                st[3] as f64 / 1e6 / frames,
+                st[4] as f64 / 1e6 / frames,
+            );
+        }
         let c: Vec<f64> = CUT_STATS.iter().map(|v| v.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         if c.iter().any(|&v| v > 0.0) {
             tracing::info!(

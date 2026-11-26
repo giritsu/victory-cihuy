@@ -43,6 +43,29 @@ struct TableGroup {
     by_descriptor: Vec<(u32, usize)>,
 }
 
+#[cfg(feature = "diagnostics")]
+static TABLE_DIAG: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_tables(frames: f64) {
+    let calls = TABLE_DIAG[0].swap(0, Ordering::Relaxed);
+    if calls == 0 {
+        return;
+    }
+    let vals: [u64; 7] = std::array::from_fn(|i| TABLE_DIAG[i + 1].swap(0, Ordering::Relaxed));
+    tracing::info!(
+        "draw::tables per frame (all threads): {:.0} calls in {:.1} ms (copy_batch {:.1} ms); slots: inline_cbv {:.0}, listed_hit {:.0}, make_at_miss {:.0}, null {:.0}, readable {:.0}",
+        calls as f64 / frames,
+        vals[0] as f64 / 1e6 / frames,
+        vals[6] as f64 / 1e6 / frames,
+        vals[1] as f64 / frames,
+        vals[2] as f64 / frames,
+        vals[3] as f64 / frames,
+        vals[4] as f64 / frames,
+        vals[5] as f64 / frames,
+    );
+}
+
 impl TablePlan {
     pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
         let mut slots: Vec<_> = used
@@ -3679,6 +3702,9 @@ impl State {
             }
         }
         let mut made = Few::default();
+        #[cfg(feature = "diagnostics")]
+        let (tables_began, mut d_inline_cbv, mut d_listed_hit, mut d_make_miss, mut d_null, mut d_readable, mut d_flush_ns) =
+            (std::time::Instant::now(), 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
         for group in &plan.groups {
             let slot = group.slot;
             if !selected_slot(&fresh, slot) {
@@ -3764,6 +3790,10 @@ impl State {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_readable += 1;
+                        }
                     }
                 }
                 for &k in &*selected {
@@ -3775,6 +3805,10 @@ impl State {
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_readable += 1;
+                        }
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
@@ -3837,12 +3871,20 @@ impl State {
                 if let Some(words) = words
                     && let Some((address, size)) = crate::descriptor::constant_record(words)
                 {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        d_inline_cbv += 1;
+                    }
                     if let Some((buffer, buffer_gpu, gpu)) = list.constant_from_placed(address, u64::from(size)) {
                         host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
                         continue;
                     }
                     let Some((buffer, buffer_gpu, gpu, to)) = list.scratch_held_base(u64::from(size)) else {
                         host.make_null_batched(index, &mut self.copy_batch);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_null += 1;
+                        }
                         continue;
                     };
                     let slot = (std::ptr::from_ref(heap) as usize, index);
@@ -3856,6 +3898,10 @@ impl State {
                     && let Some(words) = words
                     && let Some(mut listed) = host.make_listed_batched(frame, words, index, &mut self.copy_batch)
                 {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        d_listed_hit += 1;
+                    }
                     let kind = group
                         .entry(k)
                         .map(|u| u.kind)
@@ -3871,6 +3917,10 @@ impl State {
                             let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
                             readable(list, kind, &view);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                d_readable += 1;
+                            }
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
@@ -3896,6 +3946,10 @@ impl State {
                 let used = group.entry(k);
                 if words.is_none() {
                     host.make_null_batched(index, &mut self.copy_batch);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        d_null += 1;
+                    }
                     if used.is_some() {
                         once!(slot, "a table entry without a view");
                     }
@@ -3903,12 +3957,20 @@ impl State {
                 }
                 match crate::descriptor::view(handle) {
                     Some(View::Constant(address, size)) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_inline_cbv += 1;
+                        }
                         if let Some((buffer, buffer_gpu, gpu)) = list.constant_from_placed(address, u64::from(size)) {
                             host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
                             continue;
                         }
                         let Some((buffer, buffer_gpu, gpu, to)) = list.scratch_held_base(u64::from(size)) else {
                             host.make_null_batched(index, &mut self.copy_batch);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                d_null += 1;
+                            }
                             continue;
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
@@ -3917,11 +3979,19 @@ impl State {
                     }
                     Some(view) => {
                         host.make_at(index, &view);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_make_miss += 1;
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                d_readable += 1;
+                            }
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3939,14 +4009,35 @@ impl State {
                     }
                     None => {
                         host.make_null_batched(index, &mut self.copy_batch);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_null += 1;
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            let flush_began = std::time::Instant::now();
             host.flush_copy_batch(&mut self.copy_batch);
+            #[cfg(feature = "diagnostics")]
+            {
+                d_flush_ns += flush_began.elapsed().as_nanos() as u64;
+            }
             made.push((slot, first * 32));
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            TABLE_DIAG[0].fetch_add(1, Ordering::Relaxed);
+            TABLE_DIAG[1].fetch_add(tables_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if d_inline_cbv > 0 { TABLE_DIAG[2].fetch_add(d_inline_cbv, Ordering::Relaxed); }
+            if d_listed_hit > 0 { TABLE_DIAG[3].fetch_add(d_listed_hit, Ordering::Relaxed); }
+            if d_make_miss > 0 { TABLE_DIAG[4].fetch_add(d_make_miss, Ordering::Relaxed); }
+            if d_null > 0 { TABLE_DIAG[5].fetch_add(d_null, Ordering::Relaxed); }
+            if d_readable > 0 { TABLE_DIAG[6].fetch_add(d_readable, Ordering::Relaxed); }
+            if d_flush_ns > 0 { TABLE_DIAG[7].fetch_add(d_flush_ns, Ordering::Relaxed); }
         }
         made
     }

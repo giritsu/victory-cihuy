@@ -3535,6 +3535,8 @@ fn land() {
 /// value while the submitting thread waits for that thread would never
 /// see it.
 fn late_helper() {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::register_worker("late-wait");
     crate::cores::keep_on_fast_cores("victory-late-wait");
     let Some(host) = host() else {
         return;
@@ -3686,6 +3688,8 @@ struct RelayFetch {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::register_worker("relay");
     crate::cores::keep_on_fast_cores("victory-relay");
     let Some(host) = host() else {
         return;
@@ -3962,6 +3966,22 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+        #[cfg(feature = "diagnostics")]
+        {
+            let [calls, pages_u, groups, shards, wait_ns, wall_ns, dirty_ns] = crate::shadow::under_writes_diag();
+            if calls > 0 {
+                tracing::info!(
+                    "under_writes breakdown per frame: {:.0} calls, {:.0} stale pages, {:.0} stripe groups (avg {:.2} shards/lock); lock_wait {:.2} ms (all thr), each_under {:.2} ms (wall), dirty_runs {:.2} ms (all thr)",
+                    calls as f64 / frames,
+                    pages_u as f64 / frames,
+                    groups as f64 / frames,
+                    shards as f64 / groups.max(1) as f64,
+                    wait_ns as f64 / 1e6 / frames,
+                    wall_ns as f64 / 1e6 / frames,
+                    dirty_ns as f64 / 1e6 / frames,
+                );
+            }
+        }
     }
 }
 
@@ -4604,12 +4624,20 @@ impl Host {
             }
             None => 0,
         };
+        #[cfg(feature = "diagnostics")]
+        let cb_t0 = std::time::Instant::now();
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
+        #[cfg(feature = "diagnostics")]
+        let dirty_ns = cb_t0.elapsed().as_nanos() as u64;
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            CARD_BEFORE_DIAG[0].fetch_add(dirty_ns, Ordering::Relaxed);
             return None;
         }
+        #[cfg(feature = "diagnostics")]
+        let cb_t1 = std::time::Instant::now();
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
         // A copy whose shader writes are declared for the first time gets
@@ -4629,7 +4657,11 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
+        #[cfg(feature = "diagnostics")]
+        let work_make_ns = cb_t1.elapsed().as_nanos() as u64;
         // The bytes as they are now, whatever later submissions put there.
+        #[cfg(feature = "diagnostics")]
+        let cb_t2 = std::time::Instant::now();
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let mut own = if send::own() { send::take(self, &dirty) } else { None };
         if own.is_none()
@@ -4645,6 +4677,8 @@ impl Host {
             }
         }
         taking.end();
+        #[cfg(feature = "diagnostics")]
+        let (send_take_ns, cb_t3) = (cb_t2.elapsed().as_nanos() as u64, std::time::Instant::now());
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4749,6 +4783,8 @@ impl Host {
             used.push((false, sync));
         }
         drop(order);
+        #[cfg(feature = "diagnostics")]
+        let (sync_rec_ns, cb_t4) = (cb_t3.elapsed().as_nanos() as u64, std::time::Instant::now());
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -4855,6 +4891,15 @@ impl Host {
             plan.lists.push((true, check));
         }
         work.out += 1;
+        #[cfg(feature = "diagnostics")]
+        {
+            CARD_BEFORE_DIAG[0].fetch_add(dirty_ns, Ordering::Relaxed);
+            CARD_BEFORE_DIAG[1].fetch_add(work_make_ns, Ordering::Relaxed);
+            CARD_BEFORE_DIAG[2].fetch_add(send_take_ns, Ordering::Relaxed);
+            CARD_BEFORE_DIAG[3].fetch_add(sync_rec_ns, Ordering::Relaxed);
+            CARD_BEFORE_DIAG[4].fetch_add(cb_t4.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            CARD_BEFORE_DIAG[5].fetch_add(1, Ordering::Relaxed);
+        }
         Some(plan)
     }
 
@@ -7987,6 +8032,36 @@ fn split_line(frames: f64) {
         e[0],
         e[1] / 1e3,
     );
+    {
+        let r: [u64; 10] = std::array::from_fn(|i| REFRESH_DIAG[i].swap(0, Ordering::Relaxed));
+        if r[0] > 0 || r[1] > 0 || r[2] > 0 {
+            tracing::info!(
+                "refresh breakdown per frame (all threads): mask {:.1} ms (skip {:.0}, must {:.0}, exact-hit {:.0}, exact-miss {:.0}, ranged-hit {:.0}, need-full {:.0}), update {:.1} ms ({:.0} calls, {:.1} MB copied)",
+                r[0] as f64 / 1e6 / frames,
+                r[4] as f64 / frames,
+                r[5] as f64 / frames,
+                r[6] as f64 / frames,
+                r[7] as f64 / frames,
+                r[8] as f64 / frames,
+                r[9] as f64 / frames,
+                r[1] as f64 / 1e6 / frames,
+                r[2] as f64 / frames,
+                r[3] as f64 / 1048576.0 / frames,
+            );
+        }
+        let cb: [u64; 6] = std::array::from_fn(|i| CARD_BEFORE_DIAG[i].swap(0, Ordering::Relaxed));
+        if cb[5] > 0 || cb[0] > 0 {
+            tracing::info!(
+                "card_before breakdown per frame ({:.0} calls): dirty {:.1} ms, work/make {:.1} ms, send_take {:.1} ms, sync_rec {:.1} ms, check_rec {:.1} ms",
+                cb[5] as f64 / frames,
+                cb[0] as f64 / 1e6 / frames,
+                cb[1] as f64 / 1e6 / frames,
+                cb[2] as f64 / 1e6 / frames,
+                cb[3] as f64 / 1e6 / frames,
+                cb[4] as f64 / 1e6 / frames,
+            );
+        }
+    }
     tracing::info!(
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
@@ -8346,6 +8421,12 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+#[cfg(feature = "diagnostics")]
+static REFRESH_DIAG: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+#[cfg(feature = "diagnostics")]
+static CARD_BEFORE_DIAG: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 const REFRESH_BATCH_CHUNK: usize = 16;
 
 /// Returns a bitmask (bit `i` set if `slice[i]` is unchanged and can be skipped)
@@ -8353,12 +8434,26 @@ const REFRESH_BATCH_CHUNK: usize = 16;
 fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> (u32, usize) {
     use crate::shadow::{RangedCheck, Shadow};
     debug_assert!(slice.len() <= REFRESH_BATCH_CHUNK);
+    #[cfg(feature = "diagnostics")]
+    let mask_began = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let (mut d_skip, mut d_must, mut d_exact_hit, mut d_exact_miss, mut d_ranged_hit, mut d_need_full) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut checks: [RangedCheck; REFRESH_BATCH_CHUNK] = std::array::from_fn(|_| RangedCheck::NeedFull);
     let mut has_ranged = false;
     for (slot, (shadow, a, b)) in checks.iter_mut().zip(slice) {
         *slot = shadow.ranged_check(*a, *b - *a);
-        if matches!(*slot, RangedCheck::Exact(..) | RangedCheck::CheckRanged(..)) {
-            has_ranged = true;
+        match *slot {
+            RangedCheck::Skip => {
+                #[cfg(feature = "diagnostics")]
+                { d_skip += 1; }
+            }
+            RangedCheck::MustUpdate => {
+                #[cfg(feature = "diagnostics")]
+                { d_must += 1; }
+            }
+            RangedCheck::Exact(..) | RangedCheck::CheckRanged(..) => has_ranged = true,
+            RangedCheck::NeedFull => {}
         }
     }
     if has_ranged {
@@ -8369,14 +8464,20 @@ fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize
                     if jr.ranged_nothing_new(lo, hi, t) {
                         Shadow::note_nothing_new_bytes(hi - lo);
                         *check = RangedCheck::Skip;
+                        #[cfg(feature = "diagnostics")]
+                        { d_exact_hit += 1; }
                     } else {
                         *check = RangedCheck::MustUpdate;
+                        #[cfg(feature = "diagnostics")]
+                        { d_exact_miss += 1; }
                     }
                 }
                 RangedCheck::CheckRanged(lo, hi, ranged) => {
                     if jr.ranged_nothing_new(lo, hi, ranged) {
                         Shadow::note_nothing_new_bytes(hi - lo);
                         *check = RangedCheck::Skip;
+                        #[cfg(feature = "diagnostics")]
+                        { d_ranged_hit += 1; }
                     } else {
                         *check = RangedCheck::NeedFull;
                     }
@@ -8391,13 +8492,27 @@ fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize
         let unchanged = match check {
             RangedCheck::Skip => true,
             RangedCheck::MustUpdate => false,
-            RangedCheck::NeedFull => shadow.nothing_new(*a, *b - *a),
+            RangedCheck::NeedFull => {
+                #[cfg(feature = "diagnostics")]
+                { d_need_full += 1; }
+                shadow.nothing_new(*a, *b - *a)
+            }
             RangedCheck::Exact(..) | RangedCheck::CheckRanged(..) => false,
         };
         if unchanged {
             mask |= 1u32 << i;
             skipped += 1;
         }
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        REFRESH_DIAG[0].fetch_add(mask_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if d_skip > 0 { REFRESH_DIAG[4].fetch_add(d_skip, Ordering::Relaxed); }
+        if d_must > 0 { REFRESH_DIAG[5].fetch_add(d_must, Ordering::Relaxed); }
+        if d_exact_hit > 0 { REFRESH_DIAG[6].fetch_add(d_exact_hit, Ordering::Relaxed); }
+        if d_exact_miss > 0 { REFRESH_DIAG[7].fetch_add(d_exact_miss, Ordering::Relaxed); }
+        if d_ranged_hit > 0 { REFRESH_DIAG[8].fetch_add(d_ranged_hit, Ordering::Relaxed); }
+        if d_need_full > 0 { REFRESH_DIAG[9].fetch_add(d_need_full, Ordering::Relaxed); }
     }
     (mask, skipped)
 }
@@ -8456,9 +8571,15 @@ impl Batch {
         let started = std::time::Instant::now();
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
+        let ns = started.elapsed().as_nanos() as u64;
+        let us = ns / 1000;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::range(from, to - from, us, 0);
+        {
+            crate::copystat::range(from, to - from, us, 0);
+            REFRESH_DIAG[1].fetch_add(ns, Ordering::Relaxed);
+            REFRESH_DIAG[2].fetch_add(1, Ordering::Relaxed);
+            REFRESH_DIAG[3].fetch_add(copied as u64, Ordering::Relaxed);
+        }
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
         PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
     }

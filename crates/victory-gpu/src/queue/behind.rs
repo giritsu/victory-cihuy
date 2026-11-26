@@ -675,6 +675,8 @@ fn started() -> bool {
             return false;
         }
         let worker = || {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::register_worker("submit");
             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
             // SAFETY: this thread's own priority.
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };

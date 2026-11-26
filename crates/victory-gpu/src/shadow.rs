@@ -25,29 +25,58 @@ use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
 /// Number of 64 KiB stripe shards protecting [`Shadow::merging`].
-const MERGE_SHARDS: usize = 64;
+const MERGE_SHARDS: usize = 256;
+const MERGE_WORDS: usize = MERGE_SHARDS / 64;
 const MERGE_STRIPE_SHIFT: usize = 16;
 
-fn merge_shard_mask(from: usize, to: usize) -> u64 {
-    if from >= to {
-        return 0;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MergeMask([u64; MERGE_WORDS]);
+
+impl MergeMask {
+    const ALL: Self = Self([u64::MAX; MERGE_WORDS]);
+
+    fn of(from: usize, to: usize) -> Self {
+        if from >= to {
+            return Self::default();
+        }
+        let first = from >> MERGE_STRIPE_SHIFT;
+        let last = (to - 1) >> MERGE_STRIPE_SHIFT;
+        if last - first + 1 >= MERGE_SHARDS {
+            return Self::ALL;
+        }
+        let mut words = [0u64; MERGE_WORDS];
+        for b in first..=last {
+            let s = b & (MERGE_SHARDS - 1);
+            words[s >> 6] |= 1u64 << (s & 63);
+        }
+        Self(words)
     }
-    let first = from >> MERGE_STRIPE_SHIFT;
-    let last = (to - 1) >> MERGE_STRIPE_SHIFT;
-    if last - first + 1 >= MERGE_SHARDS {
-        return u64::MAX;
+
+    fn or_assign(&mut self, other: Self) {
+        for (dst, src) in self.0.iter_mut().zip(other.0) {
+            *dst |= src;
+        }
     }
-    let mut mask = 0u64;
-    for b in first..=last {
-        mask |= 1u64 << (b & (MERGE_SHARDS - 1));
+
+    fn count_ones(self) -> u32 {
+        self.0.iter().map(|w| w.count_ones()).sum()
     }
-    mask
 }
 
 #[allow(dead_code)]
 struct MergeReadGuards<'a>(Vec<RwLockReadGuard<'a, ()>>);
 #[allow(dead_code)]
 struct MergeWriteGuards<'a>(Vec<RwLockWriteGuard<'a, ()>>);
+
+/// Diagnostics counters for [`Shadow::merge_under_writes`]:
+/// `[calls, stale_pages, groups, shards_locked, lock_wait_ns, each_under_wall_ns, dirty_runs_ns]`.
+#[cfg(feature = "diagnostics")]
+static UNDER_DIAG: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn under_writes_diag() -> [u64; 7] {
+    std::array::from_fn(|i| UNDER_DIAG[i].swap(0, Ordering::Relaxed))
+}
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -1707,6 +1736,8 @@ fn workers() -> &'static Workers {
     STARTED.call_once(|| {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::register_worker("wide");
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
                 loop {
@@ -3274,23 +3305,27 @@ impl Shadow {
     }
 
     /// Acquires shared locks on the `merging` shards indicated by `mask` in ascending shard order.
-    fn lock_merging_read(&self, mut mask: u64) -> MergeReadGuards<'_> {
+    fn lock_merging_read(&self, mask: MergeMask) -> MergeReadGuards<'_> {
         let mut guards = Vec::with_capacity(mask.count_ones() as usize);
-        while mask != 0 {
-            let shard = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            guards.push(self.merging[shard].read().unwrap_or_else(|e| e.into_inner()));
+        for (w_idx, mut word) in mask.0.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                guards.push(self.merging[(w_idx << 6) | bit].read().unwrap_or_else(|e| e.into_inner()));
+            }
         }
         MergeReadGuards(guards)
     }
 
     /// Acquires exclusive locks on the `merging` shards indicated by `mask` in ascending shard order.
-    fn lock_merging_write(&self, mut mask: u64) -> MergeWriteGuards<'_> {
+    fn lock_merging_write(&self, mask: MergeMask) -> MergeWriteGuards<'_> {
         let mut guards = Vec::with_capacity(mask.count_ones() as usize);
-        while mask != 0 {
-            let shard = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            guards.push(self.merging[shard].write().unwrap_or_else(|e| e.into_inner()));
+        for (w_idx, mut word) in mask.0.into_iter().enumerate() {
+            while word != 0 {
+                let bit = word.trailing_zeros() as usize;
+                word &= word - 1;
+                guards.push(self.merging[(w_idx << 6) | bit].write().unwrap_or_else(|e| e.into_inner()));
+            }
         }
         MergeWriteGuards(guards)
     }
@@ -3836,26 +3871,128 @@ impl Shadow {
             if stale.is_empty() {
                 continue;
             }
-            // The lock of the matching 64 KiB stripes (and snapshot if needed),
-            // from before title memory is read until the title's bytes are in
-            // and `card.dirty` is updated: with the copy-back on its own thread
-            // ([`relay`]) that thread puts what the card wrote into title
-            // memory and into the reference under the stripe's read lock.
-            let mask = stale.iter().fold(0u64, |m, &p| {
+            if self.card.is_some() && crate::land::on() {
+                let mut keyed: Vec<(usize, usize)> = stale
+                    .iter()
+                    .map(|&p| ((((p * PAGE).max(a) - start) >> MERGE_STRIPE_SHIFT) & (MERGE_SHARDS - 1), p))
+                    .collect();
+                keyed.sort_unstable_by_key(|&(s, _)| s);
+                let mut groups: Vec<(MergeMask, Vec<usize>)> = Vec::with_capacity(keyed.len());
+                let mut cur_shard = usize::MAX;
+                for (shard, page) in keyed {
+                    let lo = (page * PAGE).max(a) - start;
+                    let hi = ((page + 1) * PAGE).min(e) - start;
+                    let pmask = MergeMask::of(lo, hi);
+                    if shard == cur_shard
+                        && let Some(last) = groups.last_mut()
+                    {
+                        last.0.or_assign(pmask);
+                        last.1.push(page);
+                    } else {
+                        cur_shard = shard;
+                        groups.push((pmask, vec![page]));
+                    }
+                }
+                let left = std::sync::atomic::AtomicI64::new(*runs_left as i64);
+                let over = std::sync::atomic::AtomicBool::new(false);
+                let taken_groups: Vec<Mutex<Vec<usize>>> = (0..groups.len()).map(|_| Mutex::new(Vec::new())).collect();
+                #[cfg(feature = "diagnostics")]
+                let each_began = std::time::Instant::now();
+                let one = |g: usize| {
+                    if over.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let (mask, ref pages) = groups[g];
+                    #[cfg(feature = "diagnostics")]
+                    let wait_began = std::time::Instant::now();
+                    let merging = self.lock_merging_write(mask);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        UNDER_DIAG[4].fetch_add(wait_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                        UNDER_DIAG[3].fetch_add(u64::from(mask.count_ones()), Ordering::Relaxed);
+                    }
+                    let mut local_taken = Vec::with_capacity(pages.len());
+                    let mut local_changed = Vec::new();
+                    for &page in pages {
+                        if over.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+                        if lo >= hi {
+                            continue;
+                        }
+                        // SAFETY: `self.data` is mapped for `self.len`, this page lies inside a
+                        // declared range, and `merging` keeps landings out of these stripes.
+                        let runs = unsafe { self.merge_page_under_writes(lo, hi - lo, self.data, &left) };
+                        match runs {
+                            Ok(Some(runs)) => {
+                                MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                                MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                                local_changed.extend(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
+                                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+                                    local_taken.push(page);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(()) => {
+                                over.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                        }
+                    }
+                    if !local_changed.is_empty() {
+                        #[cfg(feature = "diagnostics")]
+                        let dirty_began = std::time::Instant::now();
+                        self.card_changed_runs(local_changed.into_iter());
+                        #[cfg(feature = "diagnostics")]
+                        UNDER_DIAG[6].fetch_add(dirty_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    }
+                    drop(merging);
+                    *taken_groups[g].lock().unwrap_or_else(|e| e.into_inner()) = local_taken;
+                };
+                if groups.len() > 1 && under_wide() {
+                    crate::land::each_under(groups.len(), &one);
+                } else {
+                    (0..groups.len()).for_each(one);
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    UNDER_DIAG[0].fetch_add(1, Ordering::Relaxed);
+                    UNDER_DIAG[1].fetch_add(stale.len() as u64, Ordering::Relaxed);
+                    UNDER_DIAG[2].fetch_add(groups.len() as u64, Ordering::Relaxed);
+                    UNDER_DIAG[5].fetch_add(each_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+                *runs_left = left.into_inner().max(0) as usize;
+                {
+                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    let len = copied.pages.len();
+                    for group in taken_groups {
+                        for page in group.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                            if let Some(idx) = page.checked_sub(base).filter(|&idx| idx < len) {
+                                copied.set_page(idx, now);
+                            }
+                        }
+                    }
+                }
+                if over.into_inner() {
+                    note_stale(2);
+                    return true;
+                }
+                continue;
+            }
+            // Fallback: lock matching stripes + snapshot `before` before reading title memory.
+            let mut mask = MergeMask::default();
+            for &p in &stale {
                 let lo = (p * PAGE).max(a) - start;
                 let hi = ((p + 1) * PAGE).min(e) - start;
-                m | merge_shard_mask(lo, hi)
-            });
+                mask.or_assign(MergeMask::of(lo, hi));
+            }
             let merging = self.lock_merging_write(mask);
-            let mut before = (!crate::land::on() || self.card.is_none())
-                .then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
             let held = if self.card.is_some() {
                 self.data as usize
             } else {
-                before
-                    .as_mut()
-                    .and_then(|snapshot| snapshot.as_mut())
-                    .map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
+                before.as_mut().map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
             };
             if held == 0 {
                 note_stale(3);
@@ -4513,7 +4650,7 @@ impl Shadow {
             return;
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
-        let _merging = self.lock_merging_write(merge_shard_mask(from, to));
+        let _merging = self.lock_merging_write(MergeMask::of(from, to));
         if self.card.is_some() {
             // SAFETY: inside the mapping of the CPU's side, in a range no
             // refresh writes; the lock keeps the landing out.
@@ -4841,7 +4978,10 @@ impl Shadow {
             return 0;
         };
         let waiting = std::time::Instant::now();
-        let mask = pieces.iter().fold(0u64, |m, &(lo, hi, _)| m | merge_shard_mask(lo, hi));
+        let mut mask = MergeMask::default();
+        for &(lo, hi, _) in pieces {
+            mask.or_assign(MergeMask::of(lo, hi));
+        }
         let _merging = self.lock_merging_read(mask);
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
@@ -4896,7 +5036,7 @@ impl Shadow {
             return 0;
         }
         let waiting = std::time::Instant::now();
-        let _merging = self.lock_merging_read(merge_shard_mask(at, at + n));
+        let _merging = self.lock_merging_read(MergeMask::of(at, at + n));
         crate::land::spent(crate::land::stat::LOCK, waiting);
         // The snapshot's memory stays where it is until the range is done
         // with (`copy_back_done`), which comes after this.
@@ -6170,18 +6310,19 @@ mod window_tests {
 
     #[test]
     fn merge_shard_mask_and_disjoint_stripes_allow_concurrent_access() {
-        use super::{MERGE_SHARDS, merge_shard_mask};
-        assert_eq!(merge_shard_mask(100, 100), 0);
-        assert_eq!(merge_shard_mask(0, 4096), 1u64 << 0);
-        assert_eq!(merge_shard_mask(64 << 10, (64 << 10) + 1), 1u64 << 1);
-        assert_eq!(merge_shard_mask(0, (64 << 10) + 1), 0b11);
-        assert_eq!(merge_shard_mask(63 << 16, 65 << 16), (1u64 << 63) | 1);
-        assert_eq!(merge_shard_mask(0, MERGE_SHARDS << 16), u64::MAX);
+        use super::{MERGE_SHARDS, MergeMask};
+        assert_eq!(MergeMask::of(100, 100), MergeMask::default());
+        assert_eq!(MergeMask::of(0, 4096).0, [1u64 << 0, 0, 0, 0]);
+        assert_eq!(MergeMask::of(64 << 10, (64 << 10) + 1).0, [1u64 << 1, 0, 0, 0]);
+        assert_eq!(MergeMask::of(0, (64 << 10) + 1).0, [0b11, 0, 0, 0]);
+        assert_eq!(MergeMask::of(63 << 16, 65 << 16).0, [1u64 << 63, 1u64 << 0, 0, 0]);
+        assert_eq!(MergeMask::of(255 << 16, 257 << 16).0, [1u64 << 0, 0, 0, 1u64 << 63]);
+        assert_eq!(MergeMask::of(0, MERGE_SHARDS << 16), MergeMask::ALL);
 
         let locks: Box<[std::sync::RwLock<()>; MERGE_SHARDS]> =
             Box::new(std::array::from_fn(|_| std::sync::RwLock::new(())));
         let _w = locks[0].write().unwrap();
-        assert!(locks[1].try_read().is_ok());
+        assert!(locks[64].try_read().is_ok());
         assert!(locks[0].try_read().is_err());
     }
 

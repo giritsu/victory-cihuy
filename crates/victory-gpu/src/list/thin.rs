@@ -395,6 +395,8 @@ fn start() {
         .clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::register_worker("thin");
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
             loop {
@@ -449,6 +451,23 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let calls: [f64; THIN_CATS] = std::array::from_fn(|i| CAT_CALLS[i].swap(0, Relaxed) as f64 / frames);
+        let ms: [f64; THIN_CATS] = std::array::from_fn(|i| CAT_NS[i].swap(0, Relaxed) as f64 / 1e6 / frames);
+        tracing::info!(
+            "thin breakdown per frame (all threads): draws {:.1}ms ({:.0}), dispatches {:.1}ms ({:.0}), indirect {:.1}ms ({:.0}), tables/root {:.1}ms ({:.0}), pipeline {:.1}ms ({:.0}), barriers {:.1}ms ({:.0}), copies {:.1}ms ({:.0}), targets/clear {:.1}ms ({:.0}), other {:.1}ms ({:.0})",
+            ms[0], calls[0],
+            ms[1], calls[1],
+            ms[2], calls[2],
+            ms[3], calls[3],
+            ms[4], calls[4],
+            ms[5], calls[5],
+            ms[6], calls[6],
+            ms[7], calls[7],
+            ms[8], calls[8],
+        );
+    }
 }
 
 #[inline]
@@ -770,11 +789,142 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+#[cfg(feature = "diagnostics")]
+const THIN_CATS: usize = 9;
+#[cfg(feature = "diagnostics")]
+static CAT_CALLS: [AtomicU64; THIN_CATS] = [const { AtomicU64::new(0) }; THIN_CATS];
+#[cfg(feature = "diagnostics")]
+static CAT_NS: [AtomicU64; THIN_CATS] = [const { AtomicU64::new(0) }; THIN_CATS];
+
+#[cfg(feature = "diagnostics")]
+fn op_category(op: u64) -> usize {
+    const DRAW: u64 = Plain::DRAW as u64;
+    const DRAW_INDEXED: u64 = Plain::DRAW_INDEXED as u64;
+    const DISPATCH_MESH: u64 = Plain::DISPATCH_MESH as u64;
+    const DISPATCH_MESH_X: u64 = Plain::DISPATCH_MESH_X as u64;
+    const DISPATCH: u64 = Plain::DISPATCH as u64;
+    const DISPATCH_X: u64 = Plain::DISPATCH_X as u64;
+    const EXECUTE_INDIRECT: u64 = Plain::EXECUTE_INDIRECT as u64;
+    const COMPUTE_TABLE: u64 = Plain::COMPUTE_TABLE as u64;
+    const GRAPHICS_TABLE: u64 = Plain::GRAPHICS_TABLE as u64;
+    const COMPUTE_CONSTANT: u64 = Plain::COMPUTE_CONSTANT as u64;
+    const GRAPHICS_CONSTANT: u64 = Plain::GRAPHICS_CONSTANT as u64;
+    const COMPUTE_VIEW: u64 = Plain::COMPUTE_VIEW as u64;
+    const GRAPHICS_VIEW: u64 = Plain::GRAPHICS_VIEW as u64;
+    const SET_PIPELINE: u64 = Plain::SET_PIPELINE as u64;
+    const COPY_BUFFER: u64 = Plain::COPY_BUFFER as u64;
+    const COPY_RESOURCE: u64 = Plain::COPY_RESOURCE as u64;
+    const COPY_RESOURCE_X: u64 = Plain::COPY_RESOURCE_X as u64;
+    const COPY_MEMORY: u64 = Plain::COPY_MEMORY as u64;
+    const RESOLVE: u64 = Plain::RESOLVE as u64;
+    const SYNC: u64 = Plain::SYNC as u64;
+
+    match op {
+        DRAW | DRAW_INDEXED | DISPATCH_MESH | DISPATCH_MESH_X => 0,
+        DISPATCH | DISPATCH_X => 1,
+        EXECUTE_INDIRECT => 2,
+        COMPUTE_TABLE | GRAPHICS_TABLE | COMPUTE_CONSTANT | GRAPHICS_CONSTANT | COMPUTE_VIEW
+        | GRAPHICS_VIEW | COMPUTE_CONSTANTS | GRAPHICS_CONSTANTS | HEAPS => 3,
+        SET_PIPELINE => 4,
+        BARRIER | BARRIER_GROUPS | SYNC => 5,
+        COPY_BUFFER | COPY_RESOURCE | COPY_RESOURCE_X | COPY_MEMORY | COPY_TEXTURE | RESOLVE => 6,
+        TARGETS | CLEAR_RTV | CLEAR_DSV => 7,
+        _ => 8,
+    }
+}
+
+fn translate_one(op: u64, list: This, w: &[u64]) -> bool {
+    if run_plain(op, list, w) {
+        return false;
+    }
+    let n = w.first().map_or(0, |&n| n as usize);
+    match op {
+        RESET => {
+            // (Only whether there is an allocator is looked at.)
+            let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
+            super::reset(list, allocator, w[0] as This);
+        }
+        CLOSE => {
+            super::close(list);
+            return true;
+        }
+        BARRIER => {
+            super::barrier(list, n as u32, at_or(w, 1));
+        }
+        BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+        VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
+        SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
+        BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
+        HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
+        COMPUTE_CONSTANTS => {
+            state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+        }
+        GRAPHICS_CONSTANTS => {
+            state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
+        }
+        INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
+        VERTEX_BUFFERS => {
+            let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
+            state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
+        }
+        TARGETS => {
+            let mut handles = [0u64; 8];
+            let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
+            for (k, h) in handles.iter_mut().enumerate().take(n) {
+                if w[1] >> k & 1 != 0 {
+                    *h = place(k);
+                }
+            }
+            let depth = if w[2] != 0 { place(n) } else { 0 };
+            state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
+        }
+        CLEAR_RTV => {
+            super::clear_rtv(
+                list,
+                w[1..].as_ptr() as u64,
+                at_or(w, 1 + RECORD),
+                n as u32,
+                at(w, 1 + RECORD + 2, n),
+            );
+        }
+        CLEAR_DSV => {
+            super::clear_dsv(
+                list,
+                w[3..].as_ptr() as u64,
+                w[1] as u32,
+                Word::unword(w[2]),
+                (w[1] >> 32) as u8,
+                n as u32,
+                at(w, 3 + RECORD, n),
+            );
+        }
+        COPY_TEXTURE => {
+            let step = size_of::<CopyLocation>().div_ceil(8);
+            let boxed = (w[1] >> 32) as usize;
+            super::copy_texture_region(
+                list,
+                at_or(w, 2),
+                w[0] as u32,
+                (w[0] >> 32) as u32,
+                w[1] as u32,
+                at_or(w, 2 + step),
+                at(w, 2 + 2 * step, boxed),
+            );
+        }
+        _ => {}
+    }
+    false
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    #[cfg(feature = "diagnostics")]
+    let mut cat_calls = [0u64; THIN_CATS];
+    #[cfg(feature = "diagnostics")]
+    let mut cat_ns = [0u64; THIN_CATS];
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -783,95 +933,39 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if calls % 64 == 0 {
             skip = left();
         }
+        #[cfg(feature = "diagnostics")]
+        let cmd_began = std::time::Instant::now();
         if op == UPLOAD {
             // SAFETY: made by `allocate_upload`, named once.
             let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
             // SAFETY: a list of ours.
             let uploads = unsafe { &(*list.cast::<List>()).uploads };
             held(uploads).push(block);
+            #[cfg(feature = "diagnostics")]
+            {
+                cat_calls[8] += 1;
+                cat_ns[8] += cmd_began.elapsed().as_nanos() as u64;
+            }
             continue;
         }
         if skip && op != CLOSE && op != RESET {
             continue;
         }
-        if run_plain(op, list, w) {
-            continue;
+        if translate_one(op, list, w) {
+            closed = true;
         }
-        let n = w.first().map_or(0, |&n| n as usize);
-        match op {
-            RESET => {
-                // (Only whether there is an allocator is looked at.)
-                let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
-                super::reset(list, allocator, w[0] as This);
-            }
-            CLOSE => {
-                super::close(list);
-                closed = true;
-            }
-            BARRIER => {
-                super::barrier(list, n as u32, at_or(w, 1));
-            }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
-            VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
-            SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
-            BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
-            HEAPS => state::heaps(list, n as u32, at(w, 1, n)),
-            COMPUTE_CONSTANTS => {
-                state::compute_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
-            }
-            GRAPHICS_CONSTANTS => {
-                state::graphics_constants(list, w[0] as u32, w[1] as u32, at(w, 2, w[1] as usize), (w[0] >> 32) as u32)
-            }
-            INDEX_BUFFER => state::index_buffer(list, at(w, 1, n)),
-            VERTEX_BUFFERS => {
-                let views = if w[1] != 0 { at_or(w, 2) } else { std::ptr::null() };
-                state::vertex_buffers(list, w[0] as u32, (w[0] >> 32) as u32, views);
-            }
-            TARGETS => {
-                let mut handles = [0u64; 8];
-                let place = |k: usize| w[3 + k * RECORD..].as_ptr() as u64;
-                for (k, h) in handles.iter_mut().enumerate().take(n) {
-                    if w[1] >> k & 1 != 0 {
-                        *h = place(k);
-                    }
-                }
-                let depth = if w[2] != 0 { place(n) } else { 0 };
-                state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
-            }
-            CLEAR_RTV => {
-                super::clear_rtv(
-                    list,
-                    w[1..].as_ptr() as u64,
-                    at_or(w, 1 + RECORD),
-                    n as u32,
-                    at(w, 1 + RECORD + 2, n),
-                );
-            }
-            CLEAR_DSV => {
-                super::clear_dsv(
-                    list,
-                    w[3..].as_ptr() as u64,
-                    w[1] as u32,
-                    Word::unword(w[2]),
-                    (w[1] >> 32) as u8,
-                    n as u32,
-                    at(w, 3 + RECORD, n),
-                );
-            }
-            COPY_TEXTURE => {
-                let step = size_of::<CopyLocation>().div_ceil(8);
-                let boxed = (w[1] >> 32) as usize;
-                super::copy_texture_region(
-                    list,
-                    at_or(w, 2),
-                    w[0] as u32,
-                    (w[0] >> 32) as u32,
-                    w[1] as u32,
-                    at_or(w, 2 + step),
-                    at(w, 2 + 2 * step, boxed),
-                );
-            }
-            _ => {}
+        #[cfg(feature = "diagnostics")]
+        {
+            let cat = op_category(op);
+            cat_calls[cat] += 1;
+            cat_ns[cat] += cmd_began.elapsed().as_nanos() as u64;
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    for idx in 0..THIN_CATS {
+        if cat_calls[idx] > 0 {
+            CAT_CALLS[idx].fetch_add(cat_calls[idx], Relaxed);
+            CAT_NS[idx].fetch_add(cat_ns[idx], Relaxed);
         }
     }
     (calls, closed)
