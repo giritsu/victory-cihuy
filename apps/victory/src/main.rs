@@ -13,6 +13,32 @@ mod translate;
 #[cfg(windows)]
 mod warm;
 
+#[cfg(windows)]
+mod agility_sdk {
+    use std::ffi::c_char;
+
+    /// Pointer wrapper giving `D3D12SDKPath` the exact `const char *` ABI
+    /// expected by the Windows D3D12 loader while satisfying `Sync`.
+    #[repr(transparent)]
+    pub struct SdkPath(*const c_char);
+
+    // SAFETY: always holds a pointer to a `'static` NUL-terminated C string.
+    unsafe impl Sync for SdkPath {}
+
+    /// DirectX 12 Agility SDK version (matches `D3D12Core.dll` 1.614.x in `.\D3D12\`).
+    /// Required on Windows 10 so `d3d12.dll` supports Shader Model 6.6 and
+    /// directly-indexed descriptor heap root signature flags (`0xC00`).
+    #[allow(non_upper_case_globals)]
+    #[used]
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKVersion: u32 = 614;
+
+    #[allow(non_upper_case_globals)]
+    #[used]
+    #[unsafe(no_mangle)]
+    pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr());
+}
+
 use std::path::PathBuf;
 
 use anyhow::Result;

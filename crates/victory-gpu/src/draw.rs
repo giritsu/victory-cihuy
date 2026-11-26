@@ -2525,7 +2525,9 @@ impl State {
             Some(mb) => mb << 20,
             None => {
                 let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
-                if crate::residency::limited_host_ram() {
+                if crate::residency::compact_host_ram() {
+                    base.min(64 << 20)
+                } else if crate::residency::limited_host_ram() {
                     base.min(128 << 20)
                 } else {
                     base

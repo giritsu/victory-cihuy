@@ -35,8 +35,11 @@ const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
+/// Staging blocks kept on compact (<= 16 GiB RAM) hosts: 128 MiB.
+const STAGING_COMPACT: usize = 2;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
@@ -45,6 +48,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
     SPARES.store(limit, Ordering::Relaxed);
+    let staging_limit = if crate::residency::critical_commit() {
+        0
+    } else if pressure {
+        usize::from(!crate::residency::compact_host_ram())
+    } else if crate::residency::compact_host_ram() {
+        STAGING_COMPACT
+    } else {
+        limit.min(STAGING_KEPT)
+    };
+    STAGING_SPARES.store(staging_limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
@@ -52,13 +65,6 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
-            0
-        } else if pressure {
-            1
-        } else {
-            limit
-        };
         pool.reclaim(tick, staging_limit, true);
     }
 }
@@ -208,8 +214,20 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_with(len, align, now, SPARES.load(Ordering::Relaxed), make)
+    }
+
+    fn take_with(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        spares_limit: usize,
+        make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_ripe_with(len, align, now, Ripe::ALL, spares_limit, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
@@ -220,6 +238,18 @@ impl<B: Clone> Pool<B> {
         align: u64,
         now: u64,
         ripe: Ripe,
+        make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        self.take_ripe_with(len, align, now, ripe, SPARES.load(Ordering::Relaxed), make)
+    }
+
+    fn take_ripe_with(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+        spares_limit: usize,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -227,7 +257,7 @@ impl<B: Clone> Pool<B> {
         if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
             return None;
         }
-        self.rested(now);
+        self.rested_with(now, spares_limit);
         let mut found = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
@@ -304,8 +334,13 @@ impl<B: Clone> Pool<B> {
 
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
+    #[cfg_attr(not(test), allow(dead_code))]
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        self.rested_with(now, SPARES.load(Ordering::Relaxed));
+    }
+
+    fn rested_with(&mut self, now: u64, limit: usize) {
+        self.reclaim(now, limit, false);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
@@ -385,7 +420,7 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let (piece, memory, again) = lock(&STAGING).take_with(bytes, 512, now(), STAGING_SPARES.load(Ordering::Relaxed), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.

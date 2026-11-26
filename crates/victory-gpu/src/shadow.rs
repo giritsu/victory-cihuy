@@ -219,11 +219,15 @@ fn card_limits() -> (u64, u64) {
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (mut min_bytes, max_bytes) = resolve_card_limits(
+        let max_mb_override = env_mb("VICTORY_CARD_BUFFERS_MB");
+        let (mut min_bytes, mut max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
+            max_mb_override,
         );
+        if max_mb_override.is_none() && crate::residency::compact_host_ram() {
+            max_bytes = max_bytes.min(1024 << 20);
+        }
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
@@ -492,7 +496,18 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        if let Ok(v) = std::env::var("VICTORY_WINDOWS_BAR_MB") {
+            return v.trim().parse::<u64>().unwrap_or(0) << 20;
+        }
+        if crate::residency::compact_host_ram()
+            && let Some(h) = host()
+            && h.mapped_card_memory()
+            && h.video_memory().is_some_and(|[budget, ..]| budget >= 12 << 30)
+        {
+            tracing::info!("compact RAM: offloading up to 1536 MiB of loose windows into VRAM BAR (VICTORY_WINDOWS_BAR_MB=0 disables)");
+            return 1536 << 20;
+        }
+        0
     })
 }
 
@@ -1291,21 +1306,31 @@ fn pooled(n: usize) -> Vec<u8> {
 /// [`Shadow::writing`]), and the page faults of filling it.
 fn snapshots_kept() -> usize {
     static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
+    *MOST.get_or_init(|| {
+        let default = if crate::residency::compact_host_ram() { 256 } else { 1024 };
+        std::env::var("VICTORY_SNAPSHOT_POOL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+    })
 }
 
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
 /// the largest, and of those the largest one and the next ones up to `KEPT`
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let kept_bytes: usize = if crate::residency::compact_host_ram() {
+        128 << 20
+    } else {
+        512 << 20
+    };
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > kept_bytes {
             break;
         }
         kept += 1;
@@ -5053,8 +5078,13 @@ const WINDOW: u64 = 4 << 20;
 fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
-        let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+        let kb = std::env::var("VICTORY_WINDOW_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .or_else(|| crate::residency::compact_host_ram().then_some(256));
+        let bytes = grid(kb);
+        tracing::info!(window_kb = bytes >> 10, "loose window grid");
+        bytes
     })
 }
 
@@ -5092,7 +5122,10 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_WINDOW_TAILS") {
+        Some(v) => v == "1",
+        None => crate::residency::compact_host_ram(),
+    })
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,

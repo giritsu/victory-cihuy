@@ -440,11 +440,13 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
-    crate::residency::refresh();
+    let memory = host().and_then(|h| h.video_memory());
+    crate::residency::refresh(memory);
     if crate::residency::pressured() {
         trim_spare_chunks();
+        crate::list::trim_idle();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    crate::pool::room(memory);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -497,7 +499,13 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
 fn bury_lag() -> u64 {
     static LAG: OnceLock<u64> = OnceLock::new();
     *LAG.get_or_init(|| {
-        let default = if crate::residency::limited_host_ram() { 16 } else { 64 };
+        let default = if crate::residency::compact_host_ram() {
+            6
+        } else if crate::residency::limited_host_ram() {
+            16
+        } else {
+            64
+        };
         std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     })
 }
@@ -1932,7 +1940,9 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() {
+                let limit = if crate::residency::compact_host_ram() {
+                    32 << 20
+                } else if keep_freed() && !crate::residency::limited_host_ram() {
                     SPARE_KEPT
                 } else {
                     SPARE_MOST
@@ -6283,6 +6293,9 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            if let Some(h) = host() {
+                h.log_video_memory("when a host command list failed to close");
+            }
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -8620,8 +8633,17 @@ impl Host {
             Err(e) => {
                 crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
+                self.log_buffer_oom("after an upload buffer allocation failed");
                 None
             }
+        }
+    }
+
+    fn log_buffer_oom(&self, when: &str) {
+        static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 4 || n.is_power_of_two() {
+            self.log_video_memory(when);
         }
     }
 }
@@ -9506,7 +9528,9 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no shared buffer");
+                self.log_buffer_oom("after a shared buffer allocation failed");
                 None
             }
         }

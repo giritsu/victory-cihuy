@@ -471,13 +471,15 @@ fn next(screens_only: bool) -> Arc<Pending> {
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
+#[cfg_attr(not(test), allow(dead_code))]
 fn worker_count(asked: Option<usize>, processors: usize) -> usize {
-    worker_count_for(asked, processors, false)
+    worker_count_for(asked, processors, false, false)
 }
 
-fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) -> usize {
+fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool, compact_ram: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
+        None if compact_ram => (processors / 3).clamp(2, 4),
         None if limited_ram => (processors * 3 / 4).clamp(2, 8),
         None => (processors * 2 / 3).clamp(2, 16),
     }
@@ -494,6 +496,7 @@ fn workers() -> bool {
                 .and_then(|v| v.trim().parse().ok()),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
+            crate::residency::compact_host_ram(),
         );
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
@@ -566,10 +569,13 @@ mod tests {
         assert_eq!(worker_count(None, 64), 16);
         assert_eq!(worker_count(Some(0), 24), 1);
         assert_eq!(worker_count(Some(20), 24), 20);
-        assert_eq!(worker_count_for(None, 8, true), 6);
-        assert_eq!(worker_count_for(None, 16, true), 8);
-        assert_eq!(worker_count_for(None, 24, true), 8);
-        assert_eq!(worker_count_for(Some(12), 8, true), 12);
+        assert_eq!(worker_count_for(None, 8, true, false), 6);
+        assert_eq!(worker_count_for(None, 16, true, false), 8);
+        assert_eq!(worker_count_for(None, 24, true, false), 8);
+        assert_eq!(worker_count_for(Some(12), 8, true, false), 12);
+        assert_eq!(worker_count_for(None, 12, true, true), 4);
+        assert_eq!(worker_count_for(None, 6, true, true), 2);
+        assert_eq!(worker_count_for(Some(6), 12, true, true), 6);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
