@@ -307,12 +307,29 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
+/// Whether [`ask_once`] currently holds a submission-wide journal snapshot (`j.kept`).
+static JOURNAL_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`ask_ahead`] needs to inspect the kernel write watch for a submission.
+pub(crate) fn ask_ahead_needed() -> bool {
+    !JOURNAL_KEPT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Asks Windows' write watch once for all `ranges`, then [`writes`] tells from
+/// the journal without asking the kernel again, until [`ask_ahead_done`].
+///
+/// Most of `ranges` lie together in a few buffers, so this coalesces calls to
+/// the kernel (one syscall for adjacent ranges, instead of one per buffer).
+///
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
 /// submissions refresh thousands of host copies (6,664 askings a frame,
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if !ask_ahead_needed() {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -494,6 +511,9 @@ fn ask_early(every: std::time::Duration) {
 
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
+    if !ask_ahead_needed() {
+        return;
+    }
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
@@ -575,6 +595,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    JOURNAL_KEPT.store(j.kept, std::sync::atomic::Ordering::Release);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -584,6 +605,7 @@ pub(crate) fn ask_once_end() {
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        JOURNAL_KEPT.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -591,8 +613,11 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    if len == 0 || !JOURNAL_KEPT.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
     let mut j = journal_mut();
-    if !j.kept || len == 0 {
+    if !j.kept {
         return;
     }
     let now = next_asking();
@@ -4381,5 +4406,26 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+
+    #[test]
+    fn ask_ahead_needed_tracks_ask_once_state() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: fresh write-watched allocation freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        super::ask_once_end();
+        assert!(super::ask_ahead_needed());
+        super::ask_once(&[(p, p + 2 * PAGE)]);
+        assert!(!super::ask_ahead_needed());
+        super::ask_ahead(&[(p, p + 2 * PAGE)]);
+        super::ask_ahead_done();
+        assert!(!super::ask_ahead_needed());
+        super::ask_once_end();
+        assert!(super::ask_ahead_needed());
+        // SAFETY: `VirtualAlloc` base from above.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 }

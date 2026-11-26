@@ -658,6 +658,39 @@ pub(crate) fn constant_slot(
     }
 }
 
+/// Batched [`constant_slot`], acquiring `SHADER_HEAPS.read()` once for all
+/// `slots` and reusing `buffer_gpu` and the last resolved heap.
+#[cfg(windows)]
+pub(crate) fn constant_slots(
+    slots: &[(usize, u32, u64, u32)],
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    buffer_gpu: u64,
+) {
+    if slots.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut last: Option<(usize, Option<&host::HostHeap>)> = None;
+    for &(heap, index, gpu, size) in slots {
+        let host = match last {
+            Some((cached, host)) if cached == heap => host,
+            _ => {
+                let resolved = heaps
+                    .iter()
+                    .any(|&(_, _, h)| h == heap)
+                    // SAFETY: registered heaps are live (removed when dropped).
+                    .then(|| unsafe { &*(heap as *const Heap) }.host.get().and_then(Option::as_ref))
+                    .flatten();
+                last = Some((heap, resolved));
+                resolved
+            }
+        };
+        if let Some(host) = host {
+            host.constant_at_base(index, buffer, buffer_gpu, gpu, size);
+        }
+    }
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

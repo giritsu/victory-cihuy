@@ -8116,27 +8116,29 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
-        let ahead = spans.len() > 1;
+        let ahead = spans.len() > 1 && crate::watch::ask_ahead_needed();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Self::update(shadow, *from, *to);
-        });
+        crate::shadow::wide_each_chunked(
+            due.len(),
+            spans.len(),
+            if many { 16 } else { 1 },
+            move |i| due[i].refresh(),
+            move |from, to| {
+                for (shadow, a, b) in &spans[from..to] {
+                    if many && shadow.nothing_new(*a, *b - *a) {
+                        #[cfg(feature = "diagnostics")]
+                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    Self::update(shadow, *a, *b);
+                }
+            },
+        );
         if ahead {
             crate::watch::ask_ahead_done();
         }

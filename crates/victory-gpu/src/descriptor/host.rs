@@ -3062,6 +3062,20 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        // SAFETY: a live buffer.
+        let buffer_gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        self.constant_at_base(index, buffer, buffer_gpu, gpu, size);
+    }
+
+    /// [`HostHeap::constant_at`] when the caller already holds `buffer.GetGPUVirtualAddress()`.
+    pub(crate) fn constant_at_base(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        buffer_gpu: u64,
+        gpu: u64,
+        size: u32,
+    ) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3078,8 +3092,7 @@ impl HostHeap {
         // A program that reads it as raw bytes reads its twin.
         let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
         if let Some((twin, _)) = twin {
-            // SAFETY: a live buffer that holds the range.
-            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            let first = (gpu - buffer_gpu) / 4;
             let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT_R32_TYPELESS,
                 ViewDimension: D3D12_SRV_DIMENSION_BUFFER,

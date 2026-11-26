@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -53,6 +53,8 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free hint for whether `pending` is non-empty (always updated under `pending`).
+    pending_any: AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -843,8 +845,11 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
         if from >= to {
             continue;
         }
-        let busy: Vec<(usize, usize)> =
-            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        let busy: Vec<(usize, usize)> = if shadow.pending_any.load(Ordering::Acquire) {
+            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect()
+        } else {
+            Vec::new()
+        };
         for (a, b) in outside(from, to, busy) {
             shadow.copy(a, b);
         }
@@ -1611,9 +1616,16 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
-/// How many threads are kept for [`wide`].
+/// How many threads are kept for [`wide`] (`VICTORY_WIDE_THREADS` overrides).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 3).clamp(2, 6))
+            .clamp(1, 12)
+    })
 }
 
 fn workers() -> &'static Workers {
@@ -1720,6 +1732,48 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
                         break;
                     }
                     work(i);
+                }
+            }) as Job
+        })
+        .collect();
+    wide(jobs);
+}
+
+/// Runs `0..first` one at a time first (for heavy uneven items such as textures),
+/// then claims `chunk`-sized slices of `0..rest` via atomic work-stealing.
+pub(crate) fn wide_each_chunked(
+    first: usize,
+    rest: usize,
+    chunk: usize,
+    work_first: impl Fn(usize) + Send + Sync + 'static,
+    work_rest: impl Fn(usize, usize) + Send + Sync + 'static,
+) {
+    let chunk = chunk.max(1);
+    let total = first + rest.div_ceil(chunk);
+    if total == 0 {
+        return;
+    }
+    let next_first = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let next_rest = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let work_first = Arc::new(work_first);
+    let work_rest = Arc::new(work_rest);
+    let threads = (wide_threads() + 1).min(total);
+    let jobs = (0..threads)
+        .map(|_| {
+            let (next_first, next_rest) = (next_first.clone(), next_rest.clone());
+            let (work_first, work_rest) = (work_first.clone(), work_rest.clone());
+            Box::new(move || {
+                loop {
+                    let i = next_first.fetch_add(1, Ordering::Relaxed);
+                    if i < first {
+                        work_first(i);
+                        continue;
+                    }
+                    let start = next_rest.fetch_add(chunk, Ordering::Relaxed);
+                    if start >= rest {
+                        break;
+                    }
+                    work_rest(start, (start + chunk).min(rest));
                 }
             }) as Job
         })
@@ -3104,6 +3158,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_any: AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3182,6 +3237,7 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+            self.pending_any.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3206,6 +3262,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.pending_any.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3495,6 +3552,7 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        self.pending_any.store(!pending.is_empty(), Ordering::Release);
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3552,13 +3610,14 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.pending_any.load(Ordering::Acquire)
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.pending_any.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3575,7 +3634,7 @@ impl Shadow {
     pub(crate) fn stale_under_writes(&self, address: usize, len: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
+        if from >= to || !self.pending_any.load(Ordering::Acquire) {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -3619,7 +3678,7 @@ impl Shadow {
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
+        if from >= to || !self.pending_any.load(Ordering::Acquire) {
             return false;
         }
         let busy: Vec<(usize, usize)> = self
@@ -3815,14 +3874,18 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        let mut busy: Vec<(usize, usize)> = if self.pending_any.load(Ordering::Acquire) {
+            self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        } else {
+            Vec::new()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -3859,7 +3922,9 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.pending_any.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -4819,6 +4884,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.pending_any.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };
@@ -5784,6 +5850,34 @@ mod window_tests {
             ram.ptr.add((64 << 10) - 1).write(0xA5);
             assert_eq!(*ram.ptr, 0x5A);
             assert_eq!(*ram.ptr.add((64 << 10) - 1), 0xA5);
+        }
+    }
+
+    #[test]
+    fn wide_each_chunked_visits_all_items_once() {
+        for (first, rest, chunk) in [(3usize, 35usize, 16usize), (0, 0, 16), (2, 0, 4), (0, 17, 5)] {
+            let first_seen = std::sync::Arc::new(
+                (0..first).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect::<Vec<_>>(),
+            );
+            let rest_seen = std::sync::Arc::new(
+                (0..rest).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect::<Vec<_>>(),
+            );
+            let (f_out, r_out) = (first_seen.clone(), rest_seen.clone());
+            crate::shadow::wide_each_chunked(
+                first,
+                rest,
+                chunk,
+                move |i| {
+                    f_out[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+                move |from, to| {
+                    for i in from..to {
+                        r_out[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+            );
+            assert!(first_seen.iter().all(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 1));
+            assert!(rest_seen.iter().all(|c| c.load(std::sync::atomic::Ordering::Relaxed) == 1));
         }
     }
 }

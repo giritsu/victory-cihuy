@@ -70,7 +70,7 @@ $settings = @{
     VICTORY_SHOW_AFTER           = '1'
     VICTORY_AMBIENT              = '0.8'
     VICTORY_AMBIENT_AIR          = '1.5'
-    VICTORY_CARD_BUFFERS_MIN_KB  = '256'
+    VICTORY_CARD_BUFFERS_MIN_KB  = '64'
 }
 
 if ($Build -eq 'diag') {
@@ -84,10 +84,20 @@ if ($Build -eq 'diag') {
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'
     $settings.VICTORY_LAND_ECHO = '0'
+    $settings.VICTORY_CARD_BUFFERS_MIN_KB = '256'
 } else {
     $settings.VICTORY_THIN = '1'
     $settings.VICTORY_JOIN_PARTS = '8'
     $settings.VICTORY_UPLOAD_AHEAD = '1'
+    $settings.VICTORY_PLACED_ORDER = '1'
+    $settings.VICTORY_COPY_BESIDE = '1'
+    $settings.VICTORY_STORE_BESIDE = '1'
+    $settings.VICTORY_THIN_THREADS = '6'
+    $settings.VICTORY_LAND_THREADS = '6'
+    $settings.VICTORY_WIDE_THREADS = '5'
+    $settings.VICTORY_WIDE_SPIN = '50'
+    $settings.VICTORY_VIEW_THREADS = '5'
+    $settings.VICTORY_UNDER_THREADS = '6'
 }
 
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
