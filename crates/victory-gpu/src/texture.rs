@@ -516,7 +516,6 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -524,14 +523,25 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+    let mut idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
+    let mut idle_frames = 4u64;
+    if crate::residency::compact_host_ram() {
+        let live = live_staging_bytes();
+        if crate::residency::critical_commit() || live >= (512 << 20) {
+            idle_ms = 0;
+            idle_frames = 1;
+        } else if crate::residency::pressured() || live >= (256 << 20) {
+            idle_ms = idle_ms.min(500);
+            idle_frames = 2;
+        }
+    }
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);

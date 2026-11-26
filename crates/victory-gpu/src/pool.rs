@@ -28,6 +28,10 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
+/// Staging block size on compact (<= 16 GiB RAM) hosts: 16 MiB so free
+/// ranges coalesce back to the OS quickly without pinning 64 MiB chunks in
+/// WDDM Shared GPU Memory.
+const STAGING_BLOCK_COMPACT: u64 = 16 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
@@ -64,7 +68,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     if let Ok(mut pool) = TEXTURES.try_lock() {
         pool.reclaim(tick, limit, true);
     }
-    if let Ok(mut pool) = STAGING.try_lock() {
+    if let Ok(mut pool) = staging_pool().try_lock() {
         pool.reclaim(tick, staging_limit, true);
     }
 }
@@ -204,12 +208,17 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    block_size: u64,
     retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Self::with_block(most, BLOCK)
+    }
+
+    const fn with_block(most: usize, block_size: u64) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, block_size, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -254,7 +263,7 @@ impl<B: Clone> Pool<B> {
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
         // new when the card first reads it) lies in one of those too.
-        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
+        if len == 0 || len > if ripe.ahead > 0 { self.block_size } else { self.block_size / 2 } {
             return None;
         }
         self.rested_with(now, spares_limit);
@@ -292,7 +301,7 @@ impl<B: Clone> Pool<B> {
                     tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
                 }
             }
-            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(self.block_size)).count();
             if empty < ripe.ahead
                 && let Some(memory) = self.grow(now, &mut make)
             {
@@ -324,7 +333,8 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] =
+            Some(Block { memory, free: Ranges::new(self.block_size), used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -351,7 +361,7 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
-                any |= block.free.whole(BLOCK);
+                any |= block.free.whole(self.block_size);
             }
         }
         // (Without a piece given back too, once there is less room.)
@@ -360,7 +370,7 @@ impl<B: Clone> Pool<B> {
         if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
+                if block.as_ref().is_some_and(|b| b.free.whole(self.block_size)) {
                     spare += 1;
                     if spare > most {
                         *block = None;
@@ -382,7 +392,19 @@ struct Upload(ID3D12Resource, *mut u8);
 unsafe impl Send for Upload {}
 
 static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
+
+fn staging_block_size() -> u64 {
+    if crate::residency::compact_host_ram() {
+        STAGING_BLOCK_COMPACT
+    } else {
+        BLOCK
+    }
+}
+
+fn staging_pool() -> &'static Mutex<Pool<Upload>> {
+    static STAGING: std::sync::OnceLock<Mutex<Pool<Upload>>> = std::sync::OnceLock::new();
+    STAGING.get_or_init(|| Mutex::new(Pool::with_block(STAGING_KEPT, staging_block_size())))
+}
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -400,7 +422,12 @@ pub(crate) fn texture_room() -> u64 {
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
-    [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+    let textures = lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20);
+    let staging = {
+        let st = lock(staging_pool());
+        st.blocks() as u64 * (st.block_size >> 20)
+    };
+    [textures, staging]
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -408,7 +435,7 @@ pub(crate) struct StagingPiece(Piece);
 
 impl Drop for StagingPiece {
     fn drop(&mut self) {
-        lock(&STAGING).give(self.0, now());
+        lock(staging_pool()).give(self.0, now());
     }
 }
 
@@ -420,18 +447,25 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take_with(bytes, 512, now(), STAGING_SPARES.load(Ordering::Relaxed), || {
-        // Only gate speculative bindless prefetch on staging-pool growth
-        // headroom; table-bound textures and decoration bakes are sampled
-        // immediately and would otherwise read uninitialized/reused VRAM.
-        let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
-        if speculative && !crate::residency::allow_staging_growth(false) {
-            return None;
-        }
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
-        crate::host::name(&buffer, || "staging of textures (a block)".into());
-        Some(Upload(buffer, data))
-    })?;
+    let block_size = staging_block_size();
+    let (piece, memory, again) = lock(staging_pool()).take_with(
+        bytes,
+        512,
+        now(),
+        STAGING_SPARES.load(Ordering::Relaxed),
+        || {
+            // Only gate speculative bindless prefetch on staging-pool growth
+            // headroom; table-bound textures and decoration bakes are sampled
+            // immediately and would otherwise read uninitialized/reused VRAM.
+            let speculative = crate::texture::PICKING.get().is_some() && !crate::texture::BAKING.get();
+            if speculative && !crate::residency::allow_staging_growth(false) {
+                return None;
+            }
+            let (buffer, data) = host.upload_buffer(block_size)?;
+            crate::host::name(&buffer, || "staging of textures (a block)".into());
+            Some(Upload(buffer, data))
+        },
+    )?;
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -774,11 +808,27 @@ mod tests {
             assert!(at.is_multiple_of(512));
             std::ptr::write_bytes(data, 0xAB, 4096);
             drop(piece);
-            lock(&STAGING).rested(u64::MAX);
+            lock(staging_pool()).rested(u64::MAX);
             let (_piece, _, _, data) = staging(host, 4096).unwrap();
             assert!((0..4096).all(|i| *data.add(i) == 0));
             // SAFETY: plain query.
             assert!(host.device.GetDeviceRemovedReason().is_ok());
         }
+    }
+
+    #[test]
+    fn compact_staging_pool_uses_smaller_blocks_and_reclaims_cleanly() {
+        let mut pool = Pool::with_block(STAGING_COMPACT, STAGING_BLOCK_COMPACT);
+        assert!(pool.take_with(STAGING_BLOCK_COMPACT / 2 + 512, 512, 0, STAGING_COMPACT, || Some(1)).is_none());
+        let (a, _, _) = pool.take_with(STAGING_BLOCK_COMPACT / 2, 512, 0, STAGING_COMPACT, || Some(1)).unwrap();
+        let (b, _, _) = pool.take_with(STAGING_BLOCK_COMPACT / 2, 512, 0, STAGING_COMPACT, || Some(2)).unwrap();
+        assert_eq!(pool.blocks(), 1);
+        let (c, _, _) = pool.take_with(4096, 512, 0, STAGING_COMPACT, || Some(2)).unwrap();
+        assert_eq!(pool.blocks(), 2);
+        pool.give(a, 0);
+        pool.give(b, 0);
+        pool.give(c, 0);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
     }
 }

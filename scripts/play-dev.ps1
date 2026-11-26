@@ -1,6 +1,7 @@
 # Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p).
 #   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-s|series-x]
-#                        [-Panel] [-DebugLayer] [-RayTracing] [-Safe] [-LogFile <path>] [-More @{...}]
+#                        [-Panel] [-DebugLayer] [-DredLight] [-RayTracing] [-LevelsOnDemand] [-Safe]
+#                        [-LogFile <path>] [-More @{...}]
 # Run from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified.
 param(
     [string]$GameDir = $env:VICTORY_GAME_DIR,
@@ -8,7 +9,9 @@ param(
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
     [switch]$Panel,
     [switch]$DebugLayer,
+    [switch]$DredLight,
     [switch]$RayTracing,
+    [switch]$LevelsOnDemand,
     [switch]$Safe,
     [string]$LogFile = (Join-Path $env:LOCALAPPDATA 'victory\dev-run.log'),
     [hashtable]$More = @{}
@@ -62,13 +65,12 @@ $settings = @{
     VICTORY_SHOW_AFTER           = '1'
     VICTORY_AMBIENT              = '0.8'
     VICTORY_AMBIENT_AIR          = '1.5'
-    VICTORY_LEVELS_ON_DEMAND     = '1'
     VICTORY_CARD_BUFFERS_MIN_KB  = '64'
 }
 
 if ($Build -eq 'diag') {
     $settings.VICTORY_LOG = 'info'
-    $settings.VICTORY_D3D12_DRED = 'light'
+    $settings.VICTORY_D3D12_DRED = if ($DredLight) { 'light' } else { 'faults' }
     $settings.VICTORY_MEMORY_MAP = '1'
     $settings.VICTORY_SKIP_PIPELINES = 'none'
 } else {
@@ -87,6 +89,7 @@ if ($Safe) {
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
 if ($DebugLayer) { $settings.VICTORY_D3D12_DEBUG = '1' }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
 
 foreach ($k in $More.Keys) { $settings[$k] = [string]$More[$k] }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
@@ -98,10 +101,28 @@ $Exe = (Resolve-Path $Exe).Path
 Write-Host "Running [$Build] ($Console) -> log: $LogFile"
 Write-Host "Cache: $($env:VICTORY_CACHE_DIR)"
 
+$stream = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+$writer = New-Object System.IO.StreamWriter($stream, [System.Text.UTF8Encoding]::new($false))
+$writer.AutoFlush = $true
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$code = 0
 Push-Location (Join-Path $PSScriptRoot '..')
 try {
-    & $victory run $Exe --console $Console --execute 2>&1 | Tee-Object -FilePath $LogFile
-    exit $LASTEXITCODE
+    & $victory run $Exe --console $Console --execute 2>&1 | ForEach-Object {
+        $line = if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            $_.ToString()
+        } else {
+            [string]$_
+        }
+        $writer.WriteLine($line)
+        [Console]::Out.WriteLine($line)
+    }
+    $code = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = $prevEap
     Pop-Location
+    $writer.Dispose()
+    $stream.Dispose()
 }
+exit $code

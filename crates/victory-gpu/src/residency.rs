@@ -19,8 +19,31 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
 
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static NEXT_SHARED_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
 static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn update_shared(video_memory: Option<[u64; 4]>) {
+    let Some([_, _, sb, su]) = video_memory else { return };
+    let (shared_pressure, shared_critical) =
+        next_shared_pressure(SHARED_PRESSURED.load(Ordering::Relaxed), sb, su);
+    SHARED_PRESSURED.store(shared_pressure, Ordering::Relaxed);
+    SHARED_CRITICAL.store(shared_critical, Ordering::Relaxed);
+    if sb > 0 {
+        HEADROOM.fetch_min(sb.saturating_sub(su), Ordering::Relaxed);
+    }
+}
+
+fn sample_shared(now: u64) {
+    let next = NEXT_SHARED_SAMPLE.load(Ordering::Relaxed);
+    if now >= next
+        && NEXT_SHARED_SAMPLE
+            .compare_exchange(next, now.saturating_add(100), Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        update_shared(crate::host::host().and_then(|h| h.video_memory()));
+    }
+}
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
@@ -78,6 +101,7 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
+    sample_shared(now);
     if !bake && SHARED_CRITICAL.load(Ordering::Relaxed) {
         return false;
     }
@@ -92,6 +116,7 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
         return false;
     }
+    sample_shared(now);
     if !bake
         && (SHARED_CRITICAL.load(Ordering::Relaxed)
             || (compact_host_ram() && SHARED_PRESSURED.load(Ordering::Relaxed)))
@@ -209,16 +234,27 @@ pub(crate) fn pressured() -> bool {
 /// requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
     let now = crate::host::coarse_ms();
-    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed)
-        || sample_commit(now) < 1536 * MIB
-        || SHARED_CRITICAL.load(Ordering::Relaxed)
+    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB {
+        return true;
+    }
+    sample_shared(now);
+    SHARED_CRITICAL.load(Ordering::Relaxed)
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The
 /// queue retains unserved slots so they can be retried on later frames.
-pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, critical: bool, limited: bool, staging: u64) -> u64 {
+pub(crate) fn prefetch_limit(
+    bytes: u64,
+    pressure: bool,
+    critical: bool,
+    limited: bool,
+    compact: bool,
+    staging: u64,
+) -> u64 {
     if critical {
-        bytes.min(16 << 20)
+        bytes.min(if compact { 8 << 20 } else { 16 << 20 })
+    } else if compact && (pressure || staging >= 256 * MIB) {
+        bytes.min(32 << 20)
     } else if pressure || (limited && staging >= GIB) {
         bytes.min(64 << 20)
     } else {
@@ -274,13 +310,18 @@ mod tests {
 
     #[test]
     fn prefetch_respects_existing_budgets_and_resumes_after_recovery() {
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB), 64 << 20);
-        assert_eq!(prefetch_limit(512 << 20, false, false, true, GIB - 1), 512 << 20);
-        assert_eq!(prefetch_limit(512 << 20, false, false, false, 2 * GIB), 512 << 20);
-        assert_eq!(prefetch_limit(0, true, true, false, 0), 0);
-        assert_eq!(prefetch_limit(8 << 20, true, true, false, 0), 8 << 20);
-        assert_eq!(prefetch_limit(512 << 20, true, false, false, 0), 64 << 20);
-        assert_eq!(prefetch_limit(512 << 20, true, true, false, 0), 16 << 20);
-        assert_eq!(prefetch_limit(192 << 20, false, false, false, 0), 192 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, false, GIB), 64 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, false, GIB - 1), 512 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, false, false, 2 * GIB), 512 << 20);
+        assert_eq!(prefetch_limit(0, true, true, false, false, 0), 0);
+        assert_eq!(prefetch_limit(8 << 20, true, true, false, false, 0), 8 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, false, false, false, 0), 64 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, true, false, false, 0), 16 << 20);
+        assert_eq!(prefetch_limit(192 << 20, false, false, false, false, 0), 192 << 20);
+        // Compact host (16 GiB RAM) caps earlier and tighter.
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, true, 256 * MIB - 1), 512 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, true, true, 256 * MIB), 32 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, false, true, true, 0), 32 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, true, true, true, 0), 8 << 20);
     }
 }

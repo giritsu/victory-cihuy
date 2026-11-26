@@ -430,8 +430,9 @@ fn sweep() {
     }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = now_ms();
+    let cadence = if crate::residency::compact_host_ram() && crate::residency::pressured() { 250 } else { 1000 };
     let last = LAST.load(Ordering::Relaxed);
-    if now < last + 1000
+    if now < last + cadence
         || LAST
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_err()

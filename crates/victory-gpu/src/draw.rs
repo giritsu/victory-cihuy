@@ -2635,7 +2635,13 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && on_time >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        let throttle_catchup = crate::residency::compact_host_ram()
+            && (crate::residency::pressured() || crate::texture::live_staging_bytes() >= (256 << 20));
+        let (per_frame, span) = if catchup && !throttle_catchup && on_time >= 1024 {
+            (per_frame * 3, span * 3)
+        } else {
+            (per_frame, span)
+        };
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2655,6 +2661,7 @@ impl State {
                 crate::residency::pressured(),
                 crate::residency::critical_commit(),
                 crate::residency::limited_host_ram(),
+                crate::residency::compact_host_ram(),
                 crate::texture::live_staging_bytes(),
             )
         };
@@ -3028,9 +3035,13 @@ impl State {
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
-            if room && since_asked >= 32 << 20 {
+            if since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+                let memory = crate::host::host().and_then(|h| h.video_memory());
+                if room {
+                    room = crate::resource::room(memory);
+                }
+                crate::residency::update_shared(memory);
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
