@@ -680,6 +680,7 @@ pub(crate) fn constant_slots(
     }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut last: Option<(usize, Option<&host::HostHeap>)> = None;
+    let mut retired = Vec::new();
     for &(heap, index, gpu, size) in slots {
         let host = match last {
             Some((cached, host)) if cached == heap => host,
@@ -695,8 +696,11 @@ pub(crate) fn constant_slots(
             }
         };
         if let Some(host) = host {
-            host.constant_at_base(index, buffer, buffer_gpu, gpu, size);
+            host.constant_at_base_retire(index, buffer, buffer_gpu, gpu, size, Some(&mut retired));
         }
+    }
+    if !retired.is_empty() {
+        crate::host::retire_resources(retired);
     }
 }
 

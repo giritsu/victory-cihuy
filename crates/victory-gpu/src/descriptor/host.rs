@@ -3438,6 +3438,7 @@ impl HostHeap {
     }
 
     /// [`HostHeap::constant_at`] when the caller already holds `buffer.GetGPUVirtualAddress()`.
+    #[cfg(test)]
     pub(crate) fn constant_at_base(
         &self,
         index: u32,
@@ -3446,6 +3447,35 @@ impl HostHeap {
         gpu: u64,
         size: u32,
     ) {
+        self.constant_at_base_retire(index, buffer, buffer_gpu, gpu, size, None);
+    }
+
+    /// [`HostHeap::constant_at_base`] appending replaced slot resources to `batch`
+    /// for one batched retirement flush.
+    pub(crate) fn constant_at_batched(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        buffer_gpu: u64,
+        gpu: u64,
+        size: u32,
+        batch: &mut CopyBatch,
+    ) {
+        self.constant_at_base_retire(index, buffer, buffer_gpu, gpu, size, Some(&mut batch.retired));
+    }
+
+    /// Writes a constant buffer view (and raw twin if present) at `index`.
+    /// Dynamic slots (`index >= self.count`) belong exclusively to an
+    /// unsubmitted recording and are created in-place instead of staging.
+    pub(crate) fn constant_at_base_retire(
+        &self,
+        index: u32,
+        buffer: &ID3D12Resource,
+        buffer_gpu: u64,
+        gpu: u64,
+        size: u32,
+        retired: Option<&mut Vec<ID3D12Resource>>,
+    ) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3453,37 +3483,62 @@ impl HostHeap {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
         };
-        // SAFETY: a slot of our heap; the memory is the caller's.
-        unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.at(index))
-        };
-        self.put(index);
-        // A program that reads it as raw bytes reads its twin.
-        let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
-        if let Some((twin, _)) = twin {
-            let first = (gpu - buffer_gpu) / 4;
-            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                Format: DXGI_FORMAT_R32_TYPELESS,
-                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                    Buffer: D3D12_BUFFER_SRV {
-                        FirstElement: first,
-                        NumElements: desc.SizeInBytes / 4,
-                        StructureByteStride: 0,
-                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
-                    },
+        let raw_desc = (desc.SizeInBytes > 0).then(|| D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: (gpu - buffer_gpu) / 4,
+                    NumElements: desc.SizeInBytes / 4,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
+            },
+        });
+        if index >= self.count {
+            // SAFETY: dynamic slots are never read by running GPU work until submitted.
+            unsafe { host.device.CreateConstantBufferView(Some(&desc), self.cpu(index)) };
+            #[cfg(feature = "diagnostics")]
+            if let Some(written) = self.written.get(index as usize) {
+                written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(raw) = raw_desc
+                && let Some(twin_flag) = self.twins.get(index as usize)
+            {
+                // SAFETY: dynamic raw twin slot mirrors `index` until submitted.
+                unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), self.cpu(self.raw + index)) };
+                #[cfg(feature = "diagnostics")]
+                if let Some(written) = self.written.get((self.raw + index) as usize) {
+                    written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+                }
+                twin_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.clear_twin(index);
+            }
+        } else {
+            // SAFETY: a slot of our heap; the memory is the caller's.
+            unsafe {
+                host.device
+                    .CreateConstantBufferView(Some(&desc), self.at(index))
             };
-            // SAFETY: as above, and a slot of our heaps.
-            unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
+            self.put(index);
+            // A program that reads it as raw bytes reads its twin.
+            let twin = raw_desc.as_ref().and_then(|_| self.twin(index));
+            if let (Some(raw), Some((handle, _))) = (&raw_desc, twin) {
+                // SAFETY: as above, and a slot of our heaps.
+                unsafe { host.device.CreateShaderResourceView(buffer, Some(raw), handle) };
+            }
+            self.twin_made(index, twin.is_some());
         }
-        self.twin_made(index, twin.is_some());
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep_ref(index, holds.then_some(buffer));
+        let held = holds.then_some(buffer);
+        match retired {
+            Some(list) => self.keep_ref_retire(index, held, list),
+            None => self.keep_ref(index, held),
+        }
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:

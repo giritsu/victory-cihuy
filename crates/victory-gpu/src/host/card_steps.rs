@@ -831,11 +831,12 @@ type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefau
 
 /// A step done on the card.
 struct Op {
-    from: (Arc<Shadow>, usize),
+    from: (usize, usize),
     len: usize,
     /// Its place in the buffer between.
     at: u64,
     level: u32,
+    first_read: bool,
     to: To,
 }
 
@@ -1052,9 +1053,28 @@ impl Host {
         };
         let mut writer_index = WriterIndex::build(&writers);
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
+        let mut shadows: Vec<Arc<Shadow>> = Vec::with_capacity(64);
+        let mut last_shadow: Option<(usize, usize)> = None;
+        let intern_shadow = |shadows: &mut Vec<Arc<Shadow>>, last_shadow: &mut Option<(usize, usize)>, s: Arc<Shadow>| -> usize {
+            let ptr = Arc::as_ptr(&s) as usize;
+            if let Some((cached_ptr, idx)) = *last_shadow
+                && cached_ptr == ptr
+            {
+                return idx;
+            }
+            if let Some(idx) = shadows.iter().position(|existing| Arc::as_ptr(existing) as usize == ptr) {
+                *last_shadow = Some((ptr, idx));
+                return idx;
+            }
+            let idx = shadows.len();
+            shadows.push(s);
+            *last_shadow = Some((ptr, idx));
+            idx
+        };
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
-        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
+        let mut places: HashMap<(usize, usize, usize, u32), u64> =
+            HashMap::with_capacity_and_hasher(chosen.len(), Default::default());
         let mut room = MappedCache::new();
         let mut end = 0u64;
         for (pos, &(i, level)) in chosen.iter().enumerate() {
@@ -1068,9 +1088,10 @@ impl Host {
                 return Err("nothing to read");
             }
             let from = writer_index.lookup(&writers, src, src + len)?;
-            let place = (Arc::as_ptr(&from) as usize, src, len, level);
-            let at = match places.get(&place) {
-                Some(&at) => at,
+            let from_ptr = Arc::as_ptr(&from) as usize;
+            let place = (from_ptr, src, len, level);
+            let (at, first_read) = match places.get(&place) {
+                Some(&at) => (at, false),
                 None => {
                     if end + len as u64 > BETWEEN {
                         return Err("too much at once");
@@ -1081,9 +1102,10 @@ impl Host {
                     let at = end;
                     end = (end + len as u64).next_multiple_of(256);
                     places.insert(place, at);
-                    at
+                    (at, true)
                 }
             };
+            let from_idx = intern_shadow(&mut shadows, &mut last_shadow, from);
             let to = match does[i] {
                 Does::Copy { .. } => {
                     let to = writer_index.lookup(&writers, dst, dst + len)?;
@@ -1111,10 +1133,11 @@ impl Host {
                 },
             };
             ops.push(Op {
-                from: (from, src),
+                from: (from_idx, src),
                 len,
                 at,
                 level,
+                first_read,
                 to,
             });
         }
@@ -1128,11 +1151,12 @@ impl Host {
         // to the last, whatever the steps.)
         let mut spans: ByCopy<(Arc<Shadow>, usize, usize)> = ByCopy::default();
         for op in &ops {
+            let from_shadow = &shadows[op.from.0];
             let to = match &op.to {
                 To::Copy(to, dst) => Some((to, *dst)),
                 _ => None,
             };
-            for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
+            for (shadow, at) in std::iter::once((from_shadow, op.from.1)).chain(to) {
                 let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
                 (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
             }
@@ -1151,14 +1175,13 @@ impl Host {
         own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
         let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
         for level in 0..=levels {
-            let mut reads = Vec::new();
+            let mut reads = Vec::with_capacity(ops.len());
             let mut writes = Vec::new();
             for op in ops.iter().filter(|op| op.level == level) {
                 let len = op.len as u64;
-                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
-                // (Each place once.)
-                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
-                    reads.push(read);
+                if op.first_read {
+                    let from_shadow = &shadows[op.from.0];
+                    reads.push((&from_shadow.buffer, from_shadow.offset(op.from.1 as u64), op.at, len));
                 }
                 match &op.to {
                     To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
@@ -1176,7 +1199,8 @@ impl Host {
         // several threads, a slot always on the same one, in the steps'
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
-        let mut buckets: Vec<Vec<(usize, u32, u64, u32)>> = vec![Vec::new(); parts];
+        let cap = ops.len() / parts + 1;
+        let mut buckets: Vec<Vec<(usize, u32, u64, u32)>> = (0..parts).map(|_| Vec::with_capacity(cap)).collect();
         for op in &ops {
             if let To::Slot(heap, index) = &op.to {
                 buckets[*index as usize / 4 % parts].push((*heap, *index, gpu + op.at, op.len as u32));
@@ -1190,11 +1214,14 @@ impl Host {
         DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
         DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        noted(&ops);
+        noted(&ops, &shadows);
         spent.end();
+        let mut taken_steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
+            std::collections::HashSet::with_capacity_and_hasher(chosen.len(), Default::default());
+        taken_steps.extend(chosen.iter().map(|&(i, _)| steps[i]));
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+            steps: taken_steps,
             copied,
         }))
     }
@@ -1222,7 +1249,7 @@ type Noted = std::collections::HashMap<(usize, (u64, u64), (u64, u64)), (u64, us
 static NOTED: Mutex<Option<Noted>> = Mutex::new(None);
 
 #[cfg(feature = "diagnostics")]
-fn noted(ops: &[Op]) {
+fn noted(ops: &[Op], shadows: &[Arc<Shadow>]) {
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
     let noted = noted.get_or_insert_with(Default::default);
     for op in ops {
@@ -1230,7 +1257,7 @@ fn noted(ops: &[Op]) {
             To::Copy(to, dst) => (to.span(), *dst),
             To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
         };
-        let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
+        let e = noted.entry((op.len, shadows[op.from.0].span(), to)).or_default();
         *e = (e.0 + 1, op.from.1, dst);
     }
 }

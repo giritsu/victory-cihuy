@@ -37,7 +37,7 @@ pub(crate) const BLOCK: usize = 64 << 10;
 /// The unit title memory is there or not in.
 const PAGE: usize = 4096;
 /// About this many bytes to a job.
-const JOB: usize = 256 << 10;
+const JOB: usize = 128 << 10;
 
 /// See the file.
 pub(crate) fn on() -> bool {
@@ -337,6 +337,19 @@ impl Pool {
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
+}
+
+/// [`Pool::each`] on a dedicated small pool for resetting recycled host
+/// command lists without blocking [`each`]'s landing turn lock.
+pub(crate) fn each_reset(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism()
+            .map_or(2, |n| n.get() / 6)
+            .clamp(2, 3);
+        Pool::new("victory-reset", threads)
+    })
+    .each(count, f);
 }
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes

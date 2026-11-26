@@ -499,6 +499,10 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
+    let finished = FINISHED.load(Ordering::Acquire);
+    if finished > 0 {
+        bury(finished);
+    }
     let memory = host().and_then(|h| h.video_memory());
     crate::residency::refresh(memory);
     if crate::residency::pressured() {
@@ -3519,6 +3523,10 @@ fn land() {
     if !landed.is_empty() {
         crate::list::recycle_many(landed);
     }
+    let finished = FINISHED.load(Ordering::Acquire);
+    if finished > 0 {
+        bury(finished);
+    }
 }
 
 /// The thread that settles the flights once the card has run them all
@@ -4123,13 +4131,25 @@ pub(crate) fn walls_trace() -> bool {
 /// ([`late`]) did not, at any stage: the flights' lists were settled
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
+fn tex_backs_disjoint(backs: &[crate::texback::Back]) -> bool {
+    let mut ranges: Vec<(usize, usize)> = backs.iter().map(crate::texback::Back::range).collect();
+    ranges.sort_unstable();
+    ranges.windows(2).all(|w| w[0].1 <= w[1].0)
+}
+
 fn read_backs(list: &HostList) {
     // Textures shaders wrote that the title reads on the CPU
-    // ([`crate::texback`]).
-    for back in &list.deferred().texture_backs {
-        crate::texback::land(back);
+    // ([`crate::texback`]). Must only be called outside `victory-land` worker threads.
+    let deferred = list.deferred();
+    let tex_backs = &deferred.texture_backs;
+    if tex_backs.len() >= 2 && tex_backs_disjoint(tex_backs) {
+        crate::land::each(tex_backs.len(), &|i| crate::texback::land(&tex_backs[i]));
+    } else {
+        for back in tex_backs {
+            crate::texback::land(back);
+        }
     }
-    for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
+    for (buffer, at, [row, rows, pitch]) in &deferred.backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -5117,7 +5137,12 @@ impl Host {
         if land::on() {
             let titles: Vec<(usize, usize)> =
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
-            let jobs = land::jobs(&titles);
+            let mut jobs = land::jobs(&titles);
+            if jobs.len() > 2 {
+                jobs.sort_unstable_by_key(|r| {
+                    std::cmp::Reverse(titles[r.clone()].iter().map(|&(_, len)| len).sum::<usize>())
+                });
+            }
             let put = std::sync::atomic::AtomicU64::new(0);
             let job_notes: Vec<std::sync::Mutex<land::Notes>> = (0..jobs.len()).map(|_| std::sync::Mutex::default()).collect();
             land::each(jobs.len(), &|j| {
@@ -5280,7 +5305,9 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            if !LATE_HELPER_UP.load(Ordering::Acquire) {
+                bury(last);
+            }
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -8319,6 +8346,62 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+const REFRESH_BATCH_CHUNK: usize = 16;
+
+/// Returns a bitmask (bit `i` set if `slice[i]` is unchanged and can be skipped)
+/// plus the count of unchanged items, using a single `journal_read()` per chunk.
+fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> (u32, usize) {
+    use crate::shadow::{RangedCheck, Shadow};
+    debug_assert!(slice.len() <= REFRESH_BATCH_CHUNK);
+    let mut checks: [RangedCheck; REFRESH_BATCH_CHUNK] = std::array::from_fn(|_| RangedCheck::NeedFull);
+    let mut has_ranged = false;
+    for (slot, (shadow, a, b)) in checks.iter_mut().zip(slice) {
+        *slot = shadow.ranged_check(*a, *b - *a);
+        if matches!(*slot, RangedCheck::Exact(..) | RangedCheck::CheckRanged(..)) {
+            has_ranged = true;
+        }
+    }
+    if has_ranged {
+        let jr = crate::watch::journal_read();
+        for check in &mut checks[..slice.len()] {
+            match *check {
+                RangedCheck::Exact(lo, hi, t) => {
+                    if jr.ranged_nothing_new(lo, hi, t) {
+                        Shadow::note_nothing_new_bytes(hi - lo);
+                        *check = RangedCheck::Skip;
+                    } else {
+                        *check = RangedCheck::MustUpdate;
+                    }
+                }
+                RangedCheck::CheckRanged(lo, hi, ranged) => {
+                    if jr.ranged_nothing_new(lo, hi, ranged) {
+                        Shadow::note_nothing_new_bytes(hi - lo);
+                        *check = RangedCheck::Skip;
+                    } else {
+                        *check = RangedCheck::NeedFull;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut mask = 0u32;
+    let mut skipped = 0usize;
+    for (i, (check, (shadow, a, b))) in checks[..slice.len()].iter().zip(slice).enumerate() {
+        let unchanged = match check {
+            RangedCheck::Skip => true,
+            RangedCheck::MustUpdate => false,
+            RangedCheck::NeedFull => shadow.nothing_new(*a, *b - *a),
+            RangedCheck::Exact(..) | RangedCheck::CheckRanged(..) => false,
+        };
+        if unchanged {
+            mask |= 1u32 << i;
+            skipped += 1;
+        }
+    }
+    (mask, skipped)
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
@@ -8446,40 +8529,26 @@ impl Batch {
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
-        use crate::shadow::{RangedCheck, Shadow};
         const FEW: usize = 256;
-        const CHUNK: usize = 16;
         let mut spans = spans;
         let many = spans.len() > FEW;
         if !many {
-            #[cfg(feature = "diagnostics")]
-            let all = spans.len();
-            let mut checks: Vec<RangedCheck> = spans
-                .iter()
-                .map(|(shadow, from, to)| shadow.ranged_check(*from, *to - *from))
-                .collect();
-            if checks.iter().any(|c| matches!(c, RangedCheck::CheckRanged(..))) {
-                let jr = crate::watch::journal_read();
-                for check in &mut checks {
-                    if let RangedCheck::CheckRanged(lo, hi, ranged) = *check
-                        && jr.ranged_nothing_new(lo, hi, ranged)
-                    {
-                        Shadow::note_nothing_new_bytes(hi - lo);
-                        *check = RangedCheck::Skip;
+            let mut skipped = 0usize;
+            let mut filtered = Vec::with_capacity(spans.len());
+            for chunk in spans.chunks(REFRESH_BATCH_CHUNK) {
+                let (mask, n_skipped) = unchanged_refresh_mask(chunk);
+                skipped += n_skipped;
+                for (i, item) in chunk.iter().enumerate() {
+                    if mask & (1u32 << i) == 0 {
+                        filtered.push(item.clone());
                     }
                 }
             }
-            let mut idx = 0usize;
-            spans.retain(|(shadow, from, to)| {
-                let check = &checks[idx];
-                idx += 1;
-                match check {
-                    RangedCheck::Skip => false,
-                    _ => !shadow.nothing_new(*from, *to - *from),
-                }
-            });
+            spans = filtered;
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = skipped;
         }
         let ahead = spans.len() > 1 && crate::watch::ask_ahead_needed();
         if ahead {
@@ -8491,40 +8560,22 @@ impl Batch {
         crate::shadow::wide_each_chunked(
             due.len(),
             spans.len(),
-            if many { CHUNK } else { 1 },
+            if many { REFRESH_BATCH_CHUNK } else { 1 },
             move |i| due[i].refresh(),
             move |from, to| {
                 if many {
                     let slice = &spans[from..to];
-                    let mut checks: [RangedCheck; CHUNK] =
-                        std::array::from_fn(|_| RangedCheck::NeedFull);
-                    let mut has_ranged = false;
-                    for (slot, (shadow, a, b)) in checks.iter_mut().zip(slice) {
-                        *slot = shadow.ranged_check(*a, *b - *a);
-                        if matches!(*slot, RangedCheck::CheckRanged(..)) {
-                            has_ranged = true;
-                        }
+                    let (mask, skipped) = unchanged_refresh_mask(slice);
+                    #[cfg(feature = "diagnostics")]
+                    if skipped > 0 {
+                        FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
                     }
-                    if has_ranged {
-                        let jr = crate::watch::journal_read();
-                        for check in &mut checks[..slice.len()] {
-                            if let RangedCheck::CheckRanged(lo, hi, ranged) = *check
-                                && jr.ranged_nothing_new(lo, hi, ranged)
-                            {
-                                Shadow::note_nothing_new_bytes(hi - lo);
-                                *check = RangedCheck::Skip;
-                            }
+                    #[cfg(not(feature = "diagnostics"))]
+                    let _ = skipped;
+                    for (i, (shadow, a, b)) in slice.iter().enumerate() {
+                        if mask & (1u32 << i) == 0 {
+                            Self::update(shadow, *a, *b);
                         }
-                    }
-                    for (check, (shadow, a, b)) in checks[..slice.len()].iter().zip(slice) {
-                        let unchanged = matches!(check, RangedCheck::Skip)
-                            || shadow.nothing_new(*a, *b - *a);
-                        if unchanged {
-                            #[cfg(feature = "diagnostics")]
-                            FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        }
-                        Self::update(shadow, *a, *b);
                     }
                 } else {
                     for (shadow, a, b) in &spans[from..to] {
@@ -8664,12 +8715,23 @@ impl Batch {
         let light = crate::watch::light();
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let mut skipped = 0usize;
+            let mut filtered = Vec::with_capacity(self.refreshes.len());
+            for chunk in self.refreshes.chunks(REFRESH_BATCH_CHUNK) {
+                let (mask, n_skipped) = unchanged_refresh_mask(chunk);
+                skipped += n_skipped;
+                for (i, item) in chunk.iter().enumerate() {
+                    if mask & (1u32 << i) == 0 {
+                        filtered.push(item.clone());
+                    }
+                }
+            }
+            self.refreshes = filtered;
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = skipped;
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy (`ask_once` already covers the whole submission).
@@ -8699,16 +8761,27 @@ impl Batch {
                 crate::shadow::wide_each_chunked(
                     0,
                     refreshes.len(),
-                    if many { 8 } else { 1 },
+                    if many { REFRESH_BATCH_CHUNK } else { 1 },
                     |_| {},
                     move |from, to| {
-                        for (shadow, a, b) in &refreshes[from..to] {
-                            if many && shadow.nothing_new(*a, *b - *a) {
-                                #[cfg(feature = "diagnostics")]
-                                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                                continue;
+                        let slice = &refreshes[from..to];
+                        if many {
+                            let (mask, skipped) = unchanged_refresh_mask(slice);
+                            #[cfg(feature = "diagnostics")]
+                            if skipped > 0 {
+                                FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
                             }
-                            Self::update(shadow, *a, *b);
+                            #[cfg(not(feature = "diagnostics"))]
+                            let _ = skipped;
+                            for (i, (shadow, a, b)) in slice.iter().enumerate() {
+                                if mask & (1u32 << i) == 0 {
+                                    Self::update(shadow, *a, *b);
+                                }
+                            }
+                        } else {
+                            for (shadow, a, b) in slice {
+                                Self::update(shadow, *a, *b);
+                            }
                         }
                     },
                 );

@@ -428,7 +428,7 @@ pub(crate) fn recycle_many(batches: Vec<(Vec<Detached>, Vec<usize>)>) {
             }
         }
         let batch = ResetBatch(to_reset);
-        crate::land::each(batch.0.len(), &|i| batch.reset(i));
+        crate::land::each_reset(batch.0.len(), &|i| batch.reset(i));
         to_reset = batch.0;
     } else {
         for host in &to_reset {

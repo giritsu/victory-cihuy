@@ -17,12 +17,37 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
+
+/// Number of 64 KiB stripe shards protecting [`Shadow::merging`].
+const MERGE_SHARDS: usize = 64;
+const MERGE_STRIPE_SHIFT: usize = 16;
+
+fn merge_shard_mask(from: usize, to: usize) -> u64 {
+    if from >= to {
+        return 0;
+    }
+    let first = from >> MERGE_STRIPE_SHIFT;
+    let last = (to - 1) >> MERGE_STRIPE_SHIFT;
+    if last - first + 1 >= MERGE_SHARDS {
+        return u64::MAX;
+    }
+    let mut mask = 0u64;
+    for b in first..=last {
+        mask |= 1u64 << (b & (MERGE_SHARDS - 1));
+    }
+    mask
+}
+
+#[allow(dead_code)]
+struct MergeReadGuards<'a>(Vec<RwLockReadGuard<'a, ()>>);
+#[allow(dead_code)]
+struct MergeWriteGuards<'a>(Vec<RwLockWriteGuard<'a, ()>>);
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -60,11 +85,12 @@ pub(crate) struct Shadow {
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
     before: Mutex<Option<Vec<u8>>>,
-    /// Held shared while pieces of the copy are landed (`crate::land`), each
-    /// its own bytes of it on several threads, and alone while title bytes
+    /// Held shared per 64 KiB stripe while pieces of the copy are landed
+    /// (`crate::land`), and exclusive on matching stripes while title bytes
     /// go in under shader writes ([`Shadow::merge_under_writes`]), which
-    /// takes `before`'s lock too. Taken ahead of that one.
-    merging: RwLock<()>,
+    /// takes `before`'s lock too. Taken ahead of that one; shards always
+    /// lock in ascending order `0..64`.
+    merging: Box<[RwLock<()>; MERGE_SHARDS]>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -3229,7 +3255,7 @@ impl Shadow {
             pending_any: AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
-            merging: RwLock::default(),
+            merging: Box::new(std::array::from_fn(|_| RwLock::new(()))),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
@@ -3245,6 +3271,28 @@ impl Shadow {
             mapped: false,
             place: None,
         }
+    }
+
+    /// Acquires shared locks on the `merging` shards indicated by `mask` in ascending shard order.
+    fn lock_merging_read(&self, mut mask: u64) -> MergeReadGuards<'_> {
+        let mut guards = Vec::with_capacity(mask.count_ones() as usize);
+        while mask != 0 {
+            let shard = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            guards.push(self.merging[shard].read().unwrap_or_else(|e| e.into_inner()));
+        }
+        MergeReadGuards(guards)
+    }
+
+    /// Acquires exclusive locks on the `merging` shards indicated by `mask` in ascending shard order.
+    fn lock_merging_write(&self, mut mask: u64) -> MergeWriteGuards<'_> {
+        let mut guards = Vec::with_capacity(mask.count_ones() as usize);
+        while mask != 0 {
+            let shard = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            guards.push(self.merging[shard].write().unwrap_or_else(|e| e.into_inner()));
+        }
+        MergeWriteGuards(guards)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -3788,20 +3836,26 @@ impl Shadow {
             if stale.is_empty() {
                 continue;
             }
-            // The lock of the copy's reference (the snapshot, or the
-            // CPU's side of a copy in the card's memory), from before
-            // title memory is read until the title's bytes are in: with
-            // the copy-back on its own thread ([`relay`]) that thread
-            // puts what the card wrote into title memory and into the
-            // reference under the same lock, and a page read before
-            // such a merge and compared after it would take the card's
-            // bytes for the title's.
-            let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
-            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            // The lock of the matching 64 KiB stripes (and snapshot if needed),
+            // from before title memory is read until the title's bytes are in
+            // and `card.dirty` is updated: with the copy-back on its own thread
+            // ([`relay`]) that thread puts what the card wrote into title
+            // memory and into the reference under the stripe's read lock.
+            let mask = stale.iter().fold(0u64, |m, &p| {
+                let lo = (p * PAGE).max(a) - start;
+                let hi = ((p + 1) * PAGE).min(e) - start;
+                m | merge_shard_mask(lo, hi)
+            });
+            let merging = self.lock_merging_write(mask);
+            let mut before = (!crate::land::on() || self.card.is_none())
+                .then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
             let held = if self.card.is_some() {
                 self.data as usize
             } else {
-                before.as_mut().map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
+                before
+                    .as_mut()
+                    .and_then(|snapshot| snapshot.as_mut())
+                    .map_or(0, |snapshot| snapshot.as_mut_ptr() as usize)
             };
             if held == 0 {
                 note_stale(3);
@@ -3838,6 +3892,7 @@ impl Shadow {
             }
             *runs_left = left.into_inner().max(0) as usize;
             let mut taken = Vec::new();
+            let mut changed = Vec::new();
             for (i, runs) in done.into_iter().enumerate() {
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
@@ -3845,7 +3900,7 @@ impl Shadow {
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
-                self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
+                changed.extend(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
@@ -3853,6 +3908,7 @@ impl Shadow {
                     taken.push(stale[i]);
                 }
             }
+            self.card_changed_runs(changed.into_iter());
             drop(before);
             drop(merging);
             {
@@ -4001,23 +4057,22 @@ impl Shadow {
             return RangedCheck::Skip;
         }
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
-            return RangedCheck::NeedFull;
+            return RangedCheck::MustUpdate;
         }
         if !crate::watch::nothing_new_possible(from, to) {
-            return RangedCheck::NeedFull;
+            return RangedCheck::MustUpdate;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending_any.load(Ordering::Acquire)
             && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
         {
-            return RangedCheck::NeedFull;
+            return RangedCheck::MustUpdate;
         }
-        let ranged = self.copied.lock().unwrap_or_else(|e| e.into_inner()).ranged_for(from, to);
-        if ranged != 0 {
-            RangedCheck::CheckRanged(from, to, ranged)
-        } else {
-            RangedCheck::NeedFull
-        }
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let ranged = copied.ranged_for(from, to);
+        let (first, last, base) = (from / PAGE, to.div_ceil(PAGE), start / PAGE);
+        let slice = first.checked_sub(base).and_then(|s| copied.pages.get(s..last - base));
+        classify_ranged_pages(from, to, ranged, slice)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
@@ -4458,7 +4513,7 @@ impl Shadow {
             return;
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
-        let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+        let _merging = self.lock_merging_write(merge_shard_mask(from, to));
         if self.card.is_some() {
             // SAFETY: inside the mapping of the CPU's side, in a range no
             // refresh writes; the lock keeps the landing out.
@@ -4786,30 +4841,43 @@ impl Shadow {
             return 0;
         };
         let waiting = std::time::Instant::now();
-        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        let mask = pieces.iter().fold(0u64, |m, &(lo, hi, _)| m | merge_shard_mask(lo, hi));
+        let _merging = self.lock_merging_read(mask);
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            let mut skip = if dirty.is_empty() {
+                Vec::new()
+            } else {
+                dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect()
+            };
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
             sent.near(fetched_after, from, to, &mut skip);
             skip
         };
         let mut put = 0;
+        let mut near = Vec::new();
+        let mut parts = Vec::new();
         for &(lo, hi, now) in pieces {
             if lo >= hi || hi > self.len as usize {
                 continue;
             }
-            let near: Vec<(usize, usize)> = skip.iter().copied().filter(|&(a, b)| a < hi && b > lo).collect();
-            let parts: Vec<(usize, usize)> = outside(lo, hi, near).into_iter().map(|(a, b)| (a - lo, b - lo)).collect();
             // SAFETY: inside the mapping (checked above), in a range
             // declared and not done with, which no refresh writes; the
             // title's bytes are kept out by the lock; the caller's.
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
-            let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
+            let merged = if skip.is_empty() || !skip.iter().any(|&(a, b)| a < hi && b > lo) {
+                let whole = [(0, hi - lo)];
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &whole, true, notes, self) }
+            } else {
+                near.clear();
+                near.extend(skip.iter().copied().filter(|&(a, b)| a < hi && b > lo));
+                parts.clear();
+                parts.extend(outside(lo, hi, std::mem::take(&mut near)).into_iter().map(|(a, b)| (a - lo, b - lo)));
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) }
+            };
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
@@ -4828,7 +4896,7 @@ impl Shadow {
             return 0;
         }
         let waiting = std::time::Instant::now();
-        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        let _merging = self.lock_merging_read(merge_shard_mask(at, at + n));
         crate::land::spent(crate::land::stat::LOCK, waiting);
         // The snapshot's memory stays where it is until the range is done
         // with (`copy_back_done`), which comes after this.
@@ -5079,11 +5147,48 @@ mod land_tests {
 }
 
 /// Whether [`Shadow::ranged_check`] found a cached ranged asking, nothing to do,
-/// or requires the full per-page [`Shadow::nothing_new`] check.
+/// a definitive miss, or requires the full per-page [`Shadow::nothing_new`] check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RangedCheck {
     Skip,
-    NeedFull,
+    MustUpdate,
+    Exact(usize, usize, u64),
     CheckRanged(usize, usize, u64),
+    NeedFull,
+}
+
+fn classify_ranged_pages(from: usize, to: usize, ranged: u64, slice: Option<&[u64]>) -> RangedCheck {
+    let Some(slice) = slice else {
+        return RangedCheck::MustUpdate;
+    };
+    if slice.is_empty() {
+        return RangedCheck::Skip;
+    }
+    if slice.len() == 1 {
+        let t = slice[0].max(ranged);
+        return if t == 0 {
+            RangedCheck::MustUpdate
+        } else {
+            RangedCheck::Exact(from, to, t)
+        };
+    }
+    if ranged != 0 {
+        return RangedCheck::CheckRanged(from, to, ranged);
+    }
+    if slice.len() <= 16 {
+        let (mut min_t, mut max_t) = (u64::MAX, 0u64);
+        for &t in slice {
+            min_t = min_t.min(t);
+            max_t = max_t.max(t);
+        }
+        if min_t == 0 {
+            return RangedCheck::MustUpdate;
+        }
+        if min_t == max_t {
+            return RangedCheck::Exact(from, to, min_t);
+        }
+    }
+    RangedCheck::NeedFull
 }
 
 struct Entry {
@@ -6061,6 +6166,39 @@ mod window_tests {
         assert_eq!(state.ranged_for(100, 300), 20);
         assert_eq!(state.ranged_for(50, 350), 15);
         assert_eq!(state.ranged_for(40, 100), 0);
+    }
+
+    #[test]
+    fn merge_shard_mask_and_disjoint_stripes_allow_concurrent_access() {
+        use super::{MERGE_SHARDS, merge_shard_mask};
+        assert_eq!(merge_shard_mask(100, 100), 0);
+        assert_eq!(merge_shard_mask(0, 4096), 1u64 << 0);
+        assert_eq!(merge_shard_mask(64 << 10, (64 << 10) + 1), 1u64 << 1);
+        assert_eq!(merge_shard_mask(0, (64 << 10) + 1), 0b11);
+        assert_eq!(merge_shard_mask(63 << 16, 65 << 16), (1u64 << 63) | 1);
+        assert_eq!(merge_shard_mask(0, MERGE_SHARDS << 16), u64::MAX);
+
+        let locks: Box<[std::sync::RwLock<()>; MERGE_SHARDS]> =
+            Box::new(std::array::from_fn(|_| std::sync::RwLock::new(())));
+        let _w = locks[0].write().unwrap();
+        assert!(locks[1].try_read().is_ok());
+        assert!(locks[0].try_read().is_err());
+    }
+
+    #[test]
+    fn classify_ranged_pages_distinguishes_exact_must_update_and_fallback() {
+        use super::{RangedCheck, classify_ranged_pages};
+        assert_eq!(classify_ranged_pages(0, 4096, 0, None), RangedCheck::MustUpdate);
+        assert_eq!(classify_ranged_pages(0, 4096, 0, Some(&[])), RangedCheck::Skip);
+        assert_eq!(classify_ranged_pages(0, 4096, 0, Some(&[0])), RangedCheck::MustUpdate);
+        assert_eq!(classify_ranged_pages(0, 4096, 0, Some(&[7])), RangedCheck::Exact(0, 4096, 7));
+        assert_eq!(classify_ranged_pages(0, 4096, 9, Some(&[0])), RangedCheck::Exact(0, 4096, 9));
+        assert_eq!(classify_ranged_pages(0, 8192, 5, Some(&[1, 2])), RangedCheck::CheckRanged(0, 8192, 5));
+        assert_eq!(classify_ranged_pages(0, 8192, 0, Some(&[4, 4, 4])), RangedCheck::Exact(0, 8192, 4));
+        assert_eq!(classify_ranged_pages(0, 8192, 0, Some(&[4, 0, 4])), RangedCheck::MustUpdate);
+        assert_eq!(classify_ranged_pages(0, 8192, 0, Some(&[4, 5])), RangedCheck::NeedFull);
+        let seventeen = [4u64; 17];
+        assert_eq!(classify_ranged_pages(0, 17 * 4096, 0, Some(&seventeen)), RangedCheck::NeedFull);
     }
 }
 

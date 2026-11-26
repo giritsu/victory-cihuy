@@ -3838,7 +3838,7 @@ impl State {
                     && let Some((address, size)) = crate::descriptor::constant_record(words)
                 {
                     if let Some((buffer, buffer_gpu, gpu)) = list.constant_from_placed(address, u64::from(size)) {
-                        host.constant_at_base(index, &buffer, buffer_gpu, gpu, size);
+                        host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
                         continue;
                     }
                     let Some((buffer, buffer_gpu, gpu, to)) = list.scratch_held_base(u64::from(size)) else {
@@ -3847,7 +3847,7 @@ impl State {
                     };
                     let slot = (std::ptr::from_ref(heap) as usize, index);
                     list.defer_constants(to, address as *const u8, size as usize, slot);
-                    host.constant_at_base(index, &buffer, buffer_gpu, gpu, size);
+                    host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
                     continue;
                 }
                 // A view this worker's `(frame, epoch)` cache has made before:
@@ -3904,7 +3904,7 @@ impl State {
                 match crate::descriptor::view(handle) {
                     Some(View::Constant(address, size)) => {
                         if let Some((buffer, buffer_gpu, gpu)) = list.constant_from_placed(address, u64::from(size)) {
-                            host.constant_at_base(index, &buffer, buffer_gpu, gpu, size);
+                            host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
                             continue;
                         }
                         let Some((buffer, buffer_gpu, gpu, to)) = list.scratch_held_base(u64::from(size)) else {
@@ -3913,7 +3913,7 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at_base(index, &buffer, buffer_gpu, gpu, size);
+                        host.constant_at_batched(index, &buffer, buffer_gpu, gpu, size, &mut self.copy_batch);
                     }
                     Some(view) => {
                         host.make_at(index, &view);
