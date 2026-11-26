@@ -3070,7 +3070,7 @@ pub(crate) fn let_go_idle() {
         crate::host::retire(shadow);
     }
     if any_gone {
-        crate::descriptor::host::invalidate_list_views();
+        crate::descriptor::host::invalidate_buffer_views();
     }
 }
 
@@ -3975,6 +3975,51 @@ impl Shadow {
         self.update_free(from, to)
     }
 
+    /// Emits `nothing_new` diagnostic byte tallies when [`crate::watch::JournalRead::ranged_nothing_new`]
+    /// avoids a full [`Self::nothing_new`] call.
+    #[inline]
+    pub(crate) fn note_nothing_new_bytes(bytes: usize) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Checked, bytes as u64);
+            add(C::Unchanged, bytes as u64);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = bytes;
+    }
+
+    /// Lock-order-safe pre-check for [`Self::nothing_new`]: reads `copied.ranged`
+    /// and releases `self.copied` before the caller inspects `JOURNAL`.
+    pub(crate) fn ranged_check(&self, address: usize, len: usize) -> RangedCheck {
+        if self.place.is_some() {
+            return RangedCheck::Skip;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return RangedCheck::Skip;
+        }
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return RangedCheck::NeedFull;
+        }
+        if !crate::watch::nothing_new_possible(from, to) {
+            return RangedCheck::NeedFull;
+        }
+        // Around ranges shaders are writing the refresh asks gap by gap.
+        if self.pending_any.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
+            return RangedCheck::NeedFull;
+        }
+        let ranged = self.copied.lock().unwrap_or_else(|e| e.into_inner()).ranged_for(from, to);
+        if ranged != 0 {
+            RangedCheck::CheckRanged(from, to, ranged)
+        } else {
+            RangedCheck::NeedFull
+        }
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
@@ -3994,6 +4039,9 @@ impl Shadow {
         if self.pending_any.load(Ordering::Acquire)
             && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
         {
+            return false;
+        }
+        if !crate::watch::nothing_new_possible(from, to) {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -5008,6 +5056,14 @@ mod land_tests {
     }
 }
 
+/// Whether [`Shadow::ranged_check`] found a cached ranged asking, nothing to do,
+/// or requires the full per-page [`Shadow::nothing_new`] check.
+pub(crate) enum RangedCheck {
+    Skip,
+    NeedFull,
+    CheckRanged(usize, usize, u64),
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -5023,7 +5079,6 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
-    crate::descriptor::host::invalidate_list_views();
     map
 }
 
@@ -5097,14 +5152,16 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
+        crate::descriptor::host::invalidate_buffer_views();
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
 /// its copy (diagnostics: which buffer a dropped program's root view names).
 #[cfg(feature = "diagnostics")]
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    buffers_read()
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
@@ -5138,6 +5195,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     let n = gone.len() as u64;
+    if n > 0 {
+        crate::descriptor::host::invalidate_buffer_views();
+    }
     for shadow in gone {
         crate::host::retire(shadow);
     }
@@ -5726,7 +5786,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
         if map.len() < before {
-            crate::descriptor::host::invalidate_list_views();
+            crate::descriptor::host::invalidate_buffer_views();
         }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;

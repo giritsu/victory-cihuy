@@ -2130,7 +2130,7 @@ pub(crate) fn let_go_idle() {
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
     if went > 0 {
-        crate::descriptor::host::invalidate_list_views();
+        crate::descriptor::host::invalidate_texture_views();
         crate::host::trail(|| {
             format!(
                 "sweep: {went} host copies of textures the title fills let go ({} KiB), each held by its title texture alone (no list, no slot); the first: title texture {:#x}",

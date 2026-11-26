@@ -261,27 +261,33 @@ pub(crate) fn first_viewed(start: u64) -> Option<u32> {
 /// them ([`HostHeap::texture_views_remade`]).
 static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
-/// Global epoch bumped whenever resources/views/levels/idle caches are
+/// Global epochs bumped whenever buffer or texture views/levels/idle caches are
 /// invalidated so [`ListViews`] can persist across lists in the same frame
-/// without holding stale descriptors.
-static LIST_VIEWS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// without unrelated texture streaming invalidating buffer descriptors (or vice versa).
+static BUFFER_VIEWS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static TEXTURE_VIEWS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Invalidates thread-local [`ListViews`] caches across workers.
-pub(crate) fn invalidate_list_views() {
-    LIST_VIEWS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+/// Invalidates thread-local [`ListViews`] buffer caches across workers.
+pub(crate) fn invalidate_buffer_views() {
+    BUFFER_VIEWS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Invalidates thread-local [`ListViews`] texture caches across workers.
+pub(crate) fn invalidate_texture_views() {
+    TEXTURE_VIEWS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
-    invalidate_list_views();
+    invalidate_texture_views();
     RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
 }
 
 /// [`levels_changed`] once the submissions begun so far (that of the list
 /// whose step calls this among them) have run.
 pub(crate) fn levels_changed_after(start: u64) {
-    invalidate_list_views();
+    invalidate_texture_views();
     let after = crate::host::submissions().0;
     RESHOWN_AFTER.lock().unwrap_or_else(|e| e.into_inner()).push((after, start));
 }
@@ -2213,7 +2219,7 @@ impl HostHeap {
             }
         }
         if remade > 0 {
-            invalidate_list_views();
+            invalidate_texture_views();
         }
         remade
     }
@@ -2848,17 +2854,31 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg(test)]
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
+        self.release_many([(first, n)]);
+    }
+
+    /// Gives back multiple dynamic descriptor ranges under a single allocator
+    /// lock and atomic summary update.
+    pub(crate) fn release_many(&self, ranges: impl IntoIterator<Item = (u32, u32)>) {
+        let mut total_given = 0u32;
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
-            self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+        for (first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = (at + n).min(self.dynamic) as usize;
+            if let Some(slots) = guard.1.get_mut(at as usize..end) {
+                let given = slots.iter().filter(|taken| **taken).count() as u32;
+                total_given += given;
+                slots.fill(false);
+            }
+        }
+        drop(guard);
+        if total_given > 0 {
+            self.free.fetch_add(total_given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -2899,14 +2919,15 @@ impl CopyBatch {
 }
 
 impl HostHeap {
-    /// Ensures this thread's [`ListViews`] cache matches `(frame, LIST_VIEWS_EPOCH)`
+    /// Ensures this thread's [`ListViews`] cache matches `(frame, buf_epoch, tex_epoch)`
     /// and has capacity for `needed` views before a table loop begins so
     /// [`make_listed_batched`] never invalidates source handles mid-batch.
     pub(crate) fn prepare_list_views(&self, frame: u64, needed: u32) {
         if self.sampler {
             return;
         }
-        let epoch = LIST_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
         LIST_VIEWS.with(|views| {
             let mut views = views.borrow_mut();
             if views.is_none() {
@@ -2915,15 +2936,24 @@ impl HostHeap {
             let Some(views) = views.as_mut() else {
                 return;
             };
-            let need_slots = needed.saturating_mul(2);
-            let used_slots = (views.made.len() as u32).saturating_mul(2);
-            if views.frame != frame
-                || views.epoch != epoch
-                || used_slots.saturating_add(need_slots) > ListViews::SLOTS
-            {
+            if views.frame != frame {
                 views.frame = frame;
-                views.epoch = epoch;
-                views.made.clear();
+                views.buf_epoch = buf_epoch;
+                views.tex_epoch = tex_epoch;
+                views.buf_made.clear();
+                views.tex_made.clear();
+                return;
+            }
+            let buf_used = (views.buf_made.len() as u32).saturating_mul(2);
+            let buf_need = needed.saturating_mul(2);
+            if views.buf_epoch != buf_epoch || buf_used.saturating_add(buf_need) > ListViews::BUF_SLOTS {
+                views.buf_epoch = buf_epoch;
+                views.buf_made.clear();
+            }
+            let tex_used = views.tex_made.len() as u32;
+            if views.tex_epoch != tex_epoch || tex_used.saturating_add(needed) > ListViews::TEX_SLOTS {
+                views.tex_epoch = tex_epoch;
+                views.tex_made.clear();
             }
         });
     }
@@ -2954,41 +2984,90 @@ impl HostHeap {
         if self.sampler {
             return None;
         }
-        let epoch = LIST_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
         LIST_VIEWS.with(|views| {
             let mut views = views.borrow_mut();
             if views.is_none() {
                 *views = Some(ListViews::new()?);
             }
             let views = views.as_mut()?;
-            if views.frame != frame || views.epoch != epoch {
+            if views.frame != frame {
                 if !batch.dst.is_empty() {
                     return None;
                 }
                 views.frame = frame;
-                views.epoch = epoch;
-                views.made.clear();
+                views.buf_epoch = buf_epoch;
+                views.tex_epoch = tex_epoch;
+                views.buf_made.clear();
+                views.tex_made.clear();
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
+            if views.buf_epoch != buf_epoch && batch.dst.is_empty() {
+                views.buf_epoch = buf_epoch;
+                views.buf_made.clear();
+            }
+            if views.tex_epoch != tex_epoch && batch.dst.is_empty() {
+                views.tex_epoch = tex_epoch;
+                views.tex_made.clear();
+            }
+            let cached_tex = views.tex_epoch == tex_epoch && views.tex_made.contains_key(&words);
+            let is_tex = if cached_tex {
+                true
+            } else if views.buf_epoch == buf_epoch && views.buf_made.contains_key(&words) {
+                false
+            } else {
                 let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
                 // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                if matches!(view, View::Constant(..)) {
                     return None;
                 }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some((views.slot(at + 1), true)))?;
-                let stride_word = view_stride_word(&view);
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
-            }
-            let made = &views.made[&words];
+                let is_tex = is_texture_view(&view);
+                if is_tex {
+                    if views.tex_epoch != tex_epoch {
+                        return None;
+                    }
+                    let at = ListViews::TEX_BASE + views.tex_made.len() as u32;
+                    if at >= ListViews::SLOTS {
+                        return None;
+                    }
+                    let kept = make_twinned(&view, views.slot(at), None)?;
+                    let stride_word = view_stride_word(&view);
+                    let listed = Listed {
+                        kind: crate::draw::view_kind(&view),
+                        texture: true,
+                        ready: (0, 0, false),
+                        tabled: None,
+                    };
+                    views.tex_made.insert(
+                        words,
+                        ListView { view, at, twin: false, stride_word, kept, listed },
+                    );
+                } else {
+                    if views.buf_epoch != buf_epoch {
+                        return None;
+                    }
+                    let at = 2 * views.buf_made.len() as u32;
+                    if at + 1 >= ListViews::BUF_SLOTS {
+                        return None;
+                    }
+                    let twin = twinned(&view);
+                    let kept = make_twinned(&view, views.slot(at), Some((views.slot(at + 1), true)))?;
+                    let stride_word = view_stride_word(&view);
+                    let listed = Listed {
+                        kind: crate::draw::view_kind(&view),
+                        texture: false,
+                        ready: (0, 0, false),
+                        tabled: None,
+                    };
+                    views.buf_made.insert(
+                        words,
+                        ListView { view, at, twin, stride_word, kept, listed },
+                    );
+                }
+                is_tex
+            };
+            let made = if is_tex { &views.tex_made[&words] } else { &views.buf_made[&words] };
             batch.dst.push(self.cpu(index));
             batch.src.push(views.slot(made.at));
             #[cfg(feature = "diagnostics")]
@@ -6547,7 +6626,7 @@ mod tests {
         assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
 
-        // `prepare_list_views`, batched copies, and epoch/frame invalidation work together.
+        // `prepare_list_views`, batched copies, and split epoch/frame invalidation work together.
         let s1 = heap.dynamic(2).unwrap();
         let mut batch = CopyBatch::default();
         let frame = 999u64;
@@ -6558,8 +6637,22 @@ mod tests {
         assert_eq!(read_stride(s1), 8 | VIEW_INTEGER);
         assert_eq!(read_stride(s1 + 1), 0);
         assert!(listed_view(frame, rec).is_some());
-        invalidate_list_views();
+        // Texture invalidation must NOT evict cached buffer views.
+        invalidate_texture_views();
+        assert!(listed_view(frame, rec).is_some());
+        invalidate_buffer_views();
         assert!(listed_view(frame, rec).is_none());
+
+        // `release_many` frees multiple non-contiguous ranges in one lock and restores `free`.
+        let r1 = heap.dynamic(2).unwrap();
+        let r2 = heap.dynamic(3).unwrap();
+        let free_before = heap.free.load(std::sync::atomic::Ordering::Relaxed);
+        heap.release_many([(r1, 2), (r2, 3)]);
+        assert_eq!(
+            heap.free.load(std::sync::atomic::Ordering::Relaxed),
+            free_before + 5
+        );
+        heap.release_many([(s0, 4), (s1, 2)]);
     }
 }
 
@@ -6578,7 +6671,7 @@ pub(crate) struct Listed {
 
 struct ListView {
     view: View,
-    /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
+    /// Its descriptor's slot in [`ListViews`]; its raw twin's (buffer views) is the next.
     at: u32,
     twin: bool,
     stride_word: u32,
@@ -6586,19 +6679,25 @@ struct ListView {
     listed: Listed,
 }
 
-/// The descriptors a thread made for one frame & epoch, by the record
-/// they were made from, in a heap the card does not see.
+/// The descriptors a thread made for one frame, split across independent buffer
+/// (`0..BUF_SLOTS`) and texture (`TEX_BASE..SLOTS`) epochs so texture streaming
+/// invalidations do not discard cached buffer views/raw twins.
 struct ListViews {
     frame: u64,
-    epoch: u64,
+    buf_epoch: u64,
+    tex_epoch: u64,
     heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
-    made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    buf_made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    tex_made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
 }
 
 impl ListViews {
-    const SLOTS: u32 = 8192;
+    const BUF_SLOTS: u32 = 8192;
+    const TEX_BASE: u32 = Self::BUF_SLOTS;
+    const TEX_SLOTS: u32 = 8192;
+    const SLOTS: u32 = Self::BUF_SLOTS + Self::TEX_SLOTS;
 
     fn new() -> Option<ListViews> {
         let host = host()?;
@@ -6616,11 +6715,13 @@ impl ListViews {
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
             Some(ListViews {
                 frame: u64::MAX,
-                epoch: 0,
+                buf_epoch: 0,
+                tex_epoch: 0,
                 heap,
                 step,
                 start,
-                made: Default::default(),
+                buf_made: Default::default(),
+                tex_made: Default::default(),
             })
         }
     }
@@ -6637,20 +6738,42 @@ thread_local! {
 
 /// The view the record `words` names, as this thread made it for `(frame, epoch)`.
 pub(crate) fn listed_view(frame: u64, words: [u32; 3]) -> Option<View> {
-    let epoch = LIST_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
-        let views = views.as_ref().filter(|v| v.frame == frame && v.epoch == epoch)?;
-        views.made.get(&words).map(|m| m.view.clone())
+        let views = views.as_ref().filter(|v| v.frame == frame)?;
+        if views.buf_epoch == buf_epoch
+            && let Some(m) = views.buf_made.get(&words)
+        {
+            return Some(m.view.clone());
+        }
+        if views.tex_epoch == tex_epoch
+            && let Some(m) = views.tex_made.get(&words)
+        {
+            return Some(m.view.clone());
+        }
+        None
     })
 }
 
 /// Notes what is known of the record `words` in `(frame, epoch)`.
 pub(crate) fn note_listed(frame: u64, words: [u32; 3], listed: Listed) {
-    let epoch = LIST_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     LIST_VIEWS.with(|views| {
-        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.frame == frame && v.epoch == epoch)
-            && let Some(made) = views.made.get_mut(&words)
+        let mut views = views.borrow_mut();
+        let Some(views) = views.as_mut().filter(|v| v.frame == frame) else {
+            return;
+        };
+        if views.buf_epoch == buf_epoch
+            && let Some(made) = views.buf_made.get_mut(&words)
+        {
+            made.listed = listed;
+            return;
+        }
+        if views.tex_epoch == tex_epoch
+            && let Some(made) = views.tex_made.get_mut(&words)
         {
             made.listed = listed;
         }

@@ -606,16 +606,23 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// Gives back batches of dynamic descriptor ranges across recorded tables,
+/// acquiring `SHADER_HEAPS.read()` and each heap's allocator lock once per
+/// contiguous heap run.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic_batch(ranges: &[(usize, u32, u32)]) {
+    if ranges.is_empty() {
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
+    for run in ranges.chunk_by(|a, b| a.0 == b.0) {
+        let heap = run[0].0;
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_many(run.iter().map(|&(_, first, n)| (first, n)));
+        }
     }
 }
 
@@ -1259,25 +1266,43 @@ pub(crate) fn forget(resource: usize) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&resource);
-    let mut views = views_write();
-    let Some(entries) = views.by_resource.remove(&resource) else {
-        return;
-    };
-    #[cfg(windows)]
-    host::invalidate_list_views();
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-            continue;
+    let (mut forgot_buf, mut forgot_tex) = (false, false);
+    {
+        let mut views = views_write();
+        let Some(entries) = views.by_resource.remove(&resource) else {
+            return;
+        };
+        for i in entries {
+            let (view, generation) = views.list[i as usize].clone();
+            // Entries freed through a view's other resource may hold another
+            // view by now.
+            if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            #[cfg(windows)]
+            match &view {
+                View::Constant(..) | View::Sampler(..) | View::ConsoleSampler(..) => {}
+                View::Placed(false, resource, _) if resource[0] != 1 => forgot_tex = true,
+                View::Placed(..) | View::Unordered(..) => forgot_buf = true,
+                View::Shader(_, desc) if desc.is_some_and(|d| d[1] == 1) => forgot_buf = true,
+                View::Shader(..) => forgot_tex = true,
+            }
+            views.index.remove(&view);
+            // (Below the bits that say a record is no table entry.)
+            views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+            // The view's other resource (a counter) keeps a stale entry, which
+            // `forget` of that resource skips.
+            views.free.push(i);
         }
-        views.index.remove(&view);
-        // (Below the bits that say a record is no table entry.)
-        views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
-        views.free.push(i);
+    }
+    #[cfg(windows)]
+    {
+        if forgot_buf {
+            host::invalidate_buffer_views();
+        }
+        if forgot_tex {
+            host::invalidate_texture_views();
+        }
     }
 }
 

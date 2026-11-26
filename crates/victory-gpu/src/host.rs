@@ -2451,6 +2451,44 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    /// Clears recorded steps and held objects for list reuse while retaining
+    /// moderate container capacities (capping extreme outlier buffers).
+    fn clear(&mut self) {
+        give_chunks(std::mem::take(&mut self.plane_uploads));
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        self.upload_bytes = 0;
+
+        self.copies.clear();
+        self.copies.shrink_to(4096);
+        self.uploads.clear();
+        self.uploads.shrink_to(256);
+        self.kept.clear();
+        self.kept.shrink_to(1024);
+        self.bound.clear();
+        self.bound.shrink_to(256);
+        self.refreshed.clear();
+        self.refreshed.shrink_to(1024);
+        self.gpu_written.clear();
+        self.gpu_written.shrink_to(1024);
+        self.filled.clear();
+        self.filled.shrink_to(1024);
+        self.placed_ranges.clear();
+        self.placed_ranges.shrink_to(256);
+        self.textures.clear();
+        self.textures.shrink_to(1024);
+        self.writes.clear();
+        self.writes.shrink_to(256);
+        self.backs.clear();
+        self.backs.shrink_to(256);
+        self.back_wanted.clear();
+        self.back_wanted.shrink_to(256);
+        self.texture_backs.clear();
+        self.texture_backs.shrink_to(256);
+        self.budget_zeroed = false;
+        self.indirect_readable = 0;
+    }
+
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
@@ -3389,15 +3427,15 @@ pub(crate) fn settle_for_fence() {
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`).
+/// a queue does for the lists it ran (`crate::list::recycle_many`).
 fn land() {
     let landed: Vec<_> = {
         let mut line = line();
         let n = line.landed.len().saturating_sub(bury_lag() as usize);
         line.landed.drain(..n).collect()
     };
-    for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+    if !landed.is_empty() {
+        crate::list::recycle_many(landed);
     }
 }
 
@@ -6560,7 +6598,7 @@ impl HostList {
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7953,11 +7991,11 @@ struct FrontSpans {
 }
 
 impl FrontSpans {
-    fn new() -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         Self {
-            at: ByCopy::default(),
-            spans: Vec::new(),
-            given: Vec::new(),
+            at: ByCopy::with_capacity_and_hasher(capacity, Default::default()),
+            spans: Vec::with_capacity(capacity),
+            given: Vec::with_capacity(capacity),
             part: 1,
             last: usize::MAX,
         }
@@ -8007,7 +8045,7 @@ impl FrontSpans {
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    let mut front = FrontSpans::new();
+    let mut front = FrontSpans::with_capacity(0);
     for step in steps {
         match step {
             Touch::Refresh(copy, from, to) => front.push_refresh(copy, from, to),
@@ -8237,9 +8275,11 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        let est = runs.len().saturating_mul(8).min(2048);
+        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> =
+            ByCopy::with_capacity_and_hasher(est, Default::default());
         let mut due = Vec::new();
-        let mut front = FrontSpans::new();
+        let mut front = FrontSpans::with_capacity(est);
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 front.push_part();
@@ -8284,13 +8324,38 @@ impl Batch {
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
+        use crate::shadow::{RangedCheck, Shadow};
         const FEW: usize = 256;
+        const CHUNK: usize = 16;
         let mut spans = spans;
         let many = spans.len() > FEW;
         if !many {
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            let mut checks: Vec<RangedCheck> = spans
+                .iter()
+                .map(|(shadow, from, to)| shadow.ranged_check(*from, *to - *from))
+                .collect();
+            if checks.iter().any(|c| matches!(c, RangedCheck::CheckRanged(..))) {
+                let jr = crate::watch::journal_read();
+                for check in &mut checks {
+                    if let RangedCheck::CheckRanged(lo, hi, ranged) = *check
+                        && jr.ranged_nothing_new(lo, hi, ranged)
+                    {
+                        Shadow::note_nothing_new_bytes(hi - lo);
+                        *check = RangedCheck::Skip;
+                    }
+                }
+            }
+            let mut idx = 0usize;
+            spans.retain(|(shadow, from, to)| {
+                let check = &checks[idx];
+                idx += 1;
+                match check {
+                    RangedCheck::Skip => false,
+                    _ => !shadow.nothing_new(*from, *to - *from),
+                }
+            });
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
@@ -8304,16 +8369,45 @@ impl Batch {
         crate::shadow::wide_each_chunked(
             due.len(),
             spans.len(),
-            if many { 8 } else { 1 },
+            if many { CHUNK } else { 1 },
             move |i| due[i].refresh(),
             move |from, to| {
-                for (shadow, a, b) in &spans[from..to] {
-                    if many && shadow.nothing_new(*a, *b - *a) {
-                        #[cfg(feature = "diagnostics")]
-                        FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                        continue;
+                if many {
+                    let slice = &spans[from..to];
+                    let mut checks: [RangedCheck; CHUNK] =
+                        std::array::from_fn(|_| RangedCheck::NeedFull);
+                    let mut has_ranged = false;
+                    for (slot, (shadow, a, b)) in checks.iter_mut().zip(slice) {
+                        *slot = shadow.ranged_check(*a, *b - *a);
+                        if matches!(*slot, RangedCheck::CheckRanged(..)) {
+                            has_ranged = true;
+                        }
                     }
-                    Self::update(shadow, *a, *b);
+                    if has_ranged {
+                        let jr = crate::watch::journal_read();
+                        for check in &mut checks[..slice.len()] {
+                            if let RangedCheck::CheckRanged(lo, hi, ranged) = *check
+                                && jr.ranged_nothing_new(lo, hi, ranged)
+                            {
+                                Shadow::note_nothing_new_bytes(hi - lo);
+                                *check = RangedCheck::Skip;
+                            }
+                        }
+                    }
+                    for (check, (shadow, a, b)) in checks[..slice.len()].iter().zip(slice) {
+                        let unchanged = matches!(check, RangedCheck::Skip)
+                            || shadow.nothing_new(*a, *b - *a);
+                        if unchanged {
+                            #[cfg(feature = "diagnostics")]
+                            FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                        Self::update(shadow, *a, *b);
+                    }
+                } else {
+                    for (shadow, a, b) in &spans[from..to] {
+                        Self::update(shadow, *a, *b);
+                    }
                 }
             },
         );

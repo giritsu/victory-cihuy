@@ -346,19 +346,91 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         return;
     }
     let most = idle_most();
+    let room = {
+        let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        most.0.saturating_sub(idle.0.len())
+    };
+    let mut to_reset = Vec::with_capacity(room.min(ran.len()));
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
-            continue;
+        if to_reset.len() < room && ran.contains(&i) {
+            to_reset.push(host);
         }
+    }
+    if to_reset.is_empty() {
+        return;
+    }
+    for host in &to_reset {
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+    }
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    for host in to_reset {
+        if idle.0.len() >= most.0 {
+            break;
+        }
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < most.0 && idle.1 + bytes <= most.1 {
+        if idle.1 + bytes <= most.1 {
+            idle.0.push(Idle(host, bytes));
+            idle.1 += bytes;
+        }
+    }
+}
+
+/// Parallel batch version of [`recycle`] called by [`crate::host::land`]
+/// outside `victory-land` worker threads.
+#[cfg(windows)]
+pub(crate) fn recycle_many(batches: Vec<(Vec<Detached>, Vec<usize>)>) {
+    if !pools() {
+        return;
+    }
+    let most = idle_most();
+    let room = {
+        let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        most.0.saturating_sub(idle.0.len())
+    };
+    let mut to_reset = Vec::with_capacity(room);
+    for (lists, ran) in batches {
+        for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+            drop(_state);
+            drop(_uploads);
+            if to_reset.len() < room && ran.contains(&i) {
+                to_reset.push(host);
+            }
+        }
+    }
+    if to_reset.is_empty() {
+        return;
+    }
+    if to_reset.len() >= 4 {
+        struct ResetBatch(Vec<crate::host::HostList>);
+        // SAFETY: D3D12 command allocators/lists and COM references are
+        // free-threaded, and each worker accesses a disjoint index `i` across
+        // distinct `HostList` instances.
+        unsafe impl Sync for ResetBatch {}
+        impl ResetBatch {
+            fn reset(&self, i: usize) {
+                self.0[i].reset();
+            }
+        }
+        let batch = ResetBatch(to_reset);
+        crate::land::each(batch.0.len(), &|i| batch.reset(i));
+        to_reset = batch.0;
+    } else {
+        for host in &to_reset {
+            host.reset();
+        }
+    }
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    for host in to_reset {
+        if idle.0.len() >= most.0 {
+            break;
+        }
+        let bytes = host.scratch_kept();
+        if idle.1 + bytes <= most.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
