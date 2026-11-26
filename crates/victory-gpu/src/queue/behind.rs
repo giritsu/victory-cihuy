@@ -431,7 +431,10 @@ impl Work for Job {
             return vec![self];
         };
         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
-        let jobs = jobs_of(queue as This, &lists);
+        let jobs = jobs_of(queue as This, &lists, false);
+        for r in recordings.iter() {
+            r.finish_back();
+        }
         // It stood for one submission not begun.
         let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
         QUEUED.fetch_add(runs, Relaxed);
@@ -745,7 +748,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
         room(before + 1);
         return;
     }
-    let jobs = jobs_of(this, lists);
+    let jobs = jobs_of(this, lists, true);
     let runs = jobs.iter().filter(|j| j.runs()).count() as u64;
     let before = QUEUED.fetch_add(runs, Relaxed);
     STATS[RUNS].fetch_add(runs, Relaxed);
@@ -766,7 +769,7 @@ fn room(queued: u64) {
 }
 
 /// What a submission of `lists` is in the line.
-fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
+fn jobs_of(this: This, lists: &[This], replace: bool) -> Vec<Job> {
     let queue = this as usize;
     // In one piece up to the first list that waits for a memory value, as
     // `super::submit_cut` runs them; the rest part by part.
@@ -787,11 +790,20 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     });
     let mut jobs: Vec<Job> = Vec::new();
     if first > 0 {
-        let (taken, order) = crate::list::detach(&lists[..first]);
+        let (taken, order) = if replace {
+            crate::list::detach(&lists[..first])
+        } else {
+            crate::list::detach_take(&lists[..first])
+        };
         jobs.push(Job::Run(queue, taken, order));
     }
     if first < lists.len() {
-        for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
+        let parts = if replace {
+            crate::list::detach_parts(&lists[first..])
+        } else {
+            crate::list::detach_parts_take(&lists[first..])
+        };
+        for (waits, taken, order) in parts {
             jobs.extend(waits.into_iter().map(Job::Value));
             jobs.push(Job::Run(queue, taken, order));
         }

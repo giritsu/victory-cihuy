@@ -444,7 +444,9 @@ fn sweep() {
     let memory = host().and_then(|h| h.video_memory());
     crate::residency::refresh(memory);
     if crate::residency::pressured() {
-        trim_spare_chunks();
+        if crate::residency::critical_commit() || !crate::residency::compact_host_ram() {
+            trim_spare_chunks();
+        }
         crate::list::trim_idle();
     }
     crate::pool::room(memory);
@@ -4038,10 +4040,27 @@ impl Host {
         list
     }
 
+    /// Emergency leaf-lock-only reclaim when D3D12 command list/allocator creation
+    /// hits `E_OUTOFMEMORY` (`0x8007000E`), safe to call even while holding `self.submitted`
+    /// or per-list state locks.
+    fn reclaim_for_list_oom(&self, err: &windows::core::Error, drain_idle_lists: bool) -> bool {
+        const E_OUTOFMEMORY: i32 = 0x8007_000E_u32 as i32;
+        if err.code().0 != E_OUTOFMEMORY {
+            return false;
+        }
+        crate::residency::allocation_error(err);
+        trim_spare_chunks();
+        if drain_idle_lists {
+            crate::list::trim_idle_to(0);
+        }
+        crate::pool::room(self.video_memory());
+        true
+    }
+
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
-        let made: windows::core::Result<Prelude> = unsafe {
+        let create = || unsafe {
             (|| {
                 let allocator: ID3D12CommandAllocator =
                     self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
@@ -4052,28 +4071,46 @@ impl Host {
                 Ok((allocator, list))
             })()
         };
+        let mut made: windows::core::Result<Prelude> = create();
+        if let Err(ref e) = made
+            && self.reclaim_for_list_oom(e, true)
+        {
+            made = create();
+        }
         LISTS[1].fetch_add(1, Ordering::Relaxed);
         match made {
             Ok(prelude) => Some(prelude),
             Err(e) => {
                 tracing::warn!(error = %e, "no host list for a prelude");
+                self.log_buffer_oom("after a prelude allocation failed");
                 None
             }
         }
     }
 
     fn make_list(&self) -> windows::core::Result<HostList> {
-        // SAFETY: plain object creation.
+        let create = || {
+            // SAFETY: plain object creation.
+            unsafe {
+                let allocator: ID3D12CommandAllocator = self
+                    .device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    &allocator,
+                    None,
+                )?;
+                Ok((allocator, list))
+            }
+        };
+        let (allocator, list) = match create() {
+            Ok(pair) => pair,
+            Err(e) if self.reclaim_for_list_oom(&e, false) => create()?,
+            Err(e) => return Err(e),
+        };
+        // SAFETY: plain object initialization.
         unsafe {
-            let allocator: ID3D12CommandAllocator = self
-                .device
-                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                &allocator,
-                None,
-            )?;
             let prelude = OnceLock::new();
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());

@@ -65,7 +65,9 @@ Target workstation profile added in this checkout:
 | Shader cache (`cache-pareto`) | Ready | 25,782 shaders pre-compiled (`victory shaders`) into `%LOCALAPPDATA%\VIctory\cache-pareto`. |
 | Pass 1: 16 GB RAM & 6C/12T scaling | Done | Added WDDM `NON_LOCAL` pressure tracking, compact `STAGING_SPARES`, `bury_lag=6`, 32 MiB spare scratch cap, and 6C/12T worker counts (`thin=4`, `under=4`, `pipeline=4`, `dstorage=6`). |
 | Pass 2: Staging bloat & 16 MiB staging pool | Done | Disabled `VICTORY_LEVELS_ON_DEMAND` default (`held_only()` active), added 16 MiB staging blocks, 100 ms `NON_LOCAL` sampling, and fast idle eviction. Runtime rose from ~1 min to **~7 min**; live texture staging dropped **2,104 MB -> 54 MB**; spurious texture re-uploads dropped **4,001+ -> 142**. |
-| Pass 3: `thin::BACKS` cap & 4 MiB loose windows | Built & tested | Bounded `thin::BACKS` (`64/32/16` on compact RAM) with `thin::trim_idle()` (down from 1,183 leaked alive host lists), reverted `256 KiB` + `tails=1` window fragmentation (+1,470 MB overlap duplication / 28.7 GB churn). Ready for live re-test. |
+| Pass 3: `thin::BACKS` cap & 4 MiB loose windows | Done | Bounded `thin::BACKS` (`64/32/16`) and restored `4 MiB` loose windows. Live `diag` test reached **8m22s (frame 4,757)** at **8.5–10.7 FPS**, holding Shared GPU steady around **6.1–6.4 GB** for 6 minutes with 0 `no upload buffer` stalls until a late area-load spike. |
+| Pass 4: `detach_take` + `CARD_BUFFERS_MIN_KB=256` | Diagnosed | Live `diag` test ran **7m41s (frame 4,662)** before `0x8007000E` (`shared_gpu = 7,244 / 7,490 MB`, **4.85 GB VRAM free**). Telemetry revealed why `HostList` + card-buffer counts stayed high: `640 host lists alive` at second 6 came from empty startup `[RESET, CLOSE]` recordings (`3,057 MB` private bytes), while `153 host lists made/frame` (`339,267` total), `243,192` card buffers, and `206.6 s` of `MakeResident`/`mapped()` stalls came from `list::boxed` bypassing `list::IDLE` whenever `BACKS` missed. |
+| Pass 5: Lazy `Front::recording`, `boxed -> fresh_list`, staging & OOM retry | Built & tested | Deferred `Front::recording` until first recorded command (eliminating ~632 dead startup `HostList`s), routed `list::boxed` through `list::fresh_list()` (`IDLE`), sized `IDLE` / `BACKS` for 1 gameplay frame (~207 lists), shrank compact staging pool to `8 MiB` blocks / `500 ms` rest (`352 -> ~64–96 MiB` target), stopped mild-pressure scratch churn, and added `E_OUTOFMEMORY` reclaim-and-retry in `make_prelude` / `make_list`. |
 
 To run locally from a normal (non-Administrator) PowerShell window with your own dump path and external cache:
 
@@ -78,7 +80,7 @@ cargo build --release --locked -p victory
 .\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build release -Panel
 ```
 
-Detailed chronological measurements and findings are recorded in [docs/bug-journal.md](docs/bug-journal.md) and [docs/findings.md](docs/findings.md).
+Detailed chronological measurements, progress percentages, input mapping, and hardware findings are recorded in [docs/progress.md](docs/progress.md), [docs/bug-journal.md](docs/bug-journal.md), and [docs/findings.md](docs/findings.md).
 
 ## How to run it
 

@@ -63,6 +63,7 @@ pub(crate) fn wanted() -> bool {
 #[derive(Default)]
 pub(super) struct Front {
     recording: Option<Arc<Recording>>,
+    pending: Option<(u32, usize)>,
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
@@ -78,6 +79,7 @@ impl Front {
     /// Lets go of the recording there is: one never submitted is not run any
     /// further.
     fn leave(&mut self) {
+        self.pending = None;
         if let Some(recording) = self.recording.take()
             && !self.submitted
         {
@@ -89,15 +91,33 @@ impl Front {
     /// Begins a recording, with `pipeline` bound.
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
         self.leave();
-        self.recording = Some(Arc::new(Recording::new(kind)));
+        self.pending = Some((kind, pipeline as usize));
         self.closed = false;
         self.submitted = false;
-        self.put(RESET, &[pipeline as u64]);
+        if !pipeline.is_null() {
+            crate::pipeline::bound(pipeline);
+        }
+    }
+
+    #[inline]
+    fn ensure_recording(&mut self) -> bool {
+        if self.closed {
+            return false;
+        }
+        if self.recording.is_none() {
+            let Some((kind, pipeline)) = self.pending.take() else {
+                return false;
+            };
+            self.recording = Some(Arc::new(Recording::new(kind)));
+            self.words.push(RESET | (1u64 << 16));
+            self.words.push(pipeline as u64);
+        }
+        true
     }
 
     #[inline]
     fn put(&mut self, op: u64, args: &[u64]) {
-        if self.closed || self.recording.is_none() {
+        if !self.ensure_recording() {
             return;
         }
         self.words.push(op | (args.len() as u64) << 16);
@@ -109,7 +129,7 @@ impl Front {
 
     /// [`Self::put`] of some words and then the bytes of some things.
     fn put_with(&mut self, op: u64, args: &[u64], blobs: &[&[u8]]) {
-        if self.closed || self.recording.is_none() {
+        if !self.ensure_recording() {
             return;
         }
         let at = self.words.len();
@@ -153,9 +173,14 @@ impl Front {
         if self.closed {
             return;
         }
-        self.put(CLOSE, &[]);
-        self.closed = true;
-        self.hand_over();
+        if self.recording.is_some() {
+            self.put(CLOSE, &[]);
+            self.closed = true;
+            self.hand_over();
+        } else {
+            self.pending = None;
+            self.closed = true;
+        }
     }
 }
 
@@ -228,6 +253,16 @@ impl Recording {
         held(&self.inner).back as This
     }
 
+    /// Returns the host-less back list shell to [`BACKS`] once its detached work
+    /// has been queued, so title `List` handles waiting for reuse hold no D3D12
+    /// command lists or allocators.
+    pub(crate) fn finish_back(&self) {
+        let back = std::mem::take(&mut held(&self.inner).back);
+        if back != 0 {
+            return_back(back);
+        }
+    }
+
     /// Translates what there is.
     fn run(&self) {
         loop {
@@ -264,13 +299,13 @@ impl Recording {
 
 fn backs_most_for(compact: bool, pressured: bool, critical: bool) -> usize {
     if critical {
-        if compact { 16 } else { 32 }
+        if compact { 64 } else { 128 }
     } else if pressured {
-        if compact { 32 } else { 64 }
+        if compact { 128 } else { 256 }
     } else if compact {
-        64
+        256
     } else {
-        128
+        512
     }
 }
 
@@ -298,6 +333,16 @@ pub(crate) fn trim_idle() {
     }
 }
 
+fn return_back(back: usize) {
+    let mut backs = held(&BACKS);
+    if backs.len() < backs_most() {
+        backs.push(back);
+    } else {
+        drop(backs);
+        super::release_back(back as This);
+    }
+}
+
 impl Drop for Recording {
     fn drop(&mut self) {
         let inner = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
@@ -307,16 +352,10 @@ impl Drop for Recording {
                 // Left in the middle: release rather than pooling un-detached state.
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
-                super::release_back(inner.back as This);
-            } else {
-                let mut backs = held(&BACKS);
-                if backs.len() < backs_most() {
-                    backs.push(inner.back);
-                } else {
-                    drop(backs);
-                    super::release_back(inner.back as This);
-                }
             }
+            // Any back still attached here was never unfolded/detached, so its state
+            // was not taken; release it instead of pooling a dirty HostList.
+            super::release_back(inner.back as This);
         }
     }
 }
@@ -336,6 +375,7 @@ fn back_list(kind: u32) -> This {
     if let Some(back) = held(&BACKS).pop() {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
+        super::ensure_host(back as This);
         return back as This;
     }
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
@@ -581,7 +621,7 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
         return std::ptr::null_mut();
     }
     let front = front(this);
-    if front.closed || front.recording.is_none() {
+    if !front.ensure_recording() {
         return std::ptr::null_mut();
     }
     let Some(mut block) = Upload::new(len) else {
@@ -964,11 +1004,38 @@ mod tests {
 
     #[test]
     fn backs_cap_tightens_on_compact_ram_and_pressure() {
-        assert_eq!(backs_most_for(false, false, false), 128);
-        assert_eq!(backs_most_for(false, true, false), 64);
-        assert_eq!(backs_most_for(false, true, true), 32);
-        assert_eq!(backs_most_for(true, false, false), 64);
-        assert_eq!(backs_most_for(true, true, false), 32);
-        assert_eq!(backs_most_for(true, true, true), 16);
+        assert_eq!(backs_most_for(false, false, false), 512);
+        assert_eq!(backs_most_for(false, true, false), 256);
+        assert_eq!(backs_most_for(false, true, true), 128);
+        assert_eq!(backs_most_for(true, false, false), 256);
+        assert_eq!(backs_most_for(true, true, false), 128);
+        assert_eq!(backs_most_for(true, true, true), 64);
+    }
+
+    #[test]
+    fn empty_reset_close_does_not_create_recording_or_schedule_work() {
+        let mut f = Front::default();
+        f.begin(0, std::ptr::null());
+        f.close();
+        assert!(f.recording.is_none());
+        assert!(f.pending.is_none());
+        assert!(f.words.is_empty());
+        assert!(f.closed);
+
+        f.begin(0, std::ptr::null());
+        f.put(Plain::DRAW as u64, &[3, 1, 0, 0]);
+        assert!(f.recording.is_some());
+        assert!(f.pending.is_none());
+        assert_eq!(f.words[0], RESET | (1u64 << 16));
+        assert_eq!(f.words[2], Plain::DRAW as u64 | (4u64 << 16));
+        f.leave();
+    }
+
+    #[test]
+    fn finish_back_is_safe_and_idempotent_when_empty() {
+        let recording = Recording::new(0);
+        recording.finish_back();
+        recording.finish_back();
+        assert!(recording.back().is_null());
     }
 }

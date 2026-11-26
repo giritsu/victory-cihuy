@@ -243,17 +243,15 @@ const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 #[cfg(windows)]
 fn idle_most() -> (usize, u64) {
     if crate::residency::compact_host_ram() {
-        (128, 64 << 20)
+        (256, 64 << 20)
     } else {
         IDLE_MOST
     }
 }
 
-/// Drops excess idle command lists when host or Shared GPU memory is pressured.
+/// Drops excess idle command lists down to `keep`.
 #[cfg(windows)]
-pub(crate) fn trim_idle() {
-    thin::trim_idle();
-    let keep = if crate::residency::critical_commit() { 32 } else { 64 };
+pub(crate) fn trim_idle_to(keep: usize) {
     let gone: Vec<Idle> = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() <= keep {
@@ -267,6 +265,35 @@ pub(crate) fn trim_idle() {
         drained
     };
     drop(gone);
+}
+
+/// Drops excess idle command lists when host or Shared GPU memory is pressured.
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    thin::trim_idle();
+    let keep = if crate::residency::compact_host_ram() {
+        if crate::residency::critical_commit() { 96 } else { 192 }
+    } else if crate::residency::critical_commit() {
+        128
+    } else {
+        256
+    };
+    trim_idle_to(keep);
+}
+
+#[cfg(windows)]
+fn ensure_host(this: This) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: `this` is an exclusive internal back list popped from `BACKS`.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    if list.host.is_none()
+        && let Some(fresh) = fresh_list()
+    {
+        fresh.close();
+        list.host = Some(fresh);
+    }
 }
 
 #[cfg(windows)]
@@ -427,6 +454,18 @@ pub(crate) type Parts = Vec<(Vec<ValueWait>, Vec<Detached>, Vec<usize>)>;
 /// the second naming is dropped (logged once).
 #[cfg(windows)]
 pub(crate) fn detach_parts(lists: &[This]) -> Parts {
+    detach_parts_with(lists, true)
+}
+
+/// Like [`detach_parts`], without equipping the source title list with a fresh
+/// host list (used for internal `thin` back lists immediately returned afterwards).
+#[cfg(windows)]
+pub(crate) fn detach_parts_take(lists: &[This]) -> Parts {
+    detach_parts_with(lists, false)
+}
+
+#[cfg(windows)]
+fn detach_parts_with(lists: &[This], replace: bool) -> Parts {
     let mut parts: Parts = vec![(Vec::new(), Vec::new(), Vec::new())];
     // The lists taken: where its one host list is (entry, place), or none
     // for a list of several parts.
@@ -447,16 +486,24 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
+        let replacement = if replace {
+            let Some(fresh) = fresh_list() else {
+                continue;
+            };
+            // A new host list is open; the title's next call on its list is a
+            // reset, which wants it closed.
+            fresh.close();
+            Some(fresh)
+        } else {
+            None
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = (match replacement {
+            Some(fresh) => list.host.replace(fresh),
+            None => list.host.take(),
+        }) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -509,6 +556,18 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
+    detach_with(lists, true)
+}
+
+/// Like [`detach`], leaving `list.host` as `None` (used for internal `thin`
+/// back lists so idle recordings hold no live `HostList`).
+#[cfg(windows)]
+pub(crate) fn detach_take(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
+    detach_with(lists, false)
+}
+
+#[cfg(windows)]
+fn detach_with(lists: &[This], replace: bool) -> (Vec<Detached>, Vec<usize>) {
     let mut taken: Vec<(This, Detached)> = Vec::new();
     let mut order = Vec::new();
     for &this in lists {
@@ -519,17 +578,25 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
+        let replacement = if replace {
+            let Some(fresh) = fresh_list() else {
+                continue;
+            };
+            // A new host list is open; the title's next call on its list is a
+            // reset, which wants it closed.
+            fresh.close();
+            Some(fresh)
+        } else {
+            None
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = (match replacement {
+                Some(fresh) => (*list).host.replace(fresh),
+                None => (*list).host.take(),
+            }) else {
                 continue;
             };
             let uploads =
@@ -650,13 +717,15 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
-            Ok(list) => Some(list),
-            Err(e) => {
-                tracing::warn!(error = %e, "no host command list");
-                None
+        host: if thin || crate::host::host().is_none() {
+            None
+        } else {
+            let list = fresh_list();
+            if list.is_none() {
+                tracing::warn!("no host command list");
             }
-        }),
+            list
+        },
         #[cfg(windows)]
         state: {
             let mut state = crate::draw::State::default();

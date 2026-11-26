@@ -28,10 +28,10 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 /// Bytes of a block; pieces of more than half of one are not pooled (with
 /// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
-/// Staging block size on compact (<= 16 GiB RAM) hosts: 16 MiB so free
-/// ranges coalesce back to the OS quickly without pinning 64 MiB chunks in
+/// Staging block size on compact (<= 16 GiB RAM) hosts: 8 MiB so free
+/// ranges coalesce back to the OS quickly without pinning large chunks in
 /// WDDM Shared GPU Memory.
-const STAGING_BLOCK_COMPACT: u64 = 16 << 20;
+const STAGING_BLOCK_COMPACT: u64 = 8 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
@@ -84,6 +84,9 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// frames, a tenth of a second while the title shows a loading screen at 30
 /// a second, with up to 18 submissions in the air.)
 const REST: u64 = 2500;
+/// Faster rest timeout for the compact-RAM staging pool so area-load bursts
+/// reuse space instead of spreading across many WDDM Shared GPU blocks.
+const STAGING_REST_COMPACT: u64 = 500;
 
 fn now() -> u64 {
     crate::host::now_ms()
@@ -209,16 +212,21 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     block_size: u64,
+    rest_ms: u64,
     retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Self::with_block(most, BLOCK)
+        Self::with_block_and_rest(most, BLOCK, REST)
     }
 
     const fn with_block(most: usize, block_size: u64) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, block_size, retry_growth_at: 0 }
+        Self::with_block_and_rest(most, block_size, REST)
+    }
+
+    const fn with_block_and_rest(most: usize, block_size: u64, rest_ms: u64) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, block_size, rest_ms, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -339,7 +347,7 @@ impl<B: Clone> Pool<B> {
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+        self.resting.push_back((now + self.rest_ms, piece));
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
@@ -401,9 +409,17 @@ fn staging_block_size() -> u64 {
     }
 }
 
+fn staging_rest_ms() -> u64 {
+    if crate::residency::compact_host_ram() {
+        STAGING_REST_COMPACT
+    } else {
+        REST
+    }
+}
+
 fn staging_pool() -> &'static Mutex<Pool<Upload>> {
     static STAGING: std::sync::OnceLock<Mutex<Pool<Upload>>> = std::sync::OnceLock::new();
-    STAGING.get_or_init(|| Mutex::new(Pool::with_block(STAGING_KEPT, staging_block_size())))
+    STAGING.get_or_init(|| Mutex::new(Pool::with_block_and_rest(STAGING_KEPT, staging_block_size(), staging_rest_ms())))
 }
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
@@ -829,6 +845,17 @@ mod tests {
         pool.give(b, 0);
         pool.give(c, 0);
         pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
+    }
+
+    #[test]
+    fn compact_staging_rest_reclaims_pieces_earlier() {
+        let mut pool = Pool::with_block_and_rest(2, STAGING_BLOCK_COMPACT, STAGING_REST_COMPACT);
+        let (p, _, _) = pool.take_with(STAGING_BLOCK_COMPACT / 2, 512, 0, 0, || Some(1)).unwrap();
+        pool.give(p, 100);
+        pool.reclaim(100 + STAGING_REST_COMPACT - 1, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        pool.reclaim(100 + STAGING_REST_COMPACT, 0, true);
         assert_eq!(pool.blocks(), 0);
     }
 }
