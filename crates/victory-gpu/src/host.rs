@@ -3360,14 +3360,21 @@ fn late_helper() {
     }
 }
 
+static LATE_HELPER_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn should_land_inline(relay_on: bool, helper_up: bool, landed_len: usize, lag: usize) -> bool {
+    !relay_on || !helper_up || landed_len > lag.saturating_add(32)
+}
+
 /// Starts the threads of [`late`], once: the one that settles flights when
 /// the card has run them and looks at what queues hold, and with [`relay`]
 /// the one that lands flights.
 fn late_threads() {
     static HELPER: std::sync::Once = std::sync::Once::new();
     HELPER.call_once(|| {
-        if let Err(e) = std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
-            tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow");
+        match std::thread::Builder::new().name("victory-late-wait".into()).spawn(late_helper) {
+            Ok(_) => LATE_HELPER_UP.store(true, Ordering::Release),
+            Err(e) => tracing::warn!(error = %e, "no thread to settle submissions sent ahead: they are settled by the calls that follow"),
         }
         tracing::info!(
             most = late_most(),
@@ -5253,12 +5260,18 @@ impl Host {
         } {
             match split(lists, order, cut) {
                 Ok([(lists, order), (more, behind)]) => {
+                    #[cfg(feature = "diagnostics")]
+                    card_steps::note_cut_ok();
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                     let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
                     self.execute_parts(lists, order, &first);
                     self.execute_parts(more, behind, &second);
                 }
-                Err((lists, order)) => self.send_late(lists, order, parts),
+                Err((lists, order)) => {
+                    #[cfg(feature = "diagnostics")]
+                    card_steps::note_cut_split_err();
+                    self.send_late(lists, order, parts);
+                }
             }
             return;
         }
@@ -5317,8 +5330,27 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        let inline_land = if relay() && LATE_HELPER_UP.load(Ordering::Acquire) {
+            let mut line = line();
+            let len = line.landed.len();
+            let lag = bury_lag() as usize;
+            if should_land_inline(true, true, len, lag) {
+                true
+            } else {
+                if len > lag && !line.poke {
+                    line.poke = true;
+                    drop(line);
+                    LINE_MOVED.notify_one();
+                }
+                false
+            }
+        } else {
+            true
+        };
+        if inline_land {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -5579,6 +5611,10 @@ impl Host {
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // Descriptors the title copied into placed heaps directly, before
+        // command lists that index those slots are submitted. Start early when
+        // asynchronous so it overlaps `card_steps` and `relay_wait`.
+        let mut heaps_synced = late.then(crate::descriptor::begin_sync_heaps);
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -5588,11 +5624,13 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
+        let mut waited_flights = false;
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            waited_flights = true;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -5605,9 +5643,10 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
-        // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        if !late || waited_flights {
+            drop(heaps_synced.take());
+            heaps_synced = Some(crate::descriptor::begin_sync_heaps());
+        }
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
@@ -8829,6 +8868,10 @@ impl Meter {
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
+        tracing::info!(
+            target: "victory_gpu::fps",
+            "{fps:.1} fps, {ms:.1} ms/frame (cpu {cpu:.1} ms, gpu {gpu:.1} ms, back {back_ms:.1} ms), {draws:.0} draws/frame"
+        );
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
@@ -10794,6 +10837,15 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(super::scratch_spare_limit(true, true, false, false, true), 0);
         assert_eq!(super::scratch_spare_limit(false, true, true, false, false), super::SPARE_MOST);
         assert_eq!(super::scratch_spare_limit(false, false, true, false, false), super::SPARE_KEPT);
+    }
+
+    #[test]
+    fn should_land_inline_defers_to_helper_in_relay_mode_until_backpressure() {
+        assert!(!super::should_land_inline(true, true, 0, 6));
+        assert!(!super::should_land_inline(true, true, 38, 6));
+        assert!(super::should_land_inline(true, true, 39, 6));
+        assert!(super::should_land_inline(false, true, 0, 6));
+        assert!(super::should_land_inline(true, false, 0, 6));
     }
 }
 

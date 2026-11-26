@@ -475,10 +475,24 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     (does, steps, step_lists)
 }
 
-/// With flights in the air: before which of `runs` the submission is cut so
-/// that what reads or writes the bytes of a copy at its place in an earlier
-/// list ([`BEHIND_PLACED`]) is done on the card in front of a submission of
-/// its own, behind that copy.
+/// Diagnostics: counts of `BEHIND_PLACED` cut attempts (`[ok, single_list, same_list, split_err]`).
+#[cfg(feature = "diagnostics")]
+static CUT_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+pub(super) fn note_cut_ok() {
+    CUT_STATS[0].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(super) fn note_cut_split_err() {
+    CUT_STATS[3].fetch_add(1, Ordering::Relaxed);
+}
+
+/// With flights in the air: if what keeps `runs` from being prepared
+/// now is reads of title memory that can all be done on the card
+/// ([`stage`]), the list that does them. `None` if nothing is in the
+/// way or the old wait is due. Under the submission lock.
 pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     if stage() == 0 || !relay_exact() || !placed_order() || runs.len() < 2 {
         return None;
@@ -490,15 +504,14 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps, _) = does_of(&written, runs);
+    let (does, _steps, step_lists) = does_of(&written, runs);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
     }
     let (placed, reader) = behind?;
-    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
-    let cut = place(placed)? + 1;
-    (place(reader)? >= cut).then_some(cut)
+    let cut = step_lists[placed] + 1;
+    (step_lists[reader] >= cut).then_some(cut)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -692,7 +705,23 @@ impl Host {
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps, step_lists) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let mut behind = None;
+        let chosen = match plan(&does, stage(), placed_order(), &mut behind) {
+            Ok(chosen) => chosen,
+            Err(why) => {
+                #[cfg(feature = "diagnostics")]
+                if why == BEHIND_PLACED {
+                    if runs.len() < 2 {
+                        CUT_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    } else if let Some((placed, reader)) = behind
+                        && step_lists[placed] == step_lists[reader]
+                    {
+                        CUT_STATS[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return Err(why);
+            }
+        };
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -937,6 +966,16 @@ pub(super) fn log(frames: f64) {
     );
     #[cfg(feature = "diagnostics")]
     {
+        let c: Vec<f64> = CUT_STATS.iter().map(|v| v.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if c.iter().any(|&v| v > 0.0) {
+            tracing::info!(
+                "BEHIND_PLACED cuts per frame: {:.2} cut ok, {:.2} single-list, {:.2} same-list, {:.2} split-err",
+                c[0],
+                c[1],
+                c[2],
+                c[3],
+            );
+        }
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let mut noted: Vec<_> = noted.into_iter().collect();
         noted.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e.0));

@@ -322,21 +322,17 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
-        let before = host.copied_before(frame);
-        let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                if host.copied_tabled(index, frame) {
-                    of_tables.fetch_add(1, Relaxed);
-                } else {
+        let (before, of_tables) = host.copied_before(frame);
+        if !before.is_empty() {
+            crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+                for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
                     host.mirror(index, start + u64::from(index) * step, false);
                 }
-            }
-        });
-        let of_tables = of_tables.into_inner();
+            });
+        }
         tabled += of_tables;
-        mirrored += before.len() as u64 - of_tables;
-        kinds[4] += before.len() as u64 - of_tables;
+        mirrored += before.len() as u64;
+        kinds[4] += before.len() as u64;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
@@ -638,27 +634,7 @@ pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<
     Some(f(host))
 }
 
-/// Makes dynamic slot `index` of the host heap behind the title heap at
-/// `heap`, if that heap still exists, the constant buffer view of `size`
-/// bytes of `buffer` at `gpu`.
-#[cfg(windows)]
-pub(crate) fn constant_slot(
-    heap: usize,
-    index: u32,
-    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    gpu: u64,
-    size: u32,
-) {
-    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.constant_at(index, buffer, gpu, size);
-    }
-}
-
-/// Batched [`constant_slot`], acquiring `SHADER_HEAPS.read()` once for all
+/// Batched [`HostHeap::constant_at_base`], acquiring `SHADER_HEAPS.read()` once for all
 /// `slots` and reusing `buffer_gpu` and the last resolved heap.
 #[cfg(windows)]
 pub(crate) fn constant_slots(

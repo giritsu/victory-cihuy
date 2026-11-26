@@ -79,7 +79,7 @@ if ($Build -eq 'diag') {
     $settings.VICTORY_D3D12_DRED = if ($DredLight) { 'light' } else { 'faults' }
     $settings.VICTORY_MEMORY_MAP = if ($MemoryMap) { '1' } else { '0' }
 } else {
-    $settings.VICTORY_LOG = 'warn'
+    $settings.VICTORY_LOG = 'warn,victory_gpu::fps=info'
 }
 
 if ($Safe) {

@@ -1694,13 +1694,17 @@ impl HostHeap {
     /// A plain point sampler at slot `index`, for sampler slots without a
     /// view.
     fn null_sampler(&self, index: u32) {
+        if let Some(bank) = null_bank() {
+            self.copy_from_kind(index, bank.sampler(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+            return;
+        }
         null_sampler(self.at(index));
         self.put(index);
     }
 }
 
 /// A plain point sampler at `at`.
-fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+fn create_null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
@@ -1713,6 +1717,23 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of a sampler heap of ours.
     unsafe { host.device.CreateSampler(&desc, at) };
+}
+
+/// A plain point sampler at `at`.
+fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if let (Some(host), Some(bank)) = (host(), null_bank()) {
+        // SAFETY: `at` is a valid sampler descriptor slot and `bank` outlives the device.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                at,
+                bank.sampler(),
+                D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+            );
+        }
+        return;
+    }
+    create_null_sampler(at);
 }
 
 impl HostHeap {
@@ -2543,11 +2564,9 @@ impl HostHeap {
         if key == 0 {
             return;
         }
-        match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.at(index)),
-            None => null_view(self.at(index)),
-        }
-        self.put(index);
+        let kind = view_at(key as u32, (key >> 32) as u32)
+            .map_or(NullViewKind::Tex2d, |view| null_view_kind(&view));
+        self.put_null_kind(index, kind);
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.keep(index, None);
@@ -2796,9 +2815,10 @@ impl HostHeap {
     pub(crate) fn make_at(&self, index: u32, view: &View) {
         let kept = make_twinned(view, self.at(index), self.twin(index));
         if kept.is_none() {
-            null_for(view, self.at(index));
+            self.put_null_kind(index, null_view_kind(view));
+        } else {
+            self.put(index);
         }
-        self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
         self.keep(index, kept.flatten());
@@ -2859,13 +2879,29 @@ impl HostHeap {
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
     /// see.
     fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        self.copy_from_kind(to, from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+
+    /// Copies one descriptor from CPU handle `from` to heap slot `to`.
+    fn copy_from_kind(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE, kind: D3D12_DESCRIPTOR_HEAP_TYPE) {
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
         }
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
-        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
+    }
+
+    /// Places a pre-baked null view of `kind` into heap slot `index` without
+    /// creating a temporary descriptor or bouncing through thread-local staging.
+    fn put_null_kind(&self, index: u32, kind: NullViewKind) {
+        if let Some(bank) = null_bank() {
+            self.copy_from(index, bank.view(kind));
+            return;
+        }
+        create_null_kind(kind, self.at(index));
+        self.put(index);
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -2873,8 +2909,7 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.at(index));
-            self.put(index);
+            self.put_null_kind(index, NullViewKind::Tex2d);
             self.write_stride(index, 0);
         }
         self.clear_twin(index);
@@ -2905,8 +2940,7 @@ impl HostHeap {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            null_buffer_view(self.at(self.raw + index));
-            self.put(self.raw + index);
+            self.put_null_kind(self.raw + index, NullViewKind::BufferSrv);
         }
     }
 
@@ -2971,8 +3005,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
-        null_buffer_view(self.at(index));
-        self.put(index);
+        self.put_null_kind(index, NullViewKind::BufferSrv);
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.keep(index, None);
@@ -3016,28 +3049,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
     /// nothing: reads give zeros, writes are dropped.
     pub(crate) fn null_raw_uav_at(&self, index: u32) {
-        let Some(host) = host() else { return };
-        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_TYPELESS,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-                Buffer: D3D12_BUFFER_UAV {
-                    NumElements: 1,
-                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
-                    ..Default::default()
-                },
-            },
-        };
-        // SAFETY: a slot of our heap; a null resource is allowed with a desc.
-        unsafe {
-            host.device.CreateUnorderedAccessView(
-                None::<&ID3D12Resource>,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.at(index),
-            )
-        };
-        self.put(index);
+        self.put_null_kind(index, NullViewKind::UavRawBuffer);
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.keep(index, None);
@@ -3214,17 +3226,18 @@ impl HostHeap {
     }
 
     /// The slots that have waited long enough at `frame`
-    /// ([`HostHeap::copied_wait`]), each once.
-    pub(crate) fn copied_before(&self, frame: u64) -> Vec<u32> {
+    /// ([`HostHeap::copied_wait`]), filtered before sorting to exclude
+    /// slots already read through a draw's table, each once, plus the count skipped.
+    pub(crate) fn copied_before(&self, frame: u64) -> (Vec<u32>, u64) {
         let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out = Vec::new();
+        let mut batches = Vec::new();
         while waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame) {
-            out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
+            if let Some((_, slots)) = waiting.pop_front() {
+                batches.push(slots);
+            }
         }
         drop(waiting);
-        out.sort_unstable();
-        out.dedup();
-        out
+        partition_copied_before(batches, |index| self.copied_tabled(index, frame))
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -3336,9 +3349,8 @@ impl HostHeap {
                 make_twinned(&view, self.at(index), self.twin(index))
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.at(index));
-            }
-            if kept.is_some() || !self.sampler {
+                self.put_null_kind(index, null_view_kind(&view));
+            } else if kept.is_some() {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
@@ -4702,49 +4714,261 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
 
-/// A null view of the kind `view` is, for a slot whose view the host
-/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
-/// view. Writes to it are dropped, reads give zeros.
-fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
-    let Some(host) = host() else { return };
+/// Filters out `tabled` slots before sorting and deduplicating queued slots.
+fn partition_copied_before(batches: Vec<Vec<u32>>, is_tabled: impl Fn(u32) -> bool) -> (Vec<u32>, u64) {
+    let mut out = Vec::new();
+    let mut skipped_tabled = 0u64;
+    for batch in batches {
+        for index in batch {
+            if is_tabled(index) {
+                skipped_tabled += 1;
+            } else {
+                out.push(index);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    (out, skipped_tabled)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NullViewKind {
+    Tex2d,
+    BufferSrv,
+    Cbv,
+    UavBuffer,
+    UavRawBuffer,
+    UavTex1d,
+    UavTex1dArray,
+    UavTex2d,
+    UavTex2dArray,
+    UavTex3d,
+    SrvTex(u32),
+}
+
+impl NullViewKind {
+    const VIEW_COUNT: u32 = 19;
+
+    const ALL: [Self; 19] = [
+        Self::Tex2d,
+        Self::BufferSrv,
+        Self::Cbv,
+        Self::UavBuffer,
+        Self::UavRawBuffer,
+        Self::UavTex1d,
+        Self::UavTex1dArray,
+        Self::UavTex2d,
+        Self::UavTex2dArray,
+        Self::UavTex3d,
+        Self::SrvTex(2),
+        Self::SrvTex(3),
+        Self::SrvTex(4),
+        Self::SrvTex(5),
+        Self::SrvTex(6),
+        Self::SrvTex(7),
+        Self::SrvTex(8),
+        Self::SrvTex(9),
+        Self::SrvTex(10),
+    ];
+
+    fn slot(self) -> u32 {
+        match self {
+            Self::Tex2d => 0,
+            Self::BufferSrv => 1,
+            Self::Cbv => 2,
+            Self::UavBuffer => 3,
+            Self::UavRawBuffer => 4,
+            Self::UavTex1d => 5,
+            Self::UavTex1dArray => 6,
+            Self::UavTex2d => 7,
+            Self::UavTex2dArray => 8,
+            Self::UavTex3d => 9,
+            Self::SrvTex(dim) if (2..=10).contains(&dim) => 10 + (dim - 2),
+            Self::SrvTex(_) => 0,
+        }
+    }
+}
+
+struct NullBank {
+    view_start: usize,
+    view_step: usize,
+    sampler_start: usize,
+    _heaps: [ID3D12DescriptorHeap; 2],
+}
+
+// SAFETY: non-shader-visible CPU descriptor heaps are immutable once populated
+// during `OnceLock` init and safe to read via `CopyDescriptorsSimple` from any thread.
+unsafe impl Send for NullBank {}
+// SAFETY: see above.
+unsafe impl Sync for NullBank {}
+
+impl NullBank {
+    fn view(&self, kind: NullViewKind) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: self.view_start + kind.slot() as usize * self.view_step,
+        }
+    }
+
+    fn sampler(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.sampler_start }
+    }
+}
+
+fn null_bank() -> Option<&'static NullBank> {
+    static BANK: std::sync::OnceLock<Option<NullBank>> = std::sync::OnceLock::new();
+    BANK.get_or_init(|| {
+        let host = host()?;
+        // SAFETY: plain non-shader-visible CPU descriptor heap creation and initialization.
+        unsafe {
+            let views: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: NullViewKind::VIEW_COUNT,
+                    ..Default::default()
+                })
+                .ok()?;
+            let samplers: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .ok()?;
+            let view_start = views.GetCPUDescriptorHandleForHeapStart().ptr;
+            let view_step = host
+                .device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let sampler_start = samplers.GetCPUDescriptorHandleForHeapStart().ptr;
+            for kind in NullViewKind::ALL {
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: view_start + kind.slot() as usize * view_step,
+                };
+                create_null_kind(kind, at);
+            }
+            create_null_sampler(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: sampler_start });
+            Some(NullBank {
+                view_start,
+                view_step,
+                sampler_start,
+                _heaps: [views, samplers],
+            })
+        }
+    })
+    .as_ref()
+}
+
+fn null_srv_tex_kind(dim: u32) -> NullViewKind {
+    if (2..=10).contains(&dim) {
+        NullViewKind::SrvTex(dim)
+    } else {
+        NullViewKind::Tex2d
+    }
+}
+
+fn null_uav_tex_kind(dimension: Option<u32>) -> NullViewKind {
+    match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => NullViewKind::UavTex1d,
+        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => NullViewKind::UavTex1dArray,
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => NullViewKind::UavTex2dArray,
+        Some(D3D12_UAV_DIMENSION_TEXTURE3D) => NullViewKind::UavTex3d,
+        _ => NullViewKind::UavTex2d,
+    }
+}
+
+fn null_view_kind(view: &View) -> NullViewKind {
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    // Unordered views: whether a buffer, and the title's view dimension.
-    let (buffer, dimension) = match view {
-        View::Unordered(r, _, desc) => (
-            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-            desc.map(|d| d[1]),
-        ),
-        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
-        // Shader views of buffers read nothing through a null buffer view:
-        // a null 2D view where the shader expects a buffer is a mismatch
-        // the hardware does not survive in general (GPU-based validation
-        // reports it).
-        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
-            return null_buffer_view(at);
+    match view {
+        View::Unordered(r, _, desc) => {
+            if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) {
+                NullViewKind::UavBuffer
+            } else {
+                null_uav_tex_kind(desc.map(|d| d[1]))
+            }
         }
-        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
-        // Textures: a null view of the title's dimension (1D, arrays, 3D,
-        // cubes), not always 2D.
-        View::Shader(_, Some(desc)) => return null_like(desc, at),
-        View::Placed(false, _, desc) => {
-            return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
+        View::Placed(true, resource, desc) => {
+            if resource[0] == 1 {
+                NullViewKind::UavBuffer
+            } else {
+                null_uav_tex_kind(Some(desc[1]))
+            }
         }
-        View::Constant(..) => {
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => NullViewKind::BufferSrv,
+        View::Placed(false, resource, _) if resource[0] == 1 => NullViewKind::BufferSrv,
+        View::Shader(_, Some(desc)) => null_srv_tex_kind(desc[1]),
+        View::Placed(false, _, desc) => null_srv_tex_kind(desc[1]),
+        View::Constant(..) => NullViewKind::Cbv,
+        _ => NullViewKind::Tex2d,
+    }
+}
+
+fn create_null_kind(kind: NullViewKind, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    match kind {
+        NullViewKind::Tex2d => create_null_view(at),
+        NullViewKind::BufferSrv => create_null_buffer_view(at),
+        NullViewKind::Cbv => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
         }
-        _ => return null_view(at),
-    };
-    let desc = if buffer {
-        D3D12_UNORDERED_ACCESS_VIEW_DESC {
-            Format: DXGI_FORMAT_R32_UINT,
-            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
-            ..Default::default()
+        NullViewKind::UavBuffer => {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                ..Default::default()
+            };
+            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    at,
+                )
+            };
         }
-    } else {
-        null_uav_desc(dimension)
-    };
+        NullViewKind::UavRawBuffer => {
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: 1,
+                        Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        ..Default::default()
+                    },
+                },
+            };
+            // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+            unsafe {
+                host.device.CreateUnorderedAccessView(
+                    None::<&ID3D12Resource>,
+                    None::<&ID3D12Resource>,
+                    Some(&desc),
+                    at,
+                )
+            };
+        }
+        NullViewKind::UavTex1d => create_null_uav_tex(Some(D3D12_UAV_DIMENSION_TEXTURE1D.0 as u32), at),
+        NullViewKind::UavTex1dArray => {
+            create_null_uav_tex(Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY.0 as u32), at)
+        }
+        NullViewKind::UavTex2d => create_null_uav_tex(Some(D3D12_UAV_DIMENSION_TEXTURE2D.0 as u32), at),
+        NullViewKind::UavTex2dArray => {
+            create_null_uav_tex(Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY.0 as u32), at)
+        }
+        NullViewKind::UavTex3d => create_null_uav_tex(Some(D3D12_UAV_DIMENSION_TEXTURE3D.0 as u32), at),
+        NullViewKind::SrvTex(dim) => create_null_like_dim(dim, at),
+    }
+}
+
+fn create_null_uav_tex(dimension: Option<u32>, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = null_uav_desc(dimension);
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device.CreateUnorderedAccessView(
@@ -4754,6 +4978,26 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+}
+
+/// A null view of the kind `view` is, for a slot whose view the host
+/// cannot make: unordered access (to a buffer or a 2D texture) or a shader
+/// view. Writes to it are dropped, reads give zeros.
+fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let kind = null_view_kind(view);
+    if let (Some(host), Some(bank)) = (host(), null_bank()) {
+        // SAFETY: `at` is a valid CBV_SRV_UAV slot and `bank` outlives the device.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                at,
+                bank.view(kind),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        return;
+    }
+    create_null_kind(kind, at);
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -4798,7 +5042,7 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
-fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+fn create_null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R32_TYPELESS,
@@ -4819,18 +5063,34 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
-/// A texture view that reads zeros with the dimension (and mip and array
-/// counts) of the title's description `words`; 2D if it names none.
-fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+/// A buffer view that reads zeros (raw, as translated shaders mostly read
+/// buffers).
+fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if let (Some(host), Some(bank)) = (host(), null_bank()) {
+        // SAFETY: `at` is a valid CBV_SRV_UAV slot and `bank` outlives the device.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                at,
+                bank.view(NullViewKind::BufferSrv),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        return;
+    }
+    create_null_buffer_view(at);
+}
+
+fn create_null_like_dim(dim: u32, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
-    if !TEXTURES.contains(&words[1]) {
-        return null_view(at);
+    if !TEXTURES.contains(&dim) {
+        return create_null_view(at);
     }
     let Some(host) = host() else { return };
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
-    w[1] = words[1];
-    match words[1] {
+    w[1] = dim;
+    match dim {
         6 => {}
         7 => w[5] = 1,
         3 | 5 | 10 => (w[5], w[7]) = (1, 1),
@@ -4850,7 +5110,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// shortcut: slots with no view at all (kind unknown) get this null 2D
 /// view; null buffer views there did not stop the world's low-address
 /// page faults (2026-11-24, run w10), so they are not the cause.
-fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+fn create_null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -4868,6 +5128,23 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         host.device
             .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
+}
+
+/// A view that reads zeros, for slots whose view the host cannot make.
+fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if let (Some(host), Some(bank)) = (host(), null_bank()) {
+        // SAFETY: `at` is a valid CBV_SRV_UAV slot and `bank` outlives the device.
+        unsafe {
+            host.device.CopyDescriptorsSimple(
+                1,
+                at,
+                bank.view(NullViewKind::Tex2d),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        return;
+    }
+    create_null_view(at);
 }
 
 #[cfg(test)]
@@ -5116,6 +5393,108 @@ mod tests {
         };
         let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
         null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn partition_copied_before_filters_tabled_and_dedups() {
+        let batches = vec![vec![5, 2, 8, 2, 1], vec![8, 3, 5, 9]];
+        let (remaining, skipped) = partition_copied_before(batches, |slot| slot == 2 || slot == 8);
+        assert_eq!(skipped, 4);
+        assert_eq!(remaining, vec![1, 3, 5, 9]);
+    }
+
+    #[test]
+    fn null_view_kind_maps_all_view_variants() {
+        assert_eq!(null_view_kind(&View::Constant(0, 256)), NullViewKind::Cbv);
+        assert_eq!(
+            null_view_kind(&View::Shader(0, Some([0, 1, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::BufferSrv
+        );
+        assert_eq!(
+            null_view_kind(&View::Shader(0, Some([0, 4, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::SrvTex(4)
+        );
+        assert_eq!(
+            null_view_kind(&View::Shader(0, Some([0, 8, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::SrvTex(8)
+        );
+        assert_eq!(
+            null_view_kind(&View::Shader(0, Some([0, 99, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::Tex2d
+        );
+        assert_eq!(null_view_kind(&View::Shader(0, None)), NullViewKind::Tex2d);
+        assert_eq!(
+            null_view_kind(&View::Unordered(0, 0, Some([0, 1, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::UavBuffer
+        );
+        assert_eq!(
+            null_view_kind(&View::Unordered(0, 0, Some([0, 2, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::UavTex1d
+        );
+        assert_eq!(
+            null_view_kind(&View::Unordered(0, 0, Some([0, 3, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::UavTex1dArray
+        );
+        assert_eq!(
+            null_view_kind(&View::Unordered(0, 0, Some([0, 4, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::UavTex2d
+        );
+        assert_eq!(
+            null_view_kind(&View::Unordered(0, 0, Some([0, 5, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::UavTex2dArray
+        );
+        assert_eq!(
+            null_view_kind(&View::Unordered(0, 0, Some([0, 8, 0, 0, 0, 0, 0, 0, 0, 0]))),
+            NullViewKind::UavTex3d
+        );
+        let mut buf_res = [0u32; 14];
+        buf_res[0] = 1;
+        assert_eq!(
+            null_view_kind(&View::Placed(false, buf_res, [0; 16])),
+            NullViewKind::BufferSrv
+        );
+        assert_eq!(
+            null_view_kind(&View::Placed(true, buf_res, [0; 16])),
+            NullViewKind::UavBuffer
+        );
+        let mut tex_res = [0u32; 14];
+        tex_res[0] = 2;
+        let mut tex_desc = [0u32; 16];
+        tex_desc[1] = 10;
+        assert_eq!(
+            null_view_kind(&View::Placed(false, tex_res, tex_desc)),
+            NullViewKind::SrvTex(10)
+        );
+        tex_desc[1] = 8;
+        assert_eq!(
+            null_view_kind(&View::Placed(true, tex_res, tex_desc)),
+            NullViewKind::UavTex3d
+        );
+    }
+
+    #[test]
+    fn null_bank_populates_and_copies_without_device_error() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(views) = HostHeap::new(false, 32) else {
+            return;
+        };
+        let Some(samplers) = HostHeap::new(true, 4) else {
+            return;
+        };
+        let bank = null_bank().expect("null bank should initialize on live host device");
+        for (i, kind) in NullViewKind::ALL.into_iter().enumerate() {
+            views.put_null_kind(i as u32, kind);
+        }
+        views.make_null(20);
+        views.null_raw_at(21);
+        views.null_raw_uav_at(22);
+        samplers.make_null(0);
+        null_sampler(samplers.cpu(1));
+        let _ = bank;
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
