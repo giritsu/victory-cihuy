@@ -2015,6 +2015,31 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
 /// Every caller uses it at once, within the title's call.
 /// Called before a submission starts, by the thread that submits.
 /// `VICTORY_TEXTURE_SWEEP=0` lets nothing go.
+/// Maximum textures evicted and microsecond budget per [`let_go_idle`] pass.
+#[cfg(any(windows, test))]
+fn sweep_limits(most: u64, urgent: bool, whole: bool) -> (usize, u64) {
+    if whole {
+        (usize::MAX, u64::MAX)
+    } else if most != u64::MAX && urgent {
+        (2048, 8_000)
+    } else {
+        (512, 3_000)
+    }
+}
+
+/// Retains and sorts at most `2 * max_evict` (at least 64) oldest `(stamp, ptr)` candidates.
+#[cfg(any(windows, test))]
+fn oldest_candidates(candidates: &mut Vec<(u64, usize)>, max_evict: usize) {
+    if max_evict != usize::MAX {
+        let keep = max_evict.saturating_mul(2).max(64);
+        if candidates.len() > keep {
+            candidates.select_nth_unstable(keep);
+            candidates.truncate(keep);
+        }
+    }
+    candidates.sort_unstable();
+}
+
 #[cfg(windows)]
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2050,6 +2075,16 @@ pub(crate) fn let_go_idle() {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
+    // Without one, while textures are kept for minutes, a part of them at
+    // each look, the next one at the next: a play has over 100,000
+    // (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before).
+    const PART: usize = 8192;
+    static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "whole"));
+    let (max_evict, budget_us) = sweep_limits(most, idle_ms <= 1_500, whole);
+    let host_written = crate::texture::host_written_snapshot();
+    let began = std::time::Instant::now();
     let all = textures();
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
@@ -2058,19 +2093,16 @@ pub(crate) fn let_go_idle() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
-            if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
+            if used != 0
+                && fills(&r.desc)
+                && crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+                && !host_written.as_ref().is_some_and(|s| s.contains(&at))
+            {
                 by_age.push((used & 0xffff_ffff, at));
             }
         }
-        by_age.sort_unstable();
+        oldest_candidates(&mut by_age, max_evict);
     }
-    // Without one, while textures are kept for minutes, a part of them at
-    // each look, the next one at the next: a play has over 100,000
-    // (`VICTORY_TEXTURE_SWEEP=whole`: all each time, as before).
-    const PART: usize = 8192;
-    static FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static WHOLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let whole = *WHOLE.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_some_and(|v| v == "whole"));
     let part = if most != u64::MAX {
         0
     } else if whole || idle_ms < 60_000 {
@@ -2079,22 +2111,30 @@ pub(crate) fn let_go_idle() {
         PART
     };
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
-    let mut looked = 0;
-    let began = std::time::Instant::now();
+    let mut looked = 0usize;
+    let mut last_at = None;
+    let mut stopped_early = false;
+    let mut retired: Vec<std::sync::Arc<HostTexture>> = Vec::new();
     for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
+        if bytes >= most
+            || went as usize >= max_evict
+            || (looked & 31 == 0 && began.elapsed().as_micros() as u64 >= budget_us)
+        {
+            stopped_early = true;
             break;
         }
         looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
-        }
+        last_at = Some(at);
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+        if used == 0
+            || !fills(&r.desc)
+            || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES)
+            || host_written.as_ref().is_some_and(|s| s.contains(&at))
+        {
             continue;
         }
         let gone = {
@@ -2123,8 +2163,19 @@ pub(crate) fn let_go_idle() {
             if first.is_none() {
                 first = Some(at);
             }
-            crate::host::retire(host);
+            retired.push(host);
         }
+    }
+    if part == PART {
+        let next_from = match last_at {
+            Some(at) if stopped_early || looked == part => at + 1,
+            _ => 0,
+        };
+        FROM.store(next_from, Relaxed);
+    }
+    drop(all);
+    if !retired.is_empty() {
+        crate::host::retire(retired);
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -4594,5 +4645,24 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn sweep_limits_scale_with_urgency_and_whole() {
+        assert_eq!(super::sweep_limits(u64::MAX, false, false), (512, 3_000));
+        assert_eq!(super::sweep_limits(500 << 20, false, false), (512, 3_000));
+        assert_eq!(super::sweep_limits(500 << 20, true, false), (2048, 8_000));
+        assert_eq!(super::sweep_limits(u64::MAX, true, false), (512, 3_000));
+        assert_eq!(super::sweep_limits(500 << 20, true, true), (usize::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn oldest_candidates_keeps_and_sorts_oldest_subset() {
+        let mut items: Vec<(u64, usize)> = (0..1000).rev().map(|t| (t, t as usize * 8)).collect();
+        super::oldest_candidates(&mut items, 50);
+        assert_eq!(items.len(), 100);
+        assert!(items.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(items[0], (0, 0));
+        assert_eq!(items[99], (99, 99 * 8));
     }
 }

@@ -505,6 +505,9 @@ fn sweep() {
         if crate::residency::critical_commit() || !crate::residency::compact_host_ram() {
             trim_spare_chunks();
         }
+        if crate::residency::compact_host_ram() || crate::residency::critical_commit() {
+            trim_spare_shared();
+        }
         if crate::residency::critical_commit() {
             send::trim_spare();
         }
@@ -1300,6 +1303,9 @@ pub(crate) struct HostList {
     /// ranges written by an earlier [`place`] copy in this same list:
     /// `(buffer, buffer_gpu, capacity, used_bytes, in_read_state)`.
     inline_cbv: Mutex<Option<(ID3D12Resource, u64, u64, u64, bool)>>,
+    /// Reusable device-local intermediate buffer for overlapping self-copies
+    /// in [`place`], kept in `COMMON` between copies across runs and resets.
+    place_between: Mutex<Option<(ID3D12Resource, u64)>>,
     /// Lock-free hint for whether `deferred.placed_ranges` is non-empty in the
     /// current recording.
     has_placed: std::sync::atomic::AtomicBool,
@@ -2119,6 +2125,78 @@ fn trim_spare_chunks() {
     drop(freed);
 }
 
+struct SharedUpload {
+    buffer: ID3D12Resource,
+    data: usize,
+}
+
+// SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
+// written only by the list that holds the buffer.
+unsafe impl Send for SharedUpload {}
+
+/// Power-of-two shared upload buffers reused across list resets/submissions.
+static SPARE_SHARED: Mutex<Spare<SharedUpload>> = Mutex::new(Spare::new());
+
+fn shared_upload_bucket(size: u64) -> Option<u64> {
+    if size > SCRATCH_CHUNK {
+        return None;
+    }
+    Some(size.max(64 << 10).next_power_of_two())
+}
+
+fn shared_spare_limit(compact: bool, shared_pressured: bool, critical: bool) -> u64 {
+    if critical {
+        0
+    } else if compact && shared_pressured {
+        16 << 20
+    } else {
+        32 << 20
+    }
+}
+
+fn take_shared_upload(host: &Host, size: u64) -> Option<(SharedUpload, u64)> {
+    let bucket = shared_upload_bucket(size)?;
+    if let Some(shared) = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner()).take(bucket) {
+        return Some((shared, bucket));
+    }
+    let (buffer, data) = host.shared_buffer_private(bucket)?;
+    name(&buffer, || format!("list upload {bucket:#x}"));
+    Some((SharedUpload { buffer, data: data as usize }, bucket))
+}
+
+fn give_shared_uploads(uploads: Vec<(SharedUpload, u64)>) {
+    if uploads.is_empty() {
+        return;
+    }
+    let mut freed = Vec::new();
+    {
+        let limit = shared_spare_limit(
+            crate::residency::compact_host_ram(),
+            crate::residency::shared_pressured(),
+            crate::residency::critical_commit(),
+        );
+        let mut spare = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        for (shared, size) in uploads {
+            if let Some(dropped) = spare.give(shared, size, limit) {
+                freed.push(dropped);
+            }
+        }
+    }
+    drop(freed);
+}
+
+fn trim_spare_shared() {
+    let freed: Vec<(SharedUpload, u64)> = {
+        let mut spare = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        if spare.kept.is_empty() {
+            return;
+        }
+        spare.bytes = 0;
+        std::mem::take(&mut spare.kept)
+    };
+    drop(freed);
+}
+
 /// What the host keeps for copies in the card's own memory
 /// ([`crate::shadow::cards`]): three lists of ours and the compare.
 struct CardWork {
@@ -2395,6 +2473,8 @@ struct Deferred {
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
+    /// Pooled shared upload buffers kept through this list's fence (`card_steps` stage > 1).
+    shared_uploads: Vec<(SharedUpload, u64)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2455,6 +2535,7 @@ impl Deferred {
     /// moderate container capacities (capping extreme outlier buffers).
     fn clear(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        give_shared_uploads(std::mem::take(&mut self.shared_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
         self.upload_bytes = 0;
@@ -2501,6 +2582,7 @@ impl Deferred {
 impl Drop for Deferred {
     fn drop(&mut self) {
         give_chunks(std::mem::take(&mut self.plane_uploads));
+        give_shared_uploads(std::mem::take(&mut self.shared_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -4229,6 +4311,7 @@ impl Host {
         crate::residency::allocation_error(err);
         send::trim_spare();
         trim_spare_chunks();
+        trim_spare_shared();
         if drain_idle_lists {
             crate::list::trim_idle_to(0);
         }
@@ -4332,6 +4415,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 inline_cbv: Mutex::default(),
+                place_between: Mutex::default(),
                 has_placed: std::sync::atomic::AtomicBool::new(false),
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
@@ -4430,7 +4514,7 @@ impl Host {
         // A megabyte of results: 262,144 pieces, 16 GB of declared ranges
         // in one submission.
         const RESULTS: u64 = 1 << 20;
-        let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
+        let (differs, data) = self.shared_buffer_private(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
         // SAFETY: the blob's own bytes; the root signature is inside the
         // shader.
@@ -4507,7 +4591,7 @@ impl Host {
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
         for shadow in declared.iter().map(|d| &d.0).chain(looked.iter().map(|l| &l.0)) {
             if shadow.card_make_before(|size| {
-                let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
+                let before = self.uav_buffer_private(crate::shadow::card_hash_bytes(size))?;
                 name(&before, || "title buffer on the card, hashes of its pieces".into());
                 Some(before)
             }) {
@@ -4954,7 +5038,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = self.shared_buffer_private(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -5272,7 +5356,7 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                work.fetched = self.shared_buffer_private(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -7063,6 +7147,8 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.plane_uploads.is_empty()
+                && deferred.shared_uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
@@ -7222,13 +7308,37 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
+    /// A mapped CPU upload buffer of `size` bytes, reusing pooled [`Chunk`]s
+    /// up to `SCRATCH_CHUNK`, alive until the list is reset.
+    pub(crate) fn upload_cpu(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if size <= SCRATCH_CHUNK {
+            let bucket = if size <= SCRATCH_FIRST { SCRATCH_FIRST } else { SCRATCH_CHUNK };
+            let chunk = take_chunk(host, bucket)?;
+            let buffer = chunk.buffer.clone();
+            let data = chunk.data as *mut u8;
+            self.deferred().plane_uploads.push((chunk, bucket));
+            return Some((buffer, data));
+        }
+        let (buffer, data) = host.upload_buffer(size)?;
+        name(&buffer, || format!("list upload {size:#x}"));
+        self.deferred().hold_upload(buffer.clone(), size);
+        Some((buffer, data))
+    }
+
     /// A mapped upload buffer of `size` bytes, alive until the list is
     /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+        if card_steps::stage() <= 1 {
+            return self.upload_cpu(host, size);
+        }
+        if let Some((shared, bucket)) = take_shared_upload(host, size) {
+            let buffer = shared.buffer.clone();
+            let data = shared.data as *mut u8;
+            self.deferred().shared_uploads.push((shared, bucket));
+            return Some((buffer, data));
+        }
+        let (buffer, data) = host.shared_buffer_private(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
         self.deferred().hold_upload(buffer.clone(), size);
         Some((buffer, data))
@@ -7298,7 +7408,7 @@ impl HostList {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
+                let (b, d) = host()?.shared_buffer_private(256)?;
                 Some((b, d as usize))
             })
             .as_ref()?;
@@ -7342,7 +7452,7 @@ impl HostList {
             return None;
         }
         self.list.cast::<ID3D12GraphicsCommandList2>().ok()?;
-        let buffer = host()?.uav_buffer(256)?;
+        let buffer = host()?.uav_buffer_private(256)?;
         name(&buffer, || "indirect budget".to_owned());
         Some(buffer)
     }
@@ -7423,7 +7533,7 @@ impl HostList {
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
+        let buffer = host()?.uav_buffer_private(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
@@ -7445,7 +7555,7 @@ impl HostList {
         let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
         if buffer == args.0.len() {
             let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
+            let made = host()?.uav_buffer_private(size)?;
             name(&made, || format!("indirect batches {size:#x}"));
             args.0.push(made);
         }
@@ -9845,6 +9955,16 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_inner(size, true)
+    }
+
+    /// As [`Host::shared_buffer`], for private buffers never exposed through a
+    /// live shader-visible descriptor heap (still `MakeResident`-waited).
+    pub(crate) fn shared_buffer_private(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.shared_buffer_inner(size, false)
+    }
+
+    fn shared_buffer_inner(&self, size: u64, wait_mapped: bool) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9883,7 +10003,9 @@ impl Host {
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    if wait_mapped {
+                        mapped(&self.device)?;
+                    }
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -9990,6 +10112,16 @@ impl Host {
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_inner(size, true)
+    }
+
+    /// As [`Host::uav_buffer`], for private buffers never exposed through a live
+    /// shader-visible descriptor heap (still `MakeResident`-waited).
+    pub(crate) fn uav_buffer_private(&self, size: u64) -> Option<ID3D12Resource> {
+        self.uav_buffer_inner(size, false)
+    }
+
+    fn uav_buffer_inner(&self, size: u64, wait_mapped: bool) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10026,7 +10158,9 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made
+            .and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)))
+            .and_then(|()| if wait_mapped { mapped(&self.device) } else { Ok(()) });
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -11107,6 +11241,23 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(super::retire_into_shards(&shards, 1, 30).is_empty());
         assert_eq!(super::retire_into_shards(&shards, 0, 30).len(), 1);
         assert_eq!(shards[0].pending.load(Acquire), 0);
+    }
+
+    #[test]
+    fn shared_upload_bucket_and_spare_limit_behave_as_expected() {
+        assert_eq!(super::shared_upload_bucket(0), Some(64 << 10));
+        assert_eq!(super::shared_upload_bucket(4096), Some(64 << 10));
+        assert_eq!(super::shared_upload_bucket(64 << 10), Some(64 << 10));
+        assert_eq!(super::shared_upload_bucket((64 << 10) + 1), Some(128 << 10));
+        assert_eq!(super::shared_upload_bucket(3 << 20), Some(4 << 20));
+        assert_eq!(super::shared_upload_bucket(4 << 20), Some(4 << 20));
+        assert_eq!(super::shared_upload_bucket((4 << 20) + 1), None);
+
+        assert_eq!(super::shared_spare_limit(false, false, false), 32 << 20);
+        assert_eq!(super::shared_spare_limit(true, false, false), 32 << 20);
+        assert_eq!(super::shared_spare_limit(true, true, false), 16 << 20);
+        assert_eq!(super::shared_spare_limit(true, true, true), 0);
+        assert_eq!(super::shared_spare_limit(false, true, true), 0);
     }
 }
 

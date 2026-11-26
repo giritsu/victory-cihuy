@@ -2030,16 +2030,27 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // The range's blocks that are neither clean nor known to be holes. A
     // frame asks about some 10 GB of view memory, 150,000 blocks, nearly all
     // clean.
+    const PROTECT_CHUNK: usize = 64;
     let written = dirty_blocks_in_range(&g.clean, &g.absent, &BESIDE, first, last);
     let mut run: Option<(usize, usize)> = None;
+    let mut cover_run: Option<(usize, usize)> = None;
     for &block in &written {
         if let Some((from, to)) = run
-            && to != block
+            && (to != block || to - from >= PROTECT_CHUNK)
         {
             protect(&mut g, from, to);
             run = None;
-            // Faults of the title's wait for the lock: each block is done on
+            // Faults of the title's wait for the lock: each chunk is done on
             // its own, and looked at anew below.
+            drop(g);
+            g = guards_timed();
+        }
+        if let Some((from, to)) = cover_run
+            && (to != block || to - from >= PROTECT_CHUNK)
+        {
+            g.clean.insert_all(from..to);
+            cover(&mut g, from, to);
+            cover_run = None;
             drop(g);
             g = guards_timed();
         }
@@ -2057,17 +2068,29 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.clean.contains(block) {
                 continue;
             }
-            if cover(&mut g, block, block + 1) {
-                g.clean.insert(block);
-            }
+            cover_run = Some((cover_run.map_or(block, |r| r.0), block + 1));
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
+            if let Some((from, to)) = cover_run.take() {
+                g.clean.insert_all(from..to);
+                cover(&mut g, from, to);
+            }
             run = Some((run.map_or(block, |r| r.0), block + 1));
-        } else if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
+        } else {
+            if let Some((from, to)) = run.take() {
+                protect(&mut g, from, to);
+            }
+            if let Some((from, to)) = cover_run.take() {
+                g.clean.insert_all(from..to);
+                cover(&mut g, from, to);
+            }
         }
     }
     if let Some((from, to)) = run {
         protect(&mut g, from, to);
+    }
+    if let Some((from, to)) = cover_run {
+        g.clean.insert_all(from..to);
+        cover(&mut g, from, to);
     }
     drop(g);
     #[cfg(feature = "diagnostics")]
@@ -5084,5 +5107,68 @@ mod many_askers_tests {
         assert!(!super::AHEAD_ACTIVE.load(std::sync::atomic::Ordering::Acquire));
         // SAFETY: `VirtualAlloc` base from above.
         unsafe { windows_sys::Win32::System::Memory::VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn guard_chunks_large_runs_and_batches_cover_runs() {
+        const BLOCKS: usize = 80;
+        const SIZE: usize = BLOCKS * PAGE;
+        // SAFETY: view mappings unregistered and unmapped at the end.
+        let (section, one, two) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let one = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            let two = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            assert!(one != 0 && two != 0);
+            crate::inplace::title_memory_section(section as usize, SIZE as u64, true);
+            crate::inplace::title_memory_view(one, SIZE, section as usize, 0);
+            crate::inplace::title_memory_view(two, SIZE, section as usize, 0);
+            (section, one, two)
+        };
+        let b1 = one / PAGE;
+        let expected: Vec<usize> = (b1..b1 + BLOCKS).collect();
+        // Multi-chunk (> PROTECT_CHUNK = 64) guard protects every block.
+        assert_eq!(super::guard(one, one + SIZE), Some(expected.clone()));
+        assert_eq!(super::guard(one, one + SIZE), Some(Vec::new()));
+        // Reopen without marking clean so blocks become `protected && !clean`
+        // (or open + re-mark protected via alias), then test batched `cover_run`
+        // when one aliased block in the middle is under `kernel_writing`.
+        let kw = super::kernel_writing(two + 10 * PAGE, PAGE);
+        // `two + 10*PAGE` is opened (`!protected`), and `one + 10*PAGE` had its
+        // `clean` cleared; open `one` cleanly via remapping wait, re-guard whole,
+        // and verify block 10 stays unclean while others become clean.
+        {
+            let mut g = super::guards();
+            for b in b1..b1 + 20 {
+                g.clean.remove(b);
+            }
+        }
+        let dirty = super::guard(one, one + 20 * PAGE).expect("view");
+        assert_eq!(dirty.len(), 20);
+        {
+            let g = super::guards_read();
+            for b in b1..b1 + 20 {
+                if b == b1 + 10 {
+                    assert!(!g.clean.contains(b), "block under kernel_writing alias must stay unclean");
+                } else {
+                    assert!(g.clean.contains(b), "covered block {b} should become clean");
+                }
+            }
+        }
+        drop(kw);
+        // Once kernel_writing finishes, the next guard covers block 10 cleanly.
+        assert_eq!(super::guard(one, one + 20 * PAGE), Some(vec![b1 + 10]));
+        assert_eq!(super::guard(one, one + 20 * PAGE), Some(Vec::new()));
+
+        super::title_memory_unmapping(one, SIZE);
+        super::title_memory_unmapping(two, SIZE);
+        crate::inplace::views_gone(one, SIZE);
+        crate::inplace::views_gone(two, SIZE);
+        // SAFETY: teardown of test mappings and section.
+        unsafe {
+            windows_sys::Win32::System::Memory::UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ });
+            windows_sys::Win32::System::Memory::UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: two as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
     }
 }

@@ -243,9 +243,22 @@ const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 #[cfg(windows)]
 fn idle_most() -> (usize, u64) {
     if crate::residency::compact_host_ram() {
-        (320, 64 << 20)
+        (448, 64 << 20)
     } else {
         IDLE_MOST
+    }
+}
+
+#[cfg(any(windows, test))]
+fn idle_trim_keep(compact: bool, shared_pressured: bool, critical: bool) -> usize {
+    if critical {
+        128
+    } else if shared_pressured {
+        256
+    } else if compact {
+        384
+    } else {
+        256
     }
 }
 
@@ -271,13 +284,11 @@ pub(crate) fn trim_idle_to(keep: usize) {
 #[cfg(windows)]
 pub(crate) fn trim_idle() {
     thin::trim_idle();
-    let keep = if crate::residency::compact_host_ram() {
-        if crate::residency::critical_commit() { 128 } else { 256 }
-    } else if crate::residency::critical_commit() {
-        128
-    } else {
-        256
-    };
+    let keep = idle_trim_keep(
+        crate::residency::compact_host_ram(),
+        crate::residency::shared_pressured(),
+        crate::residency::critical_commit(),
+    );
     trim_idle_to(keep);
 }
 
@@ -2632,5 +2643,16 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn idle_trim_keep_scales_with_compact_ram_and_pressure() {
+        assert_eq!(idle_trim_keep(true, false, false), 384);
+        assert_eq!(idle_trim_keep(true, true, false), 256);
+        assert_eq!(idle_trim_keep(true, true, true), 128);
+        assert_eq!(idle_trim_keep(true, false, true), 128);
+        assert_eq!(idle_trim_keep(false, false, false), 256);
+        assert_eq!(idle_trim_keep(false, true, false), 256);
+        assert_eq!(idle_trim_keep(false, false, true), 128);
     }
 }

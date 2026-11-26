@@ -225,7 +225,7 @@ impl HostList {
                 from.refresh(self, src as u64, len as u64);
                 let offset = from.offset(src as u64);
                 if from.buffer.as_raw() == to.buffer.as_raw() {
-                    let Some(between) = self.between(host, len as u64) else {
+                    let Some(between) = self.place_copy_between(host, len as u64) else {
                         return false;
                     };
                     unsafe {
@@ -233,6 +233,7 @@ impl HostList {
                         self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
                         wait_for_all(host, &self.list);
                         self.list.CopyBufferRegion(&to.buffer, at, &between, 0, len as u64);
+                        self.list.ResourceBarrier(&[transition(&between, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
                     }
                 } else {
                     unsafe { self.list.CopyBufferRegion(&to.buffer, at, &from.buffer, offset, len as u64) };
@@ -287,9 +288,34 @@ impl HostList {
 
     /// A buffer on the card for this recording alone.
     fn between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
-        let buffer = host.uav_buffer(len.next_multiple_of(1 << 16))?;
+        let buffer = host.uav_buffer_private(len.next_multiple_of(1 << 16))?;
         name(&buffer, || "bytes between copies".into());
         self.keep(&buffer);
+        Some(buffer)
+    }
+
+    /// Reusable private intermediate buffer for overlapping self-copies on `self`,
+    /// left in `D3D12_RESOURCE_STATE_COMMON` between uses and across list resets.
+    fn place_copy_between(&self, host: &Host, len: u64) -> Option<ID3D12Resource> {
+        let needed = len.max(1).next_multiple_of(64 << 10);
+        let mut slot = self.place_between.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buffer, cap)) = &*slot
+            && *cap >= needed
+        {
+            return Some(buffer.clone());
+        }
+        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let alloc = prev
+            .saturating_mul(2)
+            .max(needed)
+            .next_multiple_of(64 << 10);
+        let buffer = host.uav_buffer_private(alloc)?;
+        name(&buffer, || "bytes between copies".into());
+        let old = slot.replace((buffer.clone(), alloc));
+        drop(slot);
+        if let Some((old_buf, _)) = old {
+            self.keep(&old_buf);
+        }
         Some(buffer)
     }
 
