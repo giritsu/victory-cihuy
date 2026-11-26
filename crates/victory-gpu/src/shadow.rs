@@ -4856,6 +4856,7 @@ impl Shadow {
     /// came that is not noted yet. Looked at after the note, whatever comes
     /// later has a number above it: a write of the title's takes the block's
     /// bit, until an asking has noted it.
+    #[allow(dead_code)]
     pub(crate) fn landed(&self, block: usize, before: u64, now: u64) -> bool {
         let Some(page) = block.checked_sub(self.start as usize / PAGE) else {
             return false;
@@ -4869,6 +4870,27 @@ impl Shadow {
             copied.set_page(page, at.max(now));
         }
         held
+    }
+
+    /// Batched [`Self::landed`]: acquires `self.copied` once for all blocks
+    /// landed beside the guards through this copy.
+    pub(crate) fn landed_many(&self, blocks: &[(usize, u64)], now: u64) -> u64 {
+        let base = self.start as usize / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = 0u64;
+        for &(block, before) in blocks {
+            let Some(page) = block.checked_sub(base) else {
+                continue;
+            };
+            let Some(&at) = copied.pages.get(page) else {
+                continue;
+            };
+            if at != 0 && at >= before && crate::watch::block_published(block) {
+                copied.set_page(page, at.max(now));
+                kept += 1;
+            }
+        }
+        kept
     }
 }
 

@@ -29,7 +29,7 @@
 //! [`crate::watch::landed_beside`] notes the blocks written afterwards, so
 //! that the next refresh takes them as before.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 /// The unit pieces are cut in (of title memory), and the guards' blocks.
@@ -200,6 +200,9 @@ struct Pool {
     state: Mutex<State>,
     more: Condvar,
     idle: Condvar,
+    /// Lock-free index cursor and panic flag during an active batch.
+    next: AtomicUsize,
+    panicked: AtomicBool,
     /// One batch at a time.
     turn: Mutex<()>,
     threads: usize,
@@ -208,11 +211,9 @@ struct Pool {
 struct State {
     /// What to do with each number below `count`.
     work: Option<Work>,
-    next: usize,
     count: usize,
     /// Helpers inside a call.
     running: usize,
-    panicked: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -229,9 +230,11 @@ impl Pool {
 
     fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
-            state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
+            state: Mutex::new(State { work: None, count: 0, running: 0 }),
             more: Condvar::new(),
             idle: Condvar::new(),
+            next: AtomicUsize::new(0),
+            panicked: AtomicBool::new(false),
             turn: Mutex::new(()),
             threads,
         }));
@@ -252,19 +255,29 @@ impl Pool {
     fn help(&self) {
         let mut state = self.state();
         loop {
-            let Some((work, i)) = take(&mut state) else {
+            while state.work.is_none() || self.next.load(Ordering::Relaxed) >= state.count {
                 state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
-                continue;
-            };
+            }
+            let work = state.work.expect("checked Some");
+            let count = state.count;
             state.running += 1;
             drop(state);
-            let working = crate::timeline::span("a landing's job");
-            // SAFETY: counted in `running`, so `each` has not returned.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
-            working.end();
+            loop {
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= count || self.panicked.load(Ordering::Relaxed) {
+                    break;
+                }
+                let working = crate::timeline::span("a landing's job");
+                // SAFETY: counted in `running`, so `each` has not returned.
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+                working.end();
+                if ran.is_err() {
+                    self.panicked.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
             state = self.state();
             state.running -= 1;
-            state.panicked |= ran.is_err();
             if state.running == 0 {
                 self.idle.notify_all();
             }
@@ -283,8 +296,10 @@ impl Pool {
         // SAFETY: the lifetime is left out only until this call returns, and
         // it does not before no helper is inside `f` and none can enter.
         let work = Work(unsafe { std::mem::transmute::<*const (dyn Fn(usize) + Sync + '_), *const (dyn Fn(usize) + Sync + 'static)>(f) });
+        self.next.store(0, Ordering::Relaxed);
+        self.panicked.store(false, Ordering::Relaxed);
         let mut state = self.state();
-        (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        (state.work, state.count) = (Some(work), count);
         drop(state);
         if count > self.threads {
             self.more.notify_all();
@@ -293,33 +308,29 @@ impl Pool {
         }
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
-                let Some((_, i)) = take(&mut self.state()) else { break };
+                let i = self.next.fetch_add(1, Ordering::Relaxed);
+                if i >= count || self.panicked.load(Ordering::Relaxed) {
+                    break;
+                }
                 f(i);
             }
         }));
+        if ran.is_err() {
+            self.panicked.store(true, Ordering::Relaxed);
+        }
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
         state.work = None;
         while state.running > 0 {
             state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
         }
-        let panicked = state.panicked;
+        let panicked = self.panicked.load(Ordering::Relaxed);
         drop(state);
         if let Err(panic) = ran {
             std::panic::resume_unwind(panic);
         }
         assert!(!panicked, "a job of landing panicked");
     }
-}
-
-/// The next number of the batch, if there is one.
-fn take(state: &mut State) -> Option<(Work, usize)> {
-    let work = state.work?;
-    if state.next >= state.count {
-        return None;
-    }
-    state.next += 1;
-    Some((work, state.next - 1))
 }
 
 /// [`Pool::each`] on the threads kept for landing.
@@ -492,7 +503,7 @@ fn anytime() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
 }
 
-/// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
+/// What a job wrote beside the guards, or into unguarded direct memory, to be noted ([`Notes::flush`]).
 #[derive(Default)]
 pub(crate) struct Notes {
     /// Pages of 4 KiB, by number.
@@ -502,6 +513,10 @@ pub(crate) struct Notes {
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    /// Pages of 4 KiB written into unguarded direct memory.
+    direct_pages: Vec<usize>,
+    /// Spans written into unguarded direct memory: address, bytes.
+    direct_spans: Vec<(usize, usize)>,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
@@ -533,30 +548,73 @@ fn taken() -> bool {
 static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Notes {
-    /// At the end of a job: what it wrote beside the guards is noted.
+    /// Folds another job's buffered notes into `self` for one combined [`Self::flush`].
+    pub(crate) fn extend(&mut self, mut other: Notes) {
+        fn append_vec<T>(dst: &mut Vec<T>, src: &mut Vec<T>) {
+            if dst.is_empty() {
+                *dst = std::mem::take(src);
+            } else {
+                dst.append(src);
+            }
+        }
+        append_vec(&mut self.pages, &mut other.pages);
+        append_vec(&mut self.spans, &mut other.spans);
+        append_vec(&mut self.landed, &mut other.landed);
+        append_vec(&mut self.direct_pages, &mut other.direct_pages);
+        append_vec(&mut self.direct_spans, &mut other.direct_spans);
+    }
+
+    /// At the end of a job or landing: what it wrote beside the guards (and
+    /// into unguarded direct memory) is noted.
     pub(crate) fn flush(&mut self) {
-        if self.pages.is_empty() {
+        if self.pages.is_empty() && self.direct_pages.is_empty() {
             return;
         }
         let noting = std::time::Instant::now();
-        let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
-        TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
-        if taken() {
-            for (block, before) in blocks {
-                let mut through = self.landed.iter().filter(|l| l.0 == block).map(|l| l.1);
-                let Some(copy) = through.next() else {
-                    continue;
-                };
-                if !copy.is_null() && through.all(|other| other == copy) {
-                    // SAFETY: the job holds its copies until this is done.
-                    let copy = unsafe { &*copy };
-                    TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now)), Ordering::Relaxed);
+        if !self.pages.is_empty() {
+            let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
+            TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
+            if taken() && !self.landed.is_empty() {
+                self.landed.sort_unstable_by_key(|l| l.0);
+                let mut unique: Vec<(usize, usize)> = Vec::with_capacity(self.landed.len());
+                for &(block, copy) in &self.landed {
+                    let ptr = copy as usize;
+                    match unique.last_mut() {
+                        Some(last) if last.0 == block => {
+                            if last.1 != ptr {
+                                last.1 = 0;
+                            }
+                        }
+                        _ => unique.push((block, ptr)),
+                    }
+                }
+                let mut by_copy: Vec<(usize, usize, u64)> = Vec::with_capacity(blocks.len());
+                for (block, before) in blocks {
+                    if let Ok(idx) = unique.binary_search_by_key(&block, |u| u.0)
+                        && unique[idx].1 != 0
+                    {
+                        by_copy.push((unique[idx].1, block, before));
+                    }
+                }
+                by_copy.sort_unstable_by_key(|entry| entry.0);
+                let mut entries: Vec<(usize, u64)> = Vec::new();
+                for chunk in by_copy.chunk_by(|a, b| a.0 == b.0) {
+                    entries.clear();
+                    entries.extend(chunk.iter().map(|&(_, block, before)| (block, before)));
+                    // SAFETY: the caller holds the copies until this flush finishes.
+                    let copy = unsafe { &*(chunk[0].0 as *const crate::shadow::Shadow) };
+                    TAKEN[1].fetch_add(copy.landed_many(&entries, now), Ordering::Relaxed);
                 }
             }
+        }
+        if !self.direct_pages.is_empty() {
+            crate::watch::landed_direct(&self.direct_pages, &self.direct_spans);
         }
         self.pages.clear();
         self.spans.clear();
         self.landed.clear();
+        self.direct_pages.clear();
+        self.direct_spans.clear();
         spent(stat::NOTES, noting);
     }
 }
@@ -608,32 +666,37 @@ unsafe fn piece_at(
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
     // The pages that differ, before any is written: none, and the guard
-    // stays; else it is opened once for the piece.
+    // stays; else it is opened once for the piece. Unguarded direct pieces
+    // merge in a single pass and batch `LANDED`/`remapped` notifications.
     let mut differing = [true; BLOCK / PAGE + 1];
     let base = title / PAGE;
+    let has_guards = beside.is_none() && crate::watch::guards_any(title, end);
     if beside.is_none() {
         drop(reading);
-        differing.fill(false);
-        for_pages(title, parts, |from, n| {
-            // SAFETY: the caller's.
-            if unsafe { crate::safecopy::differ(now.add(from), held.add(from), n) } {
-                differing[(title + from) / PAGE - base] = true;
-            }
-        });
-        let Some(first) = differing.iter().position(|&d| d) else {
-            for_pages(title, parts, |_, _| count(stat::PAGES, 1));
-            return 0;
-        };
-        let last = differing.iter().rposition(|&d| d).unwrap_or(first);
-        let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
-        let opening = std::time::Instant::now();
-        crate::watch::landing(from, to - from);
-        spent(stat::NOTES, opening);
+        if has_guards {
+            differing.fill(false);
+            for_pages(title, parts, |from, n| {
+                // SAFETY: the caller's.
+                if unsafe { crate::safecopy::differ(now.add(from), held.add(from), n) } {
+                    differing[(title + from) / PAGE - base] = true;
+                }
+            });
+            let Some(first) = differing.iter().position(|&d| d) else {
+                for_pages(title, parts, |_, _| count(stat::PAGES, 1));
+                return 0;
+            };
+            let last = differing.iter().rposition(|&d| d).unwrap_or(first);
+            let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
+            let opening = std::time::Instant::now();
+            crate::watch::landing(from, to - from);
+            spent(stat::NOTES, opening);
+        }
     }
     let into = beside.unwrap_or(title);
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    let mut direct_span: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
@@ -666,13 +729,19 @@ unsafe fn piece_at(
         missing += u64::from(!done.there);
         if done.new > 0 {
             new_pages += 1;
+            let page = (title + from) / PAGE;
             if beside.is_some() {
-                let page = (title + from) / PAGE;
                 // (Two parts in one page.)
                 if notes.pages.last() != Some(&page) {
                     notes.pages.push(page);
                 }
                 let s = span.get_or_insert((title + from, title + from + n));
+                s.1 = title + from + n;
+            } else if !has_guards {
+                if notes.direct_pages.last() != Some(&page) {
+                    notes.direct_pages.push(page);
+                }
+                let s = direct_span.get_or_insert((title + from, title + from + n));
                 s.1 = title + from + n;
             }
         }
@@ -683,6 +752,9 @@ unsafe fn piece_at(
         // block then has two.
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
+    }
+    if let Some((from, to)) = direct_span {
+        notes.direct_spans.push((from, to - from));
     }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);

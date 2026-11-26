@@ -94,6 +94,28 @@ std::arch::global_asm!(
     "jz 6f",
     "vpcmpeqd ymm5, ymm5, ymm5",
     "2:",
+    "cmp r9, 4",
+    "jb 20f",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpxor ymm0, ymm0, ymmword ptr [r8]",
+    "vmovdqu ymm1, ymmword ptr [rdx + 32]",
+    "vpxor ymm1, ymm1, ymmword ptr [r8 + 32]",
+    "vmovdqu ymm2, ymmword ptr [rdx + 64]",
+    "vpxor ymm2, ymm2, ymmword ptr [r8 + 64]",
+    "vmovdqu ymm3, ymmword ptr [rdx + 96]",
+    "vpxor ymm3, ymm3, ymmword ptr [r8 + 96]",
+    "vpor ymm0, ymm0, ymm1",
+    "vpor ymm2, ymm2, ymm3",
+    "vpor ymm0, ymm0, ymm2",
+    "vptest ymm0, ymm0",
+    "jnz 20f",
+    "add rcx, 128",
+    "add rdx, 128",
+    "add r8, 128",
+    "sub r9, 4",
+    "jnz 2b",
+    "jmp 6f",
+    "20:",
     "vmovdqu ymm0, ymmword ptr [rdx]",
     "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
     "vpmovmskb eax, ymm1",
@@ -517,6 +539,58 @@ mod tests {
             // SAFETY: as above.
             let again = unsafe { merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, false) };
             assert_eq!(again, Merged { new: 0, dwords: 0, there: true });
+        }
+    }
+
+    #[test]
+    fn merge_fast_skip_handles_4k_sparse_and_fault_mid_buffer() {
+        assert!(on());
+        let pages = Pages::new(2 << 12);
+        let len = 4096usize;
+        let base: Vec<u8> = (0..len).map(|i| (i * 17 + 3) as u8).collect();
+        let mut held = base.clone();
+        let mut now = base.clone();
+        // Equal fast-skip path over 4096 bytes.
+        // SAFETY: valid test allocation and buffers of 4096 bytes.
+        let eq = unsafe {
+            std::ptr::copy_nonoverlapping(base.as_ptr(), pages.0, len);
+            merge(pages.0, now.as_ptr(), held.as_mut_ptr(), len, true)
+        };
+        assert_eq!(eq, Merged { new: 0, dwords: 0, there: true });
+
+        // Sparse mutations spanning 128-byte fast-skip boundaries.
+        let offsets = [0usize, 31, 32, 95, 96, 127, 128, 255, 4095];
+        for &o in &offsets {
+            now[o] ^= 0x3C;
+        }
+        // SAFETY: valid test allocation and buffers of 4096 bytes.
+        let done = unsafe { merge(pages.0, now.as_ptr(), held.as_mut_ptr(), len, false) };
+        assert!(done.there);
+        assert_eq!(done.new, 7);
+        assert_eq!(held, now);
+        // SAFETY: inside `pages` allocation.
+        assert_eq!(unsafe { std::slice::from_raw_parts(pages.0, len) }, now);
+
+        // Fault on decommitted second 4 KiB page mid-buffer with `take = false` vs `take = true`.
+        let base2: Vec<u8> = (0..8192).map(|i| (i * 17 + 3) as u8).collect();
+        let mut now2 = base2.clone();
+        now2[64] ^= 0xFF;
+        now2[4096 + 96] ^= 0xFF;
+        let mut held_keep = base2.clone();
+        let mut held_take = base2.clone();
+        // SAFETY: valid 8 KiB allocation with second page decommitted then recommitted.
+        unsafe {
+            std::ptr::copy_nonoverlapping(base2.as_ptr(), pages.0, 4096);
+            VirtualFree(pages.0.add(4096).cast(), 4096, MEM_DECOMMIT);
+            let res_keep = merge(pages.0, now2.as_ptr(), held_keep.as_mut_ptr(), 8192, false);
+            assert!(!res_keep.there);
+            assert_eq!(held_keep[64], now2[64]);
+            assert_eq!(held_keep[4096 + 96], base2[4096 + 96]);
+
+            let res_take = merge(pages.0, now2.as_ptr(), held_take.as_mut_ptr(), 8192, true);
+            assert!(!res_take.there);
+            assert_eq!(held_take, now2);
+            VirtualAlloc(pages.0.add(4096).cast(), 4096, MEM_COMMIT, PAGE_READWRITE);
         }
     }
 

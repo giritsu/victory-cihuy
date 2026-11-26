@@ -3811,6 +3811,7 @@ impl RelayBack {
             let cut: Vec<(usize, usize)> = order.iter().map(|&p| (start(pieces[p].0) + pieces[p].1, pieces[p].2)).collect();
             let jobs = land::jobs(&cut);
             let put: Vec<std::sync::atomic::AtomicU64> = self.work.iter().map(|_| Default::default()).collect();
+            let job_notes: Vec<std::sync::Mutex<land::Notes>> = (0..jobs.len()).map(|_| std::sync::Mutex::default()).collect();
             land::each(jobs.len(), &|j| {
                 let working = std::time::Instant::now();
                 let mut notes = land::Notes::default();
@@ -3818,9 +3819,14 @@ impl RelayBack {
                     let (i, at, n) = pieces[p];
                     put[i].fetch_add(self.work[i].0.land_back(at, n, &mut notes), Ordering::Relaxed);
                 }
-                notes.flush();
+                *job_notes[j].lock().unwrap_or_else(|e| e.into_inner()) = notes;
                 land::spent(land::stat::BACK_ALL, working);
             });
+            let mut merged = land::Notes::default();
+            for notes in job_notes {
+                merged.extend(notes.into_inner().unwrap_or_else(|e| e.into_inner()));
+            }
+            merged.flush();
             land::count(land::stat::JOBS, jobs.len() as u64);
             written.extend(put.iter().map(|p| p.load(Ordering::Relaxed)));
         } else {
@@ -5113,6 +5119,7 @@ impl Host {
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
             let jobs = land::jobs(&titles);
             let put = std::sync::atomic::AtomicU64::new(0);
+            let job_notes: Vec<std::sync::Mutex<land::Notes>> = (0..jobs.len()).map(|_| std::sync::Mutex::default()).collect();
             land::each(jobs.len(), &|j| {
                 let working = std::time::Instant::now();
                 if let Some(check) = &check {
@@ -5130,9 +5137,14 @@ impl Host {
                     // for this call.
                     put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
                 }
-                notes.flush();
+                *job_notes[j].lock().unwrap_or_else(|e| e.into_inner()) = notes;
                 land::spent(land::stat::CARD_ALL, working);
             });
+            let mut merged = land::Notes::default();
+            for notes in job_notes {
+                merged.extend(notes.into_inner().unwrap_or_else(|e| e.into_inner()));
+            }
+            merged.flush();
             land::count(land::stat::JOBS, jobs.len() as u64);
             written = put.into_inner();
         } else {

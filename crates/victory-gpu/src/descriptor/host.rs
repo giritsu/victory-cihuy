@@ -900,6 +900,43 @@ pub(crate) fn remapped(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
+/// Batched [`remapped`] across multiple `(address, bytes)` spans under one
+/// lock of [`REMAPPED`].
+pub(crate) fn remapped_batch(spans: &[(usize, usize)]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MOST: usize = 1 << 15;
+    if spans.is_empty() {
+        return;
+    }
+    let lo = SPANNED[0].load(Relaxed);
+    let hi = SPANNED[1].load(Relaxed);
+    if !spans.iter().any(|&(at, len)| len > 0 && at.saturating_add(len) as u64 > lo && (at as u64) < hi) {
+        return;
+    }
+    let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
+    for &(at, len) in spans {
+        if len == 0 {
+            continue;
+        }
+        let (start, end) = (at as u64, at.saturating_add(len) as u64);
+        if end <= lo || start >= hi {
+            continue;
+        }
+        STALE[1].fetch_add(1, Relaxed);
+        if let Some(last) = ranges.last_mut()
+            && last.1 == start
+        {
+            last.1 = end;
+            continue;
+        }
+        if ranges.len() >= MOST {
+            STALE[2].fetch_add(ranges.len() as u64, Relaxed);
+            ranges.clear();
+        }
+        ranges.push((start, end));
+    }
+}
+
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
 /// several threads map and write, some 5,000 ranges a frame, the same
 /// textures' over and over, and each was looked up).
@@ -3702,6 +3739,16 @@ impl HostHeap {
         self.made.get(index).unwrap_or(0) == 0
     }
 
+    /// Lock-free check whether `quick` already records `key` for slot `index`.
+    #[inline]
+    pub(crate) fn quick_matches(&self, index: u32, key: u64) -> bool {
+        quick_mirror()
+            && self
+                .quick
+                .get(index as usize)
+                .is_some_and(|k| k.load(std::sync::atomic::Ordering::Acquire) == key)
+    }
+
     /// Slot `index` is made from record `key` and stays so (0: not). Under
     /// the lock of `made`.
     fn quick_is(&self, index: u32, key: u64) {
@@ -4964,9 +5011,14 @@ impl Copied<'_> {
 
 /// The records (`step` bytes each, the first is slot `first`) that differ
 /// between `last` and `records` (of one length) go into `out` and `last`.
-/// Most of a changed page is as it was: it is looked at sixteen records at a
-/// time.
+/// Most of a changed page is as it was: it is skipped 128 bytes at a time
+/// when `step == 32` on AVX2 CPUs.
 fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out: &mut Vec<u32>) {
+    if step == 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: `std::is_x86_feature_detected!("avx2")` verified above; `last` and `records` are disjoint slices.
+        unsafe { changed_records_32_avx2(last, records, first, out) };
+        return;
+    }
     const AT_A_TIME: usize = 16;
     let block = AT_A_TIME * step;
     for (b, (old, new)) in last.chunks_mut(block).zip(records.chunks(block)).enumerate() {
@@ -4982,20 +5034,101 @@ fn changed_records(last: &mut [u8], records: &[u8], step: usize, first: u32, out
     }
 }
 
+/// AVX2-accelerated 32-byte record diff/update checking 4 records (128 B) per step.
+///
+/// # Safety
+/// Requires AVX2 support and caller-guaranteed valid `last`/`records` slices.
+#[target_feature(enable = "avx2")]
+unsafe fn changed_records_32_avx2(last: &mut [u8], records: &[u8], first: u32, out: &mut Vec<u32>) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_loadu_si256, _mm256_or_si256, _mm256_storeu_si256, _mm256_testz_si256, _mm256_xor_si256,
+    };
+    let n = last.len().min(records.len()) / 32;
+    let lp = last.as_mut_ptr();
+    let np = records.as_ptr();
+    let mut i = 0usize;
+    while i + 4 <= n {
+        // SAFETY: `i + 4 <= n` keeps all four 32-byte loads inside `last` and `records`.
+        unsafe {
+            let b0 = _mm256_loadu_si256(np.add(i * 32).cast::<__m256i>());
+            let b1 = _mm256_loadu_si256(np.add((i + 1) * 32).cast::<__m256i>());
+            let b2 = _mm256_loadu_si256(np.add((i + 2) * 32).cast::<__m256i>());
+            let b3 = _mm256_loadu_si256(np.add((i + 3) * 32).cast::<__m256i>());
+            let d0 = _mm256_xor_si256(_mm256_loadu_si256(lp.add(i * 32).cast::<__m256i>()), b0);
+            let d1 = _mm256_xor_si256(_mm256_loadu_si256(lp.add((i + 1) * 32).cast::<__m256i>()), b1);
+            let d2 = _mm256_xor_si256(_mm256_loadu_si256(lp.add((i + 2) * 32).cast::<__m256i>()), b2);
+            let d3 = _mm256_xor_si256(_mm256_loadu_si256(lp.add((i + 3) * 32).cast::<__m256i>()), b3);
+            let any = _mm256_or_si256(_mm256_or_si256(d0, d1), _mm256_or_si256(d2, d3));
+            if _mm256_testz_si256(any, any) == 0 {
+                if _mm256_testz_si256(d0, d0) == 0 {
+                    _mm256_storeu_si256(lp.add(i * 32).cast::<__m256i>(), b0);
+                    out.push(first + i as u32);
+                }
+                if _mm256_testz_si256(d1, d1) == 0 {
+                    _mm256_storeu_si256(lp.add((i + 1) * 32).cast::<__m256i>(), b1);
+                    out.push(first + (i + 1) as u32);
+                }
+                if _mm256_testz_si256(d2, d2) == 0 {
+                    _mm256_storeu_si256(lp.add((i + 2) * 32).cast::<__m256i>(), b2);
+                    out.push(first + (i + 2) as u32);
+                }
+                if _mm256_testz_si256(d3, d3) == 0 {
+                    _mm256_storeu_si256(lp.add((i + 3) * 32).cast::<__m256i>(), b3);
+                    out.push(first + (i + 3) as u32);
+                }
+            }
+        }
+        i += 4;
+    }
+    while i < n {
+        // SAFETY: `i < n` keeps the 32-byte load/store inside `last` and `records`.
+        unsafe {
+            let b = _mm256_loadu_si256(np.add(i * 32).cast::<__m256i>());
+            let d = _mm256_xor_si256(_mm256_loadu_si256(lp.add(i * 32).cast::<__m256i>()), b);
+            if _mm256_testz_si256(d, d) == 0 {
+                _mm256_storeu_si256(lp.add(i * 32).cast::<__m256i>(), b);
+                out.push(first + i as u32);
+            }
+        }
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod changed_records_tests {
     use super::changed_records;
 
     #[test]
     fn changed_records_are_those_that_differ_one_by_one() {
-        for (step, count) in [(32usize, 128usize), (32, 2048), (16, 77), (32, 5), (32, 17)] {
-            let mut seed = 7u64;
+        for (step, count) in [
+            (32usize, 0usize),
+            (32, 1),
+            (32, 3),
+            (32, 4),
+            (32, 5),
+            (32, 7),
+            (32, 8),
+            (32, 15),
+            (32, 16),
+            (32, 17),
+            (32, 64),
+            (32, 128),
+            (32, 255),
+            (32, 2048),
+            (16, 77),
+        ] {
+            let mut seed = 7u64 ^ count as u64;
             let mut random = move || {
                 seed = seed.wrapping_mul(0x5851_F42D_4C95_7F2D).wrapping_add(0x1405_7B7E_F767_814F);
                 (seed >> 33) as usize
             };
             let mut last: Vec<u8> = (0..step * count).map(|_| random() as u8).collect();
             let mut now = last.clone();
+            let mut out = Vec::new();
+            // All identical fast path.
+            changed_records(&mut last, &now, step, 1000, &mut out);
+            assert!(out.is_empty());
+
             let mut differ = Vec::new();
             for slot in 0..count {
                 if random() % 9 == 0 {
@@ -5003,9 +5136,8 @@ mod changed_records_tests {
                     differ.push(1000 + slot as u32);
                 }
             }
-            let mut out = Vec::new();
             changed_records(&mut last, &now, step, 1000, &mut out);
-            assert_eq!(out, differ);
+            assert_eq!(out, differ, "step={step} count={count}");
             assert_eq!(last, now);
             out.clear();
             changed_records(&mut last, &now, step, 1000, &mut out);
