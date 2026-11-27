@@ -4608,8 +4608,25 @@ impl State {
             );
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let mut list_epoch = list.epoch();
+            let list_refresh_epoch = list.refresh_epoch();
+            let by_desc = &group.by_descriptor;
+            let sel_slice = &*selected;
+            let mut bd_pos = 0usize;
+            let mut sel_pos = 0usize;
             host.with_table_views(frame, n, |tv| {
                 for k in 0..n {
+                    while bd_pos < by_desc.len() && by_desc[bd_pos].0 < k {
+                        bd_pos += 1;
+                    }
+                    let used = by_desc
+                        .get(bd_pos)
+                        .filter(|item| item.0 == k)
+                        .map(|item| &entries[item.1]);
+                    while sel_pos < sel_slice.len() && sel_slice[sel_pos] < k {
+                        sel_pos += 1;
+                    }
+                    let is_selected = sel_slice.get(sel_pos).copied() == Some(k);
                     let index = first + k;
                     let handle = table + u64::from(k) * 32;
                     let words = crate::descriptor::record_at(handle);
@@ -4662,14 +4679,12 @@ impl State {
                             index,
                             copy_batch,
                             |listed, cached| {
-                                let kind = group
-                                    .entry(k)
+                                let kind = used
                                     .map(|u| u.kind)
-                                    .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                                    .or_else(|| is_selected.then_some(listed.kind).flatten());
                                 if let Some(kind) = kind {
                                     if !listed.texture && kind == ResourceType::Srv {
-                                        let refresh_epoch = list.refresh_epoch();
-                                        if listed.ready.0 != refresh_epoch {
+                                        if listed.ready.0 != list_refresh_epoch {
                                             #[cfg(feature = "diagnostics")]
                                             let rb = std::time::Instant::now();
                                             readable_cached(list, kind, cached);
@@ -4679,11 +4694,11 @@ impl State {
                                                 d_readable += 1;
                                                 d_r_buf += 1;
                                             }
-                                            listed.ready = (refresh_epoch, 0, false);
+                                            listed.ready = (list_refresh_epoch, 0, false);
                                         }
                                     } else if listed.texture && kind == ResourceType::Srv {
                                         let tested = TESTED_DEPTH.get();
-                                        if listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                                        if listed.ready.0 == list_epoch && listed.ready.1 == tested.0 {
                                             if listed.ready.2 {
                                                 TESTED_DEPTH.set((tested.0, true));
                                             }
@@ -4693,6 +4708,7 @@ impl State {
                                             #[cfg(feature = "diagnostics")]
                                             let rb = std::time::Instant::now();
                                             readable_cached(list, kind, cached);
+                                            list_epoch = list.epoch();
                                             #[cfg(feature = "diagnostics")]
                                             {
                                                 d_r_ns += rb.elapsed().as_nanos() as u64;
@@ -4702,13 +4718,14 @@ impl State {
                                             let depth = TESTED_DEPTH.get().1;
                                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                                             if !crate::residency::take_staging_deferred() {
-                                                listed.ready = (list.epoch(), tested.0, depth);
+                                                listed.ready = (list_epoch, tested.0, depth);
                                             }
                                         }
                                     } else {
                                         #[cfg(feature = "diagnostics")]
                                         let rb = std::time::Instant::now();
                                         readable_cached(list, kind, cached);
+                                        list_epoch = list.epoch();
                                         #[cfg(feature = "diagnostics")]
                                         {
                                             d_r_ns += rb.elapsed().as_nanos() as u64;
@@ -4741,9 +4758,9 @@ impl State {
                         if let Some((title_slot, read)) = need_tex_tabled {
                             #[cfg(feature = "diagnostics")]
                             let mir_began = std::time::Instant::now();
-                            host.texture_slot_tabled(title_slot, read);
+                            host.texture_slot_tabled_in(title_slot, read, frame);
                             if read {
-                                host.mirror_after(list, title_slot, handle);
+                                host.mirror_after_words(list, title_slot, handle, words);
                             }
                             #[cfg(feature = "diagnostics")]
                             {
@@ -4754,8 +4771,7 @@ impl State {
                     }
                     #[cfg(feature = "diagnostics")]
                     let miss_began = std::time::Instant::now();
-                    let used = group.entry(k);
-                    if words.is_none() {
+                    let Some(words) = words else {
                         host.make_null_table_slot(index, copy_batch);
                         strides[k as usize] = 0;
                         #[cfg(feature = "diagnostics")]
@@ -4767,7 +4783,7 @@ impl State {
                             once!(slot, "a table entry without a view");
                         }
                         continue;
-                    }
+                    };
                     match crate::descriptor::view(handle) {
                         Some(View::Constant(address, size)) => {
                             #[cfg(feature = "diagnostics")]
@@ -4811,13 +4827,14 @@ impl State {
                                 d_make_miss += 1;
                                 d_miss_ns += miss_began.elapsed().as_nanos() as u64;
                             }
-                            let kind = used.map(|u| u.kind).or_else(|| {
-                                selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
-                            });
+                            let kind = used
+                                .map(|u| u.kind)
+                                .or_else(|| is_selected.then(|| view_kind(&view)).flatten());
                             if let Some(kind) = kind {
                                 #[cfg(feature = "diagnostics")]
                                 let rb = std::time::Instant::now();
                                 readable(list, kind, &view);
+                                list_epoch = list.epoch();
                                 #[cfg(feature = "diagnostics")]
                                 {
                                     d_r_ns += rb.elapsed().as_nanos() as u64;
@@ -4833,9 +4850,9 @@ impl State {
                             if crate::descriptor::host::is_texture_view(&view) {
                                 table_has_texture = true;
                                 if let Some(title) = title_first {
-                                    host.texture_slot_tabled(title + k, kind.is_some());
+                                    host.texture_slot_tabled_in(title + k, kind.is_some(), frame);
                                     if kind.is_some() {
-                                        host.mirror_after(list, title + k, handle);
+                                        host.mirror_after_words(list, title + k, handle, words);
                                     }
                                 }
                             }

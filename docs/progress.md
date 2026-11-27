@@ -1,28 +1,25 @@
-# Local PC Progress & Input Reference (2026-11-26)
+# Local PC Progress & Input Reference (2026-11-28)
 
-Workstation-specific progress tracker for running VIctory cleanly and playably on Windows 10 + 16 GB RAM + AMD Radeon RX 7600 XT 16 GB.
+Workstation-specific progress tracker for running VIctory cleanly and playably on Windows 11 + 16 GB RAM + AMD Radeon RX 7600 XT 16 GB.
 Chronological logs and deep technical notes live in [bug-journal.md](bug-journal.md) and [findings.md](findings.md).
 
 ## Target PC Specifications
 
-- **OS & Display:** Windows 10 Pro (22H2, Build 19045), 1920x1080, `--console series-s`
+- **OS & Display:** Windows 11 x64 (`Build 26300`), 4K native (`3840x2160`), `--console series-x` / `--console series-s`
 - **CPU:** AMD Ryzen 5 5600 (6 Cores / 12 Threads, Zen 3, AVX2)
-- **RAM / Pagefile:** 16 GB physical RAM + 32 GB pagefile (Windows WDDM `NON_LOCAL` Shared GPU Memory hard-capped at 50% physical RAM ≈ 7,490 MiB)
-- **GPU:** AMD Radeon RX 7600 XT (16 GB VRAM, RDNA 3, `views=2097152`, `raw_twins=true`, `mapped_card_memory=false` — D3D12 `GPUUploadHeapSupported` membutuhkan Win11 WDDM 3.2+ selain ReBAR BIOS)
-- **Runtime & Cache:** DirectX 12 Agility SDK `1.614.1` (`D3D12SDKVersion=614`), pre-compiled shader cache (`25,805` shaders in `%LOCALAPPDATA%\VIctory\cache-pareto`)
+- **RAM / Pagefile:** 16 GB physical RAM (`15.93 GB` usable) + 48–64 GB pagefile (Windows WDDM `NON_LOCAL` Shared GPU Memory hard-capped at `7,490 MiB`)
+- **GPU:** AMD Radeon RX 7600 XT (16 GB VRAM, RDNA 3, Adrenalin `26.11.2`, `views=2097152`, `raw_twins=true`, `mapped_card_memory=true` — Win11 `1536 MiB` BAR offload aktif)
+- **Runtime & Cache:** Windows 11 inbox `D3D12Core.dll` (`10.0.26100.9278` >= `614`), pre-compiled shader cache in `%LOCALAPPDATA%\VIctory\cache-pareto`
 
 ## Overall & Per-Subsystem Progress
 
 | Area | Progress | Current State |
 |---|---|---|
-| **Boot, Loader, Win10 Agility SDK & Shader Cache** | **95%** | Boots cleanly on Windows 10 (`0xC00` root signatures fixed, 29/29 upscaler pipelines created, `25,805` shader files / `914.3 MB` in `cache-pareto`). |
-| **Visual & Rendering Core (RDNA 3)** | **85%** | World, characters, textures, and lighting render cleanly across 46-min Series S campaign and Series X `diag`: Pass 8 verified **`0.0 null`** raw buffer views (eliminating distant object flicker), `0` texture evictions (`0 let go 0 MB`), `SHOW_AFTER 0.57` frames, and `UPLOAD_AHEAD 45k` (`1.4 ms` avg). |
+| **Boot, Loader, Win11 D3D12 & Shader Cache** | **96%** | Boots cleanly on Windows 11 inbox `D3D12Core.dll` (`2,006–2,161` pre-warmed pipelines, shader cache in `%LOCALAPPDATA%\VIctory\cache-pareto`). |
+| **Visual & Rendering Core (RDNA 3)** | **88%** | **0 blackscreen**, **0 error**, **`0.0 null`** raw buffer twins di 100% world frame (Series X & Series S); HUD baru (`540x354` dark telemetry panel + frametime sparkline, `F3` toggle) aktif di `release` & `diag`. |
 | **Input & Controls (XInput + Keyboard Stand-in)** | **85%** | XInput pads (slots 0–3, low/high rumble), merged `VICTORY_ONE_PAD=1` mode, full keyboard-to-pad mapping, and `F3` performance panel toggle; trigger rumble and mouse-to-camera mapping not yet implemented. |
-| **16 GB RAM / WDDM Shared GPU Stability** | **95%** | **Pass 8 verified live on Series X (`diag`, 0 crashes):** Shared GPU **`3,983 / 7,490 MiB`** (~3.5 GiB headroom), VRAM **`11,512 / 14,781 MiB`** (~3.27 GiB headroom), `544` upload buffers (`113,083` spare reuses), and `0` gameplay pressure toggles (only `1` brief `6.7 s` loading blip at `physical_free_mib=95`). |
-| **FPS Performance vs. 30 FPS Target (6C/12T CPU)** | **96%** | **Pass 31 (`Series X diag` `n=62` & `release` `n=69`, `0` error / `0` crash / `0.00` null):** `diag` `ALL` `9.85 -> 10.50 FPS`, `4k–7k 12.30 FPS`, `9k+ p90 10.50 FPS` (+22%), `list_views evict` `5,913` (`p10 = 0`), `inline_cbv 9.50 ms`, `refresh copied 65.0 MB`, `pure root_views 10.70 ms`; `release` (`avg 8,182` dr) `9k+ 8.60 FPS` med (`p10 6.80` **+31%**, `max 12.20 FPS`), `0` pressure. **Pass 32 (Series X + Ray Tracing ON default, dibangun `diag` & `release`):** mengisolasi `MEMORY_CARD_BYTES` dari `WINDOW_CARD_BYTES`, membatasi arena RT `2 GiB` di 16 GB RAM (`max_pages = 2 << 14`, VRAM `92%`, guard fallback Shared GPU), & default `play-dev.ps1` ke `series-x` + `VICTORY_BVH_BUILDER=1`. |
-
-- **Overall "Playable & Stabil di PC ini": ~90%**
-- **Overall "100% Mulus 30 FPS Konstan di Semua Scene": ~75–80%**
+| **16 GB RAM / WDDM Shared GPU Stability** | **96%** | **Clean Win11 4K (`166130e` / `9319737`):** VRAM `10.99 / 15.56 GB` (`max 11.65 GB`), Shared GPU `4.34 / 7.49 GB` (`max 5.10 GB`), `0` runtime errors, `0` pressure toggles. |
+| **FPS Performance (Fresh Win11 Optimization Track)** | **72%** | **Pass #1 (`9319737`) verified live (`Series X diag` `n=48` / `Series S diag` `n=46`, 0 error):** `direct` **`~37 ms -> 14.3 ms`** (`96.2%` hit), `VICTORY_THIN` **`359–374 -> 284.2 ms`**, `Series X 9k+` **`9.00 FPS`** (`p10 3.70 -> 4.80`), `Series S` **`10.8 FPS`** (`max 19.5`). **Pass #2 built (`listed_slot 57.8 ms` target), pending live test.** |
 
 ## Optimization Passes Summary (Pass 1–8)
 
@@ -65,6 +62,16 @@ Chronological logs and deep technical notes live in [bug-journal.md](bug-journal
 | **Pass 34** | Skip Builder Scratch `gpu_writes` (`> BACK` / `256 KiB`), Skip Untouched Static RT Arena/Directory Refreshes (`4`-frame relay window), Zero-Upgrade `card_dirty()` Fast-Path (`Arc<AtomicBool>`), HashSet `relay_card_back`, & Parallel Tree-Reduced `CARD_COMPARE` + `torn::finish` | **Verified live (`Win11 Build 26300` + `Adrenalin 26.11.2`, `Series X diag NoRT`, 4K):** World tampil bersih (**0 blackscreen**, **0 error**, **`0.0 null`** raw buffer twins per `24k–30k` raw twins, `1,874` pipelines loaded, `being made 0.0–0.3`). VRAM `9.9–10.7 / 15.56 GB`, Shared GPU `3.3–3.7 / 7.49 GB` (1× brief physical RAM pressure toggle `physical_free_mib=247`, cleared). Steady **`9.4–13.0 FPS`** (`5.6k–11.0k` draws/frame), GPU `70.2–72.9 ms` (`title 61.2–64.0`, `card_check 4.9`, `card_sync 3.5–3.8`, ~48% busy), `VICTORY_THIN 278–316 ms` (`indirect prepare/bind 144–171`, `draw::tables 126–141` [`listed_slot 63–72`, `readable 17–19`]), submit `53.7–54.1 ms` (`refreshes 19.4–19.6`, `card_steps 7.2–7.3`, `card_before 4.2–4.8`), `heap textures 20.7–24.1`, `veh_fault 24.0–24.9` (`already 15.6–15.7`). *(Commit bundel Pass 35–46 `d9c430d` yang sempat memicu blackscreen diarsipkan di branch `wadaw-pass46-backup`; optimasi ulang dimulai bertahap dari `d98e4c7`, 1 commit per pass.)* |
 
 Details: [bug-journal.md](bug-journal.md) | Hardware findings: [findings.md](findings.md).
+
+## Win11 Fresh Optimization Track (from `d98e4c7` + HUD `166130e`)
+
+Mulai ulang bersih di Windows 11 Build 26300 + Adrenalin `26.11.2` dari baseline bebas-blackscreen (`d98e4c7`, lewat revert linear `d391d1a` dan port HUD sleek `166130e`), dikerjakan terisolasi 1 pass per commit berdasarkan telemetri log terbaru:
+
+| Pass | Commit | Focus | Key Result / Status |
+|---|---|---|---|
+| **Baseline Win11 (`166130e` / `05c6e56`)** | `166130e`, `05c6e56` | Port HUD dark panel (`540x354`, `F3`) + rollback `VICTORY_OUTPUT` 1080p karena UI Scaleform Series X membesar 2× | **Verified (`Series X diag NoRT` 4K, `n=95`, `0` error / `0` blackscreen / `0.0 null`):** `ALL 7.50 FPS` (`9k+ 6.60–8.50`), `VICTORY_THIN 359–374 ms`, `bind/prepare tables 166.0 ms` vs `draw::tables 129.0 ms` (~37 ms gap `plan.direct`), `submit 67–79 ms`. |
+| **Win11 Pass #1** | `9319737` | Per-list epoch-aware `direct_ready` cache (`DirectEntry`, `view_epochs()`, `cached_readable_of`) + lockless sampler `quick_matches` + `direct` diag split | **Verified (`Series X diag` `n=48` & `Series S diag` `n=46`, `0` error / `0.0 null`):** `direct` **`~37 -> 14.3 ms`** (`96.2%` hit), `VICTORY_THIN` **`359–374 -> 284.2 ms`**, `bind/prepare tables` **`166.0 -> 142.4 ms`**, `indirect prepare/bind` **`145–170 -> 120.6 ms`**, Series X `9k+` **`9.00 FPS`** (`p10 3.70 -> 4.80`), Series S `ALL` **`10.8 FPS`** (`max 19.5`). |
+| **Win11 Pass #2** | *(pending commit)* | Compact 64-byte cache-line `BufSlot` (`HashMap<u64, u32>`, -72% L3 `~40 -> ~11.2 MiB`), zero-clone `view_home_alt` + `dedup_kept` (`kept=None` saat `CachedReadable::Buffer` pegang `Shadow` sama), 4-slot `CopyBatch` MRU, `mirror_after_words`, & O(1) slot cursors + hoisted `list_epoch` di `State::tables()` | **Built & unit-tested, pending live test** (menyasar `listed_slot 57.8 ms` med / `78.2 ms` p90). |
 
 ## Input & Hotkeys Reference
 
@@ -117,4 +124,7 @@ Details: [bug-journal.md](bug-journal.md) | Hardware findings: [findings.md](fin
 - [x] Uji live **Pass 32** di `Series X + Ray Tracing ON` (`diag`: **0 error / 0 crash / 0 pressure / 0.00 null**, VRAM `10.32 GB`, Shared `2.80 GB`, RT arenas `684 MB`; mengisolasi `501 ms/frame` pipeline wait stall pada shader RT dingin sebagai biang kerok `2.80 FPS` dengan GPU `69%` idle).
 - [x] Pre-warm shader RT (`-Warm` 1×) & uji live **Pass 33** di `Series X + Ray Tracing ON` (`diag`: `waiting for pipelines 0.00 ms`, `GPU busy 85%`, `4k–7k 6.50 FPS`; `release`: `ALL 5.90 FPS` / `max 12.70` di avg `10k` draws, `0` error / `0` crash).
 - [x] Uji live **Pass 34** di `Win11 Build 26300` + `Adrenalin 26.11.2` (`Series X diag NoRT` 4K: **0 blackscreen / 0 error / `0.0 null` raw twins**, steady `9.4–13.0 FPS`; baseline bersih sebelum optimasi ulang bertahap dari `d98e4c7`, backup Pass 35–46 ada di `wadaw-pass46-backup`).
-- [ ] **Pass 35 (Restart)**: Terapkan ulang optimasi rendah-risiko secara bertahap (1 commit per pass + uji visual tiap pass) dimulai dari 1080p display mode / `DiffersRing` / `GUARD_SHARDS=1024` / `heap_textures` & `VICTORY_THIN` hot-paths, lalu uji terpisah fitur sync/barrier/alias/shader-skip.
+- [x] **Win11 Baseline (`166130e` / `05c6e56`)**: HUD `branch-new` terpasang (`release` & `diag`), eksperimen 1080p di-revert karena 2× UI scaling, baseline 4K bersih diverifikasi (`0` blackscreen / `0.0 null`).
+- [x] **Win11 Pass #1 (`9319737`)**: `direct_ready` cache & sampler fast-path terverifikasi live (`direct ~37 -> 14.3 ms`, `96.2%` hit, `VICTORY_THIN -> 284.2 ms`, Series X `9k+ -> 9.00 FPS`, Series S `10.8 FPS`).
+- [ ] **Win11 Pass #2**: Uji live `Diag Series X` untuk ukur penurunan `listed_slot` (`57.8 ms` med / `78.2 ms` p90).
+- [ ] **Win11 Pass #3**: Optimasi `submit refreshes` (`22.5 ms` med / `41.2 ms` p90, ~86% no-op) untuk memangkas `present wait` (`29.4 ms`) & GPU idle time.
