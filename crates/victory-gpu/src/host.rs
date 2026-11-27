@@ -524,12 +524,18 @@ fn sweep() {
     let t2 = std::time::Instant::now();
     let memory = host().and_then(|h| h.video_memory());
     crate::residency::refresh(memory);
+    trim_spare_planes_if_idle();
     if crate::residency::pressured() {
+        trim_spare_planes();
         if crate::residency::critical_commit() || !crate::residency::compact_host_ram() {
             trim_spare_chunks();
+        } else {
+            trim_spare_chunks_to_limit();
         }
-        if crate::residency::compact_host_ram() || crate::residency::critical_commit() {
+        if crate::residency::critical_commit() {
             trim_spare_shared();
+        } else {
+            trim_spare_shared_to_limit();
         }
         if crate::residency::critical_commit() {
             send::trim_spare();
@@ -2053,29 +2059,123 @@ impl<T> Spare<T> {
         Some(self.kept.remove(at).0)
     }
 
-    /// Keeps `thing` (`size` bytes) unless that takes the kept bytes past
-    /// `most`: then it comes back.
-    fn give(&mut self, thing: T, size: u64, most: u64) -> Option<T> {
-        if self.bytes + size > most {
+    /// Evicts oldest entries until retained bytes fit within `most`.
+    fn trim_to(&mut self, most: u64, evicted: &mut Vec<(T, u64)>) {
+        while self.bytes > most && !self.kept.is_empty() {
+            let (old, old_size) = self.kept.remove(0);
+            self.bytes -= old_size;
+            evicted.push((old, old_size));
+        }
+    }
+
+    /// Keeps `thing` (`size` bytes), evicting the oldest entries if needed to
+    /// fit within `most`. Returns `Some(thing)` only if `size > most`.
+    fn give(&mut self, thing: T, size: u64, most: u64, evicted: &mut Vec<(T, u64)>) -> Option<T> {
+        if size > most {
+            self.trim_to(most, evicted);
             return Some(thing);
+        }
+        while self.bytes + size > most && !self.kept.is_empty() {
+            let (old, old_size) = self.kept.remove(0);
+            self.bytes -= old_size;
+            evicted.push((old, old_size));
         }
         self.bytes += size;
         self.kept.push((thing, size));
         None
     }
+
+    fn drain_all(&mut self, out: &mut Vec<(T, u64)>) {
+        if !self.kept.is_empty() {
+            self.bytes = 0;
+            out.append(&mut self.kept);
+        }
+    }
+}
+
+/// Scratch spare pool isolated between `SCRATCH_FIRST` (`256 KiB`) and
+/// `SCRATCH_CHUNK` (`4 MiB`) so large chunks cannot starve small list buffers
+/// when the shared budget tightens.
+struct ScratchSpare<T> {
+    small: Spare<T>,
+    large: Spare<T>,
+}
+
+impl<T> ScratchSpare<T> {
+    const fn new() -> Self {
+        Self {
+            small: Spare::new(),
+            large: Spare::new(),
+        }
+    }
+
+    fn limits(total: u64) -> (u64, u64) {
+        if total == 0 {
+            return (0, 0);
+        }
+        let small = (total / 2).min(48 << 20);
+        (small, total - small)
+    }
+
+    fn take(&mut self, size: u64) -> Option<T> {
+        match size {
+            SCRATCH_FIRST => self.small.take(size),
+            SCRATCH_CHUNK => self.large.take(size),
+            _ => None,
+        }
+    }
+
+    fn give(&mut self, thing: T, size: u64, total_limit: u64, evicted: &mut Vec<(T, u64)>) -> Option<T> {
+        let (small_lim, large_lim) = Self::limits(total_limit);
+        if size == SCRATCH_FIRST {
+            self.large.trim_to(large_lim, evicted);
+            self.small.give(thing, size, small_lim, evicted)
+        } else if size == SCRATCH_CHUNK {
+            self.small.trim_to(small_lim, evicted);
+            self.large.give(thing, size, large_lim, evicted)
+        } else {
+            self.trim_to(total_limit, evicted);
+            Some(thing)
+        }
+    }
+
+    fn trim_to(&mut self, total_limit: u64, evicted: &mut Vec<(T, u64)>) {
+        let (small_lim, large_lim) = Self::limits(total_limit);
+        self.small.trim_to(small_lim, evicted);
+        self.large.trim_to(large_lim, evicted);
+    }
+
+    fn drain_all(&mut self, out: &mut Vec<(T, u64)>) {
+        self.small.drain_all(out);
+        self.large.drain_all(out);
+    }
+
+    fn count(&self) -> u64 {
+        (self.small.kept.len() + self.large.kept.len()) as u64
+    }
+
+    fn bytes(&self) -> u64 {
+        self.small.bytes + self.large.bytes
+    }
 }
 
 /// Scratch chunks no list holds.
-static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+static SPARE: Mutex<ScratchSpare<Chunk>> = Mutex::new(ScratchSpare::new());
 
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+        && let Some(chunk) = {
+            let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+            let taken = spare.take(size);
+            if taken.is_some() {
+                ALIVE[3].store(spare.count(), Ordering::Relaxed);
+                ALIVE[4].store(spare.bytes(), Ordering::Relaxed);
+                ALIVE[5].fetch_add(1, Ordering::Relaxed);
+            }
+            taken
+        }
     {
-        ALIVE[3].fetch_sub(1, Ordering::Relaxed);
-        ALIVE[4].fetch_sub(size, Ordering::Relaxed);
-        ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
     let (buffer, data) = host.upload_buffer(size)?;
@@ -2091,6 +2191,27 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     })
 }
 
+fn release_chunks(freed: Vec<(Chunk, u64)>) {
+    if freed.is_empty() {
+        return;
+    }
+    let count = freed.len() as u64;
+    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
+    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
+    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
+    drop(freed);
+}
+
+fn current_scratch_spare_limit() -> u64 {
+    scratch_spare_limit(
+        crate::residency::compact_host_ram(),
+        crate::residency::limited_host_ram(),
+        keep_freed(),
+        crate::residency::shared_pressured(),
+        crate::residency::critical_commit(),
+    )
+}
+
 fn scratch_spare_limit(
     compact: bool,
     limited: bool,
@@ -2102,7 +2223,7 @@ fn scratch_spare_limit(
         if critical {
             0
         } else if shared_pressured {
-            64 << 20
+            96 << 20
         } else {
             256 << 20
         }
@@ -2120,56 +2241,115 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     if chunks.is_empty() {
         return;
     }
+    if !scratch_pool() {
+        release_chunks(chunks);
+        return;
+    }
     let mut freed = Vec::new();
     {
-        let limit = scratch_spare_limit(
-            crate::residency::compact_host_ram(),
-            crate::residency::limited_host_ram(),
-            keep_freed(),
-            crate::residency::shared_pressured(),
-            crate::residency::critical_commit(),
-        );
+        let limit = current_scratch_spare_limit();
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
-            let back = if scratch_pool() {
-                spare.give(chunk, size, limit)
-            } else {
-                Some(chunk)
-            };
-            match back {
-                None => {
-                    ALIVE[3].fetch_add(1, Ordering::Relaxed);
-                    ALIVE[4].fetch_add(size, Ordering::Relaxed);
-                }
-                Some(chunk) => {
-                    ALIVE[1].fetch_sub(1, Ordering::Relaxed);
-                    ALIVE[2].fetch_sub(size, Ordering::Relaxed);
-                    freed.push(chunk);
-                }
+            if let Some(rejected) = spare.give(chunk, size, limit, &mut freed) {
+                freed.push((rejected, size));
             }
         }
+        ALIVE[3].store(spare.count(), Ordering::Relaxed);
+        ALIVE[4].store(spare.bytes(), Ordering::Relaxed);
     }
     // Freed outside the lock.
-    drop(freed);
+    release_chunks(freed);
+}
+
+/// Trims spare scratch chunks down to the current limit instead of draining
+/// active gameplay buckets when `compact && shared_pressured`.
+fn trim_spare_chunks_to_limit() {
+    let mut freed = Vec::new();
+    {
+        let limit = current_scratch_spare_limit();
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.trim_to(limit, &mut freed);
+        ALIVE[3].store(spare.count(), Ordering::Relaxed);
+        ALIVE[4].store(spare.bytes(), Ordering::Relaxed);
+    }
+    release_chunks(freed);
 }
 
 /// Drops spare scratch chunks kept idle when host memory is pressured.
 fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
+    let mut freed = Vec::new();
+    {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
-            return;
+        spare.drain_all(&mut freed);
+        ALIVE[3].store(0, Ordering::Relaxed);
+        ALIVE[4].store(0, Ordering::Relaxed);
+    }
+    release_chunks(freed);
+}
+
+const PLANE_SPARE_MOST: u64 = 32 << 20;
+const PLANE_IDLE_MS: u64 = 10_000;
+static SPARE_PLANES: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
+static LAST_PLANE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn plane_spare_limit(shared_pressured: bool, critical: bool) -> u64 {
+    if shared_pressured || critical {
+        0
+    } else {
+        PLANE_SPARE_MOST
+    }
+}
+
+fn take_plane_chunk(host: &Host, size: u64) -> Option<Chunk> {
+    LAST_PLANE_MS.store(coarse_ms(), Ordering::Relaxed);
+    if let Some(chunk) = SPARE_PLANES.lock().unwrap_or_else(|e| e.into_inner()).take(size) {
+        return Some(chunk);
+    }
+    let (buffer, data) = host.upload_buffer(size)?;
+    // SAFETY: a live upload buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    name(&buffer, || format!("plane upload {size:#x}"));
+    Some(Chunk {
+        buffer,
+        data: data as usize,
+        gpu,
+    })
+}
+
+fn give_plane_chunks(chunks: Vec<(Chunk, u64)>) {
+    if chunks.is_empty() {
+        return;
+    }
+    let mut freed = Vec::new();
+    {
+        let limit = plane_spare_limit(
+            crate::residency::shared_pressured(),
+            crate::residency::critical_commit(),
+        );
+        let mut spare = SPARE_PLANES.lock().unwrap_or_else(|e| e.into_inner());
+        for (chunk, size) in chunks {
+            if let Some(rejected) = spare.give(chunk, size, limit, &mut freed) {
+                freed.push((rejected, size));
+            }
         }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
-    };
-    let count = freed.len() as u64;
-    let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
-    ALIVE[1].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[2].fetch_sub(bytes, Ordering::Relaxed);
-    ALIVE[3].fetch_sub(count, Ordering::Relaxed);
-    ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
+    }
     drop(freed);
+}
+
+fn trim_spare_planes() {
+    let mut freed = Vec::new();
+    SPARE_PLANES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain_all(&mut freed);
+    drop(freed);
+}
+
+fn trim_spare_planes_if_idle() {
+    let last = LAST_PLANE_MS.load(Ordering::Relaxed);
+    if last != 0 && coarse_ms().saturating_sub(last) >= PLANE_IDLE_MS {
+        trim_spare_planes();
+    }
 }
 
 struct SharedUpload {
@@ -2224,23 +2404,36 @@ fn give_shared_uploads(uploads: Vec<(SharedUpload, u64)>) {
         );
         let mut spare = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner());
         for (shared, size) in uploads {
-            if let Some(dropped) = spare.give(shared, size, limit) {
-                freed.push(dropped);
+            if let Some(rejected) = spare.give(shared, size, limit, &mut freed) {
+                freed.push((rejected, size));
             }
         }
     }
     drop(freed);
 }
 
+fn trim_spare_shared_to_limit() {
+    let mut freed = Vec::new();
+    {
+        let limit = shared_spare_limit(
+            crate::residency::compact_host_ram(),
+            crate::residency::shared_pressured(),
+            crate::residency::critical_commit(),
+        );
+        SPARE_SHARED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .trim_to(limit, &mut freed);
+    }
+    drop(freed);
+}
+
 fn trim_spare_shared() {
-    let freed: Vec<(SharedUpload, u64)> = {
-        let mut spare = SPARE_SHARED.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
-            return;
-        }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
-    };
+    let mut freed = Vec::new();
+    SPARE_SHARED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain_all(&mut freed);
     drop(freed);
 }
 
@@ -2518,6 +2711,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Pooled CPU upload chunks kept through this list's fence (`upload_cpu`).
+    cpu_uploads: Vec<(Chunk, u64)>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
     /// Pooled shared upload buffers kept through this list's fence (`card_steps` stage > 1).
@@ -2581,7 +2776,8 @@ impl Deferred {
     /// Clears recorded steps and held objects for list reuse while retaining
     /// moderate container capacities (capping extreme outlier buffers).
     fn clear(&mut self) {
-        give_chunks(std::mem::take(&mut self.plane_uploads));
+        give_chunks(std::mem::take(&mut self.cpu_uploads));
+        give_plane_chunks(std::mem::take(&mut self.plane_uploads));
         give_shared_uploads(std::mem::take(&mut self.shared_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
@@ -2628,7 +2824,8 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
-        give_chunks(std::mem::take(&mut self.plane_uploads));
+        give_chunks(std::mem::take(&mut self.cpu_uploads));
+        give_plane_chunks(std::mem::take(&mut self.plane_uploads));
         give_shared_uploads(std::mem::take(&mut self.shared_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
@@ -4399,6 +4596,7 @@ impl Host {
         }
         crate::residency::allocation_error(err);
         send::trim_spare();
+        trim_spare_planes();
         trim_spare_chunks();
         trim_spare_shared();
         if drain_idle_lists {
@@ -4713,6 +4911,7 @@ impl Host {
             && dirty.iter().any(|(_, ranges)| !ranges.is_empty())
         {
             send::trim_spare();
+            trim_spare_planes();
             trim_spare_chunks();
             crate::pool::room(self.video_memory());
             own = send::take(self, &dirty);
@@ -7340,6 +7539,7 @@ impl HostList {
             let deferred = self.deferred();
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
+                && deferred.cpu_uploads.is_empty()
                 && deferred.plane_uploads.is_empty()
                 && deferred.shared_uploads.is_empty()
                 && deferred.kept.is_empty()
@@ -7528,7 +7728,7 @@ impl HostList {
             let chunk = take_chunk(host, bucket)?;
             let buffer = chunk.buffer.clone();
             let data = chunk.data as *mut u8;
-            self.deferred().plane_uploads.push((chunk, bucket));
+            self.deferred().cpu_uploads.push((chunk, bucket));
             return Some((buffer, data));
         }
         let (buffer, data) = host.upload_buffer(size)?;
@@ -7893,7 +8093,7 @@ impl HostList {
         read: (usize, usize),
         fill: impl Fn(usize) + Send + 'static,
     ) -> Option<ID3D12Resource> {
-        let chunk = take_chunk(host()?, size)?;
+        let chunk = take_plane_chunk(host()?, size)?;
         let source = chunk.buffer.clone();
         let destination = chunk.data;
         let mut deferred = self.deferred();
@@ -10780,22 +10980,28 @@ mod trail {
 mod spare {
     use super::Spare;
 
-    /// Kept things come back by size, the last given first, and nothing is
-    /// kept past the limit.
+    /// Kept things come back by size, the last given first, evicting the
+    /// oldest entry when the limit would be exceeded.
     #[test]
     fn kept_things_come_back_by_size_within_the_limit() {
         let mut spare: Spare<u32> = Spare::new();
+        let mut evicted = Vec::new();
         assert_eq!(spare.take(4), None);
-        assert_eq!(spare.give(1, 4, 10), None);
-        assert_eq!(spare.give(2, 1, 10), None);
-        assert_eq!(spare.give(3, 4, 10), None);
+        assert_eq!(spare.give(1, 4, 10, &mut evicted), None);
+        assert_eq!(spare.give(2, 1, 10, &mut evicted), None);
+        assert_eq!(spare.give(3, 4, 10, &mut evicted), None);
         assert_eq!(spare.bytes, 9);
-        // Past the limit: handed back, nothing changes.
-        assert_eq!(spare.give(4, 4, 10), Some(4));
+        assert!(evicted.is_empty());
+        // Larger than `most` itself: rejected and drains anything past `most`.
+        assert_eq!(spare.give(99, 11, 10, &mut evicted), Some(99));
+        assert!(evicted.is_empty());
+        // Past the limit: evicts the oldest entry (1, size 4) to make room.
+        assert_eq!(spare.give(4, 4, 10, &mut evicted), None);
+        assert_eq!(evicted, vec![(1, 4)]);
         assert_eq!(spare.bytes, 9);
         assert_eq!(spare.take(2), None, "no thing of that size");
+        assert_eq!(spare.take(4), Some(4));
         assert_eq!(spare.take(4), Some(3));
-        assert_eq!(spare.take(4), Some(1));
         assert_eq!(spare.take(4), None);
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
@@ -11595,10 +11801,51 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     fn scratch_spare_limit_scales_for_compact_ram_and_pressure() {
         assert_eq!(super::scratch_spare_limit(true, true, false, false, false), 256 << 20);
         assert_eq!(super::scratch_spare_limit(true, true, true, false, false), 256 << 20);
-        assert_eq!(super::scratch_spare_limit(true, true, false, true, false), 64 << 20);
+        assert_eq!(super::scratch_spare_limit(true, true, false, true, false), 96 << 20);
         assert_eq!(super::scratch_spare_limit(true, true, false, false, true), 0);
         assert_eq!(super::scratch_spare_limit(false, true, true, false, false), super::SPARE_MOST);
         assert_eq!(super::scratch_spare_limit(false, false, true, false, false), super::SPARE_KEPT);
+    }
+
+    #[test]
+    fn spare_evicts_lru_on_limit_drop_and_isolates_scratch_buckets() {
+        let mut spare = super::Spare::new();
+        let mut evicted = Vec::new();
+        for i in 0..25u32 {
+            assert!(spare.give(i, 4 << 20, 128 << 20, &mut evicted).is_none());
+        }
+        assert!(evicted.is_empty());
+        assert_eq!(spare.bytes, 100 << 20);
+
+        // Even when a tightened limit is smaller than existing stale entries,
+        // `give` evicts oldest entries instead of rejecting the incoming chunk.
+        let small_sz = super::SCRATCH_FIRST;
+        assert!(spare.give(999u32, small_sz, 64 << 20, &mut evicted).is_none());
+        assert!(!evicted.is_empty());
+        assert!(spare.bytes <= 64 << 20);
+        assert_eq!(spare.take(small_sz), Some(999u32));
+
+        // ScratchSpare isolates 256 KiB vs 4 MiB buckets and rejects movie-sized chunks.
+        let mut scratch = super::ScratchSpare::new();
+        let mut sc_evicted = Vec::new();
+        let limit = 96 << 20;
+        for i in 0..20u32 {
+            let _ = scratch.give(i, super::SCRATCH_CHUNK, limit, &mut sc_evicted);
+        }
+        assert!(scratch.give(100u32, small_sz, limit, &mut sc_evicted).is_none());
+        assert!(scratch.small.bytes <= 48 << 20);
+        assert!(scratch.large.bytes <= 48 << 20);
+        assert_eq!(scratch.take(small_sz), Some(100u32));
+        // Arbitrary movie chunk size never enters scratch spare.
+        assert_eq!(scratch.give(200u32, 4_200_000, limit, &mut sc_evicted), Some(200u32));
+
+        scratch.trim_to(0, &mut sc_evicted);
+        assert_eq!(scratch.count(), 0);
+        assert_eq!(scratch.bytes(), 0);
+
+        assert_eq!(super::plane_spare_limit(false, false), super::PLANE_SPARE_MOST);
+        assert_eq!(super::plane_spare_limit(true, false), 0);
+        assert_eq!(super::plane_spare_limit(false, true), 0);
     }
 
     #[test]

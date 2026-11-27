@@ -8,6 +8,7 @@ const GIB: u64 = 1 << 30;
 static PRESSURED: AtomicBool = AtomicBool::new(false);
 static SHARED_PRESSURED: AtomicBool = AtomicBool::new(false);
 static SHARED_CRITICAL: AtomicBool = AtomicBool::new(false);
+static LOGGED_PRESSURED: AtomicBool = AtomicBool::new(false);
 static HEADROOM: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn memory_status() -> Option<MEMORYSTATUSEX> {
@@ -189,7 +190,6 @@ pub(crate) fn refresh(video_memory: Option<[u64; 4]>) {
 
     let was_ram = PRESSURED.load(Ordering::Relaxed);
     let was_shared = SHARED_PRESSURED.load(Ordering::Relaxed);
-    let was = was_ram || was_shared;
 
     let ram_pressure = next_pressure_for(was_ram, physical, commit, compact_host_ram());
     let (shared_pressure, shared_critical) = match video_memory {
@@ -201,7 +201,7 @@ pub(crate) fn refresh(video_memory: Option<[u64; 4]>) {
     SHARED_CRITICAL.store(shared_critical, Ordering::Relaxed);
 
     let now_pressured = ram_pressure || shared_pressure;
-    if now_pressured != was {
+    if now_pressured != LOGGED_PRESSURED.swap(now_pressured, Ordering::Relaxed) {
         let [vram_budget_mib, vram_used_mib, shared_gpu_budget_mib, shared_gpu_used_mib] =
             video_memory.unwrap_or_default().map(|b| b >> 20);
         if now_pressured {

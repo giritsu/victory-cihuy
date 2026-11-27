@@ -1732,11 +1732,11 @@ fn adaptive_rest(base: std::time::Duration, streak: u8) -> std::time::Duration {
     }
     let mult: u32 = match streak {
         0 => 1,
-        1 => 4,
-        2 => 12,
-        _ => 25,
+        1 => 2,
+        2 => 4,
+        _ => 6,
     };
-    base.saturating_mul(mult).min(std::time::Duration::from_millis(100))
+    base.saturating_mul(mult).min(std::time::Duration::from_millis(24))
 }
 
 impl Guards {
@@ -1770,7 +1770,7 @@ impl Guards {
     /// A write fault opened `block`.
     fn opened(&mut self, block: usize) {
         const MANY: usize = 1 << 13;
-        const HOT_WINDOW_MS: u128 = 250;
+        const HOT_WINDOW_MS: u128 = 150;
         let now = std::time::Instant::now();
         if self.opened.len() >= MANY {
             self.opened
@@ -3585,10 +3585,10 @@ mod parts_tests {
         let base = Duration::from_micros(3000);
         assert_eq!(adaptive_rest(Duration::ZERO, 3), Duration::ZERO);
         assert_eq!(adaptive_rest(base, 0), base);
-        assert_eq!(adaptive_rest(base, 1), Duration::from_millis(12));
-        assert_eq!(adaptive_rest(base, 2), Duration::from_millis(36));
-        assert_eq!(adaptive_rest(base, 3), Duration::from_millis(75));
-        assert_eq!(adaptive_rest(Duration::from_millis(20), 3), Duration::from_millis(100));
+        assert_eq!(adaptive_rest(base, 1), Duration::from_millis(6));
+        assert_eq!(adaptive_rest(base, 2), Duration::from_millis(12));
+        assert_eq!(adaptive_rest(base, 3), Duration::from_millis(18));
+        assert_eq!(adaptive_rest(Duration::from_millis(10), 3), Duration::from_millis(24));
 
         let mut g = Guards::new();
         assert!(!g.rests(42, base));
