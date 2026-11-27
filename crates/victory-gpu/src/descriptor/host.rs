@@ -167,6 +167,10 @@ pub(crate) struct HostHeap {
     /// The same for a slot whose descriptor is made and stays (else 0): what
     /// [`HostHeap::mirror`] asks first, without the lock. Changed under it.
     quick: Vec<std::sync::atomic::AtomicU64>,
+    /// Tracks whether title slot `0..count` is known to hold a clean null view
+    /// (`0` = not known clean-null; `1..=VIEW_COUNT` = `kind.slot() as u8 + 1`,
+    /// guaranteeing `made == 0`, `quick == 0`, `twin == false`, `kept == None`).
+    null_state: Vec<std::sync::atomic::AtomicU8>,
     /// The records of the title's heap as the pass over records copied in
     /// as bytes last saw them ([`Copied::changes`]). Made on first
     /// use.
@@ -1708,6 +1712,9 @@ impl HostHeap {
                 .collect(),
             made: Made::new(count as usize),
             quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            null_state: (0..if sampler { 0 } else { count })
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
@@ -1757,6 +1764,11 @@ impl HostHeap {
         let started = std::time::Instant::now();
         if let Err(e) = h.fill_null(kind, size) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
+        } else if !h.sampler && (h.raw == 0 || h.raw >= h.count) {
+            let code = Self::null_code(NullViewKind::Tex2d);
+            for s in &h.null_state {
+                s.store(code, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
         Some(h)
@@ -2453,6 +2465,14 @@ impl HostHeap {
     /// a moment ago is shown after the draw's list ([`show_after`]; the draw
     /// reads the table's dynamic slots).
     pub(crate) fn mirror_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
+        if index < self.count {
+            // SAFETY: the handle is a descriptor slot in title memory.
+            let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            let key = u64::from(generation) << 32 | u64::from(i);
+            if tag == VIEW_TAG && self.quick_matches(index, key) {
+                return;
+            }
+        }
         if show_after()
             && !crate::texture::BAKING.get()
             && index < self.count
@@ -2465,7 +2485,7 @@ impl HostHeap {
         {
             return self.texture_slot_show_after(list, index, handle);
         }
-        self.mirror(index, handle, true);
+        let _ = self.mirror_inner(index, handle, true, false);
     }
 
     fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
@@ -2714,6 +2734,9 @@ impl HostHeap {
         self.clear_twin(index);
         self.write_stride(index, 0);
         self.keep(index, None);
+        if !self.sampler {
+            self.set_null_state(index, kind);
+        }
     }
 
     /// The slots [`HostHeap::note_buffer`] found stale for slot `index`, with
@@ -3779,6 +3802,7 @@ impl HostHeap {
 
     /// Copies one descriptor from CPU handle `from` to heap slot `to`.
     fn copy_from_kind(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE, kind: D3D12_DESCRIPTOR_HEAP_TYPE) {
+        self.clear_null_state(to);
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
@@ -3786,6 +3810,47 @@ impl HostHeap {
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
+    }
+
+    #[inline]
+    const fn null_code(kind: NullViewKind) -> u8 {
+        (match kind {
+            NullViewKind::Tex2d => 0,
+            NullViewKind::BufferSrv => 1,
+            NullViewKind::Cbv => 2,
+            NullViewKind::UavBuffer => 3,
+            NullViewKind::UavRawBuffer => 4,
+            NullViewKind::UavTex1d => 5,
+            NullViewKind::UavTex1dArray => 6,
+            NullViewKind::UavTex2d => 7,
+            NullViewKind::UavTex2dArray => 8,
+            NullViewKind::UavTex3d => 9,
+            NullViewKind::SrvTex(dim) if dim >= 2 && dim <= 10 => 10 + (dim - 2) as u8,
+            NullViewKind::SrvTex(_) => 0,
+        }) + 1
+    }
+
+    #[inline]
+    fn set_null_state(&self, index: u32, kind: NullViewKind) {
+        if let Some(slot) = self.null_state.get(index as usize) {
+            slot.store(Self::null_code(kind), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn clear_null_state(&self, index: u32) {
+        if let Some(slot) = self.null_state.get(index as usize)
+            && slot.load(std::sync::atomic::Ordering::Relaxed) != 0
+        {
+            slot.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    fn is_clean_null(&self, index: u32, kind: NullViewKind) -> bool {
+        self.null_state
+            .get(index as usize)
+            .is_some_and(|slot| slot.load(std::sync::atomic::Ordering::Relaxed) == Self::null_code(kind))
     }
 
     /// Places a pre-baked null view of `kind` into heap slot `index` without
@@ -3801,6 +3866,7 @@ impl HostHeap {
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
+        self.clear_null_state(index);
         if self.sampler {
             self.null_sampler(index);
         } else {
@@ -4209,6 +4275,7 @@ impl HostHeap {
     /// The descriptor this thread made last ([`HostHeap::at`]) goes to slot
     /// `index`.
     fn put(&self, index: u32) {
+        self.clear_null_state(index);
         self.copy_to(index, 0);
     }
 
@@ -4368,6 +4435,9 @@ impl HostHeap {
                 self.quick_is(index, 0);
                 self.made.set(index, 0);
                 self.make_null(index);
+                if !self.sampler {
+                    self.set_null_state(index, NullViewKind::Tex2d);
+                }
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
@@ -4421,27 +4491,46 @@ impl HostHeap {
                     }
                 }
             }
-            #[cfg(feature = "diagnostics")]
-            if !self.sampler && is_texture_view(&view) {
-                note_before(index, shown, if later { "null, waits" } else { "at once" });
-            }
-            self.quick_is(index, 0);
-            self.made.set(index, if later { 0 } else { key });
-            let kept = if later {
-                None
+            if later {
+                let kind = null_view_kind(&view);
+                if shown != 0 || self.sampler || !self.is_clean_null(index, kind) {
+                    #[cfg(feature = "diagnostics")]
+                    if !self.sampler && is_texture_view(&view) {
+                        note_before(index, shown, "null, waits");
+                    }
+                    self.quick_is(index, 0);
+                    self.made.set(index, 0);
+                    if !self.sampler {
+                        self.put_null_kind(index, kind);
+                    }
+                    self.twin_made(index, false);
+                    self.keep(index, None);
+                    if !self.sampler {
+                        self.set_null_state(index, kind);
+                    }
+                }
+                drop(held);
+                self.unmake_stale(index, stale);
             } else {
-                make_twinned(&view, self.at(index), self.twin(index))
-            };
-            if kept.is_none() && !self.sampler {
-                self.put_null_kind(index, null_view_kind(&view));
-            } else if kept.is_some() {
-                self.put(index);
+                #[cfg(feature = "diagnostics")]
+                if !self.sampler && is_texture_view(&view) {
+                    note_before(index, shown, "at once");
+                }
+                self.quick_is(index, 0);
+                self.clear_null_state(index);
+                self.made.set(index, key);
+                let kept = make_twinned(&view, self.at(index), self.twin(index));
+                if kept.is_none() && !self.sampler {
+                    self.put_null_kind(index, null_view_kind(&view));
+                } else if kept.is_some() {
+                    self.put(index);
+                }
+                self.twin_made(index, kept.is_some() && twinned(&view));
+                self.keep(index, kept.flatten());
+                self.quick_is(index, key);
+                drop(held);
+                self.unmake_stale(index, stale);
             }
-            self.twin_made(index, kept.is_some() && twinned(&view));
-            self.keep(index, kept.flatten());
-            self.quick_is(index, if later { 0 } else { key });
-            drop(held);
-            self.unmake_stale(index, stale);
         }
         want_view.then_some(view)
     }
@@ -7921,6 +8010,90 @@ mod tests {
         invalidate_buffer_views();
         heap.release_many([(first, n)]);
     }
+
+    #[test]
+    fn should_clear_ttl_honors_pressured_and_unpressured_ttls() {
+        assert!(should_clear_ttl(u64::MAX, 100, false));
+        assert!(should_clear_ttl(u64::MAX, 100, true));
+
+        // Unpressured clears after LIST_VIEWS_TTL_FRAMES (32).
+        assert!(!should_clear_ttl(100, 100, false));
+        assert!(!should_clear_ttl(100, 131, false));
+        assert!(should_clear_ttl(100, 132, false));
+
+        // Pressured retains entries for LIST_VIEWS_TTL_PRESSURED_FRAMES (8) frames
+        // rather than thrashing every single frame.
+        assert!(!should_clear_ttl(100, 101, true));
+        assert!(!should_clear_ttl(100, 107, true));
+        assert!(should_clear_ttl(100, 108, true));
+    }
+
+    #[test]
+    fn null_state_tracks_clean_nulls_and_mirror_after_skips_quick_hits() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        assert!(heap.is_clean_null(0, NullViewKind::Tex2d));
+
+        let memory = vec![0u64; 1 << 10];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(256);
+        let cbv_view = View::Constant(addr, 256);
+        let mut slot_mem = [0u32; 8];
+        let handle = slot_mem.as_mut_ptr() as u64;
+        crate::descriptor::record(handle, cbv_view.clone());
+
+        // Background mirror (`for_draw = false`) keeps a CBV slot null (`Cbv`) and marks clean null_state.
+        heap.mirror_sync(0, handle);
+        assert!(!heap.made(0));
+        assert!(heap.is_clean_null(0, NullViewKind::Cbv));
+
+        // Repeated background mirrors stay clean-null without re-dirtying `made`.
+        heap.mirror_sync(0, handle);
+        assert!(!heap.made(0));
+        assert!(heap.is_clean_null(0, NullViewKind::Cbv));
+
+        // Draw mirror (`for_draw = true`) materializes the slot and clears `null_state`.
+        let got = heap.mirror(0, handle, true);
+        assert!(got.is_some());
+        assert!(heap.made(0));
+        assert!(!heap.is_clean_null(0, NullViewKind::Cbv));
+        assert!(!heap.is_clean_null(0, NullViewKind::Tex2d));
+
+        // Unmaking resets `made`, puts NullViewKind::Cbv (matching the view), and records clean `null_state`.
+        {
+            let _held = heap.made.lock(0);
+            heap.unmake(0);
+        }
+        assert!(!heap.made(0));
+        assert!(heap.is_clean_null(0, NullViewKind::Cbv));
+
+        // Materializing again and clearing the guest record restores NullViewKind::Tex2d cleanly.
+        assert!(heap.mirror(0, handle, true).is_some());
+        slot_mem.fill(0);
+        assert!(heap.mirror(0, handle, true).is_none());
+        assert!(!heap.made(0));
+        assert!(heap.is_clean_null(0, NullViewKind::Tex2d));
+
+        // Re-record handle and materialize slot 1 so `quick` matches `handle`.
+        crate::descriptor::record(handle, cbv_view.clone());
+        assert!(heap.mirror(1, handle, true).is_some());
+        assert!(heap.made(1));
+        assert!(!heap.is_clean_null(1, NullViewKind::Cbv));
+        let key = {
+            // SAFETY: `handle` points to `slot_mem` holding the recorded descriptor words.
+            let [_, i, gen_] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+            u64::from(gen_) << 32 | u64::from(i)
+        };
+        assert!(heap.quick_matches(1, key));
+        heap.mirror_sync(1, handle);
+        assert!(heap.quick_matches(1, key));
+        {
+            let _held = heap.made.lock(1);
+            heap.unmake(1);
+        }
+        assert!(!heap.made(1));
+        assert!(heap.is_clean_null(1, NullViewKind::Cbv));
+    }
 }
 
 /// Pre-resolved `readable` work cached inside [`ListView`] for `(frame, epoch)` hits.
@@ -7975,9 +8148,15 @@ struct BufClockSlot {
 }
 
 const LIST_VIEWS_TTL_FRAMES: u64 = 32;
+const LIST_VIEWS_TTL_PRESSURED_FRAMES: u64 = 8;
 
 fn should_clear_ttl(since: u64, frame: u64, pressured: bool) -> bool {
-    since == u64::MAX || frame.abs_diff(since) >= LIST_VIEWS_TTL_FRAMES || (pressured && since != frame)
+    let ttl = if pressured {
+        LIST_VIEWS_TTL_PRESSURED_FRAMES
+    } else {
+        LIST_VIEWS_TTL_FRAMES
+    };
+    since == u64::MAX || frame.abs_diff(since) >= ttl
 }
 
 /// The descriptors a thread made across frames, split across independent buffer

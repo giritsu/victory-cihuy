@@ -19,6 +19,20 @@ use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
+fn uav_elide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_ELIDE").is_none_or(|v| v != "0"))
+}
+
+#[cfg(feature = "diagnostics")]
+static UAV_BARRIER_DIAG: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_uav_barrier_diag() -> [u64; 2] {
+    std::array::from_fn(|i| UAV_BARRIER_DIAG[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(windows)]
 pub(crate) mod thin;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
@@ -992,6 +1006,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
+            with_state(this, |_, state| state.clear_uav_dirty());
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
@@ -1755,7 +1770,15 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
-        with_state(this, |_, state| state.synced());
+        let mut emit = true;
+        with_state(this, |_, state| {
+            state.synced();
+            if uav_elide() {
+                emit = state.take_uav_dirty();
+            } else {
+                state.clear_uav_dirty();
+            }
+        });
         if let Some(list) = host_list(this) {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             #[cfg(feature = "diagnostics")]
@@ -1775,11 +1798,14 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                     );
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+                UAV_BARRIER_DIAG[usize::from(!emit)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            // SAFETY: the same layout; no resource named.
-            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-            // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            if emit {
+                // SAFETY: the same layout; no resource named.
+                let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[barrier]) };
+            }
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2348,7 +2374,22 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        with_state(this, |_, state| state.synced());
+        let mut emit = true;
+        with_state(this, |_, state| {
+            state.synced();
+            if uav_elide() {
+                emit = state.take_uav_dirty();
+            } else {
+                state.clear_uav_dirty();
+            }
+        });
+        if !emit {
+            #[cfg(feature = "diagnostics")]
+            UAV_BARRIER_DIAG[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        UAV_BARRIER_DIAG[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.

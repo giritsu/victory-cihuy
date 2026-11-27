@@ -230,10 +230,10 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 }
 
 #[cfg(feature = "diagnostics")]
-static VEH_DIAG: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static VEH_DIAG: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 #[cfg(feature = "diagnostics")]
-pub(crate) fn take_veh_diag() -> [u64; 4] {
+pub(crate) fn take_veh_diag() -> [u64; 8] {
     std::array::from_fn(|i| VEH_DIAG[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -1722,8 +1722,21 @@ struct Guards {
     /// one opens them all. (A write's range can be huge, `fread`'s, so only
     /// these are looked up.)
     aliased: Blocks,
-    /// Blocks opened by a write fault, and when ([`rest`]).
-    opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
+    /// Blocks opened by a write fault, and `(last_opened, streak)` ([`rest`]).
+    opened: std::collections::HashMap<usize, (std::time::Instant, u8), std::hash::BuildHasherDefault<PageHash>>,
+}
+
+fn adaptive_rest(base: std::time::Duration, streak: u8) -> std::time::Duration {
+    if base.is_zero() {
+        return std::time::Duration::ZERO;
+    }
+    let mult: u32 = match streak {
+        0 => 1,
+        1 => 4,
+        2 => 12,
+        _ => 25,
+    };
+    base.saturating_mul(mult).min(std::time::Duration::from_millis(100))
 }
 
 impl Guards {
@@ -1747,20 +1760,33 @@ impl Guards {
 
     /// Whether `block` is left open for now: the title has just written it.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
-        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+        !rest.is_zero()
+            && self
+                .opened
+                .get(&block)
+                .is_some_and(|&(at, streak)| at.elapsed() < adaptive_rest(rest, streak))
     }
 
     /// A write fault opened `block`.
     fn opened(&mut self, block: usize) {
         const MANY: usize = 1 << 13;
+        const HOT_WINDOW_MS: u128 = 250;
+        let now = std::time::Instant::now();
         if self.opened.len() >= MANY {
-            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            self.opened
+                .retain(|_, (at, _)| now.saturating_duration_since(*at).as_millis() < HOT_WINDOW_MS);
             if self.opened.len() >= MANY {
                 self.opened.clear();
             }
         }
+        let streak = match self.opened.get(&block) {
+            Some(&(prev, s)) if now.saturating_duration_since(prev).as_millis() < HOT_WINDOW_MS => {
+                s.saturating_add(1).min(3)
+            }
+            _ => 0,
+        };
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
-        self.opened.insert(block, std::time::Instant::now());
+        self.opened.insert(block, (now, streak));
     }
 }
 
@@ -3421,7 +3447,9 @@ pub(crate) fn install() {
             }
         }
         #[cfg(feature = "diagnostics")]
-        let _veh = VehTimer(std::time::Instant::now());
+        let veh_began = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let _veh = VehTimer(veh_began);
         #[cfg(feature = "diagnostics")]
         let _op = GuardOpScope::enter(4);
         let _fault = crate::timeline::span("a fault looked at");
@@ -3443,7 +3471,7 @@ pub(crate) fn install() {
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
         {
-            return match ours {
+            let status = match ours {
                 Some(exit) => fail(exit),
                 None if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
                     && r.NumberParameters >= 2
@@ -3454,6 +3482,13 @@ pub(crate) fn install() {
                 }
                 None => EXCEPTION_CONTINUE_SEARCH,
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                VEH_DIAG[4].fetch_add(1, Relaxed);
+                VEH_DIAG[5].fetch_add(veh_began.elapsed().as_nanos() as u64, Relaxed);
+            }
+            return status;
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
@@ -3468,11 +3503,25 @@ pub(crate) fn install() {
         // (then nothing waits for the lock), and a copy may have guarded it
         // again since that (then it is ours again, not read-only for some
         // other reason).
+        let mut checked_not_writable = false;
         for _ in 0..3 {
-            if !PROTECTED.any(block, block + 1) && writable(at) {
+            if !PROTECTED.any(block, block + 1) {
                 #[cfg(feature = "diagnostics")]
-                crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
-                return EXCEPTION_CONTINUE_EXECUTION;
+                let w_began = std::time::Instant::now();
+                if writable(at) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        VEH_DIAG[6].fetch_add(1, Relaxed);
+                        VEH_DIAG[7].fetch_add(w_began.elapsed().as_nanos() as u64, Relaxed);
+                        crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
+                    }
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                if !PROTECTED.any(block, block + 1) {
+                    checked_not_writable = true;
+                    break;
+                }
             }
             #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
@@ -3495,8 +3544,10 @@ pub(crate) fn install() {
                 let _ = waited_ns;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            #[cfg(feature = "diagnostics")]
+            VEH_DIAG[7].fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        if writable(at) {
+        if !checked_not_writable && writable(at) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         match ours {
@@ -3527,6 +3578,32 @@ fn writable(at: usize) -> bool {
 #[cfg(test)]
 mod parts_tests {
     use super::*;
+
+    #[test]
+    fn adaptive_rest_escalates_and_opened_tracks_hot_streak() {
+        use std::time::Duration;
+        let base = Duration::from_micros(3000);
+        assert_eq!(adaptive_rest(Duration::ZERO, 3), Duration::ZERO);
+        assert_eq!(adaptive_rest(base, 0), base);
+        assert_eq!(adaptive_rest(base, 1), Duration::from_millis(12));
+        assert_eq!(adaptive_rest(base, 2), Duration::from_millis(36));
+        assert_eq!(adaptive_rest(base, 3), Duration::from_millis(75));
+        assert_eq!(adaptive_rest(Duration::from_millis(20), 3), Duration::from_millis(100));
+
+        let mut g = Guards::new();
+        assert!(!g.rests(42, base));
+        g.opened(42);
+        assert_eq!(g.opened.get(&42).map(|x| x.1), Some(0));
+        assert!(g.rests(42, base));
+        g.opened(42);
+        assert_eq!(g.opened.get(&42).map(|x| x.1), Some(1));
+        g.opened(42);
+        assert_eq!(g.opened.get(&42).map(|x| x.1), Some(2));
+        g.opened(42);
+        assert_eq!(g.opened.get(&42).map(|x| x.1), Some(3));
+        g.opened(42);
+        assert_eq!(g.opened.get(&42).map(|x| x.1), Some(3));
+    }
 
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {

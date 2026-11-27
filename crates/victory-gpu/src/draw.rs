@@ -48,7 +48,7 @@ static TABLE_DIAG: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(feature = "diagnostics")]
 static TABLE_SPLIT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 #[cfg(feature = "diagnostics")]
-static BIND_SPLIT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static BIND_SPLIT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 #[cfg(feature = "diagnostics")]
 static INDIRECT_SPLIT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
@@ -108,11 +108,13 @@ pub(crate) fn log_tables(frames: f64) {
     let bcalls = BIND_SPLIT[0].swap(0, Ordering::Relaxed);
     let preps = BIND_SPLIT[7].swap(0, Ordering::Relaxed);
     if bcalls != 0 || preps != 0 {
+        let early_ns = BIND_SPLIT[8].swap(0, Ordering::Relaxed);
         let bs: [u64; 6] = std::array::from_fn(|i| BIND_SPLIT[i + 1].swap(0, Ordering::Relaxed));
         tracing::info!(
-            "bind/prepare split per frame (all threads, {:.0} binds / {:.0} preps): header/pso {:.1}ms, tables {:.1}ms, user_data {:.1}ms, root_views {:.1}ms, vb_ib {:.1}ms, rt_state {:.1}ms",
+            "bind/prepare split per frame (all threads, {:.0} binds / {:.0} preps): early_tex {:.1}ms, header/pso {:.1}ms, tables {:.1}ms, user_data {:.1}ms, root_views {:.1}ms, vb_ib {:.1}ms, rt_state {:.1}ms",
             bcalls as f64 / frames,
             preps as f64 / frames,
+            early_ns as f64 / 1e6 / frames,
             bs[0] as f64 / 1e6 / frames,
             bs[1] as f64 / 1e6 / frames,
             bs[2] as f64 / 1e6 / frames,
@@ -506,6 +508,11 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    /// Whether bound render targets match a square >=512x512 4+ MRT bake atlas.
+    bake_targets: bool,
+    /// True once a global UAV barrier has synced all prior shader UAV writes;
+    /// cleared lazily by default/reset/replay and by any draw/dispatch that can write UAVs.
+    uav_clean: bool,
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
@@ -1283,6 +1290,7 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        self.bake_targets = false;
         let mut views: [(Option<&ID3D12Resource>, Option<D3D12_RENDER_TARGET_VIEW_DESC>); 8] = Default::default();
         let mut keys: [TargetKey; 8] = Default::default();
         let mut count = 0usize;
@@ -1318,6 +1326,12 @@ impl State {
             keys[count] = (texture.as_raw() as usize, record.key());
             count += 1;
         }
+        self.bake_targets = self.targets.len() >= 4
+            && self
+                .targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h));
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
@@ -1415,6 +1429,7 @@ impl State {
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
     pub(crate) fn replay(&mut self, list: &HostList) {
+        self.uav_clean = false;
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
@@ -1741,6 +1756,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         #[derive(Default)]
         struct BindDiag {
+            early_ns: u64,
             header_ns: u64,
             tables_ns: u64,
             user_ns: u64,
@@ -1750,6 +1766,9 @@ impl State {
         impl Drop for BindDiag {
             fn drop(&mut self) {
                 BIND_SPLIT[0].fetch_add(1, Ordering::Relaxed);
+                if self.early_ns > 0 {
+                    BIND_SPLIT[8].fetch_add(self.early_ns, Ordering::Relaxed);
+                }
                 if self.header_ns > 0 {
                     BIND_SPLIT[1].fetch_add(self.header_ns, Ordering::Relaxed);
                 }
@@ -1767,10 +1786,16 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let mut bd = BindDiag::default();
         #[cfg(feature = "diagnostics")]
-        let hdr_began = std::time::Instant::now();
+        let early_began = std::time::Instant::now();
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        #[cfg(feature = "diagnostics")]
+        {
+            bd.early_ns = early_began.elapsed().as_nanos() as u64;
+        }
+        #[cfg(feature = "diagnostics")]
+        let hdr_began = std::time::Instant::now();
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -2330,7 +2355,9 @@ impl State {
         // shortcut: what the title writes into such buffers between lists
         // of one frame is seen a frame late.
         let frame = crate::frame::current();
-        if host.buffer_frame.swap(frame, Ordering::Relaxed) == frame {
+        if host.buffer_frame.load(Ordering::Relaxed) == frame
+            || host.buffer_frame.swap(frame, Ordering::Relaxed) == frame
+        {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -2505,17 +2532,9 @@ impl State {
     /// and structurally detects depth-less 4+ MRT square atlas bakes
     /// (`>= 512x512`) so unseen NPC/head/clothing shader permutations never
     /// bake `neutral()` or `null` stand-ins into permanent ped textures.
+    #[inline]
     fn is_bake_draw(&self, p: &HostPipeline) -> bool {
-        if p.bake_shader {
-            return true;
-        }
-        self.depth == 0
-            && self.targets.len() >= 4
-            && self
-                .targets
-                .first()
-                .and_then(|&t| crate::resource::texture_kind(t as This))
-                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
+        p.bake_shader || (self.depth == 0 && self.bake_targets)
     }
 
     /// Runs the pass that uploads textures picked by index
@@ -2538,7 +2557,8 @@ impl State {
         // frame has several, and together they get `bake_ms`.
         static BAKED_MS: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        let first = FRAME.swap(frame, Ordering::Relaxed) != frame;
+        let first = FRAME.load(Ordering::Relaxed) != frame
+            && FRAME.swap(frame, Ordering::Relaxed) != frame;
         if first {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
@@ -2557,6 +2577,12 @@ impl State {
         let Some(host) = heap.host() else {
             return;
         };
+        if !is_bake {
+            let last_buf = host.buffer_frame.load(Ordering::Relaxed);
+            if last_buf != u64::MAX && frame.saturating_sub(last_buf) <= 2 {
+                return;
+            }
+        }
         if is_bake {
             let began = std::time::Instant::now();
             let mut bake_slot = BAKE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
@@ -2779,10 +2805,20 @@ impl State {
         static SPENT: AtomicU64 = AtomicU64::new(0);
         static SPENT_US: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) != frame {
+        if FRAME.load(Ordering::Relaxed) != frame && FRAME.swap(frame, Ordering::Relaxed) != frame {
             SPENT.store(0, Ordering::Relaxed);
             SPENT_US.store(0, Ordering::Relaxed);
         }
+        struct SpentUsGuard<'a>(&'a AtomicU64, std::time::Instant);
+        impl Drop for SpentUsGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
+        let already_spent_us = SPENT_US.load(Ordering::Relaxed);
+        let began = std::time::Instant::now();
+        let _spent_us_guard = (!required).then(|| SpentUsGuard(&SPENT_US, began));
         // No more of them are made while the card has no room
         // (`resource::room`): by what is alive now, not by what was ever
         // staged (4 GB in all, after which later textures stayed empty for
@@ -2825,7 +2861,6 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
-        let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
@@ -2914,15 +2949,6 @@ impl State {
             )
         };
 
-        struct SpentUsGuard<'a>(&'a AtomicU64, std::time::Instant);
-        impl Drop for SpentUsGuard<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
-        }
-        let began = std::time::Instant::now();
-        let _spent_us_guard = early_span.is_none().then(|| SpentUsGuard(&SPENT_US, began));
-        let already_spent_us = SPENT_US.load(Ordering::Relaxed);
         if sync.is_none() {
             BAKE_SERVED.store(0, Ordering::Relaxed);
         }
@@ -3429,11 +3455,15 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
+        if p.writes_uav {
+            self.note_uav_write();
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
             && crate::ambient::on()
             && self.ambient(list, p, role)
         {
+            self.note_uav_write();
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
@@ -4804,12 +4834,16 @@ impl State {
         if p.is_none_or(|p| p.stores) {
             self.batch = None;
         }
+        if p.is_none_or(|p| p.writes_uav) {
+            self.uav_clean = false;
+        }
     }
 
     /// A buffer was copied to: what was clamped of it ahead is clamped anew.
     pub(crate) fn copied(&mut self) {
         self.window = None;
         self.batch = None;
+        self.uav_clean = false;
     }
 
     /// The title waits for earlier work (a barrier or a pipeline sync).
@@ -4817,6 +4851,21 @@ impl State {
         if self.batch.as_ref().is_some_and(|b| b.wrote) {
             self.batch = None;
         }
+    }
+
+    /// Marks prior UAV writes on this list synced by a global UAV barrier.
+    pub(crate) fn clear_uav_dirty(&mut self) {
+        self.uav_clean = true;
+    }
+
+    /// Returns whether a global UAV barrier is needed, resetting the dirty flag.
+    pub(crate) fn take_uav_dirty(&mut self) -> bool {
+        !std::mem::replace(&mut self.uav_clean, true)
+    }
+
+    #[inline]
+    fn note_uav_write(&mut self) {
+        self.uav_clean = false;
     }
 
     /// Where the clamped record of `kind` at `arguments` of the copy `args`
@@ -5100,6 +5149,9 @@ impl State {
         }
         if kind == DISPATCH {
             self.buffers_written();
+            if p.writes_uav {
+                self.note_uav_write();
+            }
         } else {
             self.drew(Some(p));
         }
@@ -5757,6 +5809,22 @@ mod tests {
         assert_eq!(texture_stage_budget_us(12, false, true, false, 1024), 36_000);
         assert_eq!(texture_stage_budget_us(12, true, true, true, 2000), 12_000);
         assert_eq!(texture_stage_budget_us(12, false, false, false, 2000), 12_000);
+    }
+
+    #[test]
+    fn state_uav_dirty_tracking_is_conservative_on_default_and_reset() {
+        let mut s = super::State::default();
+        assert!(s.take_uav_dirty());
+        assert!(!s.take_uav_dirty());
+        s.drew(None);
+        assert!(s.take_uav_dirty());
+        assert!(!s.take_uav_dirty());
+        s.copied();
+        assert!(s.take_uav_dirty());
+        s.clear_uav_dirty();
+        assert!(!s.take_uav_dirty());
+        s.reset(std::ptr::null());
+        assert!(s.take_uav_dirty());
     }
 }
 

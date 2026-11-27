@@ -1,10 +1,10 @@
 //! Diagnostics: how long the card itself works on our submissions, by its own
-//! timestamps (`VICTORY_CARD_SPANS=1`). The clock of the frame line
+//! timestamps (`VICTORY_CARD_SPANS=1`), split across `card_sync`, `card_steps`,
+//! `title`, and `card_check` phases. The clock of the frame line
 //! (`card_clock_line`) counts from the call that sends a submission to the
 //! moment a thread of ours wakes behind its last signal: the time the system
 //! takes to hand a submission to the card and to report it done is in it, 40
-//! times a frame. Here two lists made once, of nothing but a timestamp, stand
-//! around each submission.
+//! times a frame.
 
 use std::sync::Mutex;
 
@@ -13,17 +13,38 @@ use windows::core::Interface;
 
 use super::Host;
 
-/// Submissions stamped before the first stamps are read and used again.
+/// Submissions/syncs stamped before the first stamps are read and used again.
 const SPANS: usize = 512;
+const TIMESTAMPS_PER_SPAN: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SpanKind {
+    #[default]
+    Empty,
+    CardSync,
+    Submission {
+        has_steps: bool,
+        has_check: bool,
+    },
+}
+
+/// Pre-recorded timestamp lists bracketing one submission's GPU phases.
+pub(super) struct SubSpans {
+    pub(super) front: ID3D12CommandList,
+    pub(super) after_steps: Option<ID3D12CommandList>,
+    pub(super) before_check: Option<ID3D12CommandList>,
+    pub(super) behind: ID3D12CommandList,
+}
 
 /// The stamps of one queue's submissions.
 pub(super) struct Spans {
     _allocator: ID3D12CommandAllocator,
     _heap: ID3D12QueryHeap,
     _back: ID3D12Resource,
-    /// The mapped results, two a submission.
+    /// The mapped results, `TIMESTAMPS_PER_SPAN` u64s per slot.
     data: usize,
     lists: Vec<ID3D12CommandList>,
+    kinds: Vec<SpanKind>,
     ticks_per_ms: f64,
     next: usize,
     sums: Sums,
@@ -39,6 +60,11 @@ struct Sums {
     count: u64,
     busy: u64,
     between: u64,
+    /// Ticks spent inside each phase (best-effort additive split over `count`).
+    card_sync: u64,
+    card_steps: u64,
+    title: u64,
+    card_check: u64,
     /// Ticks of the longest one, and the last one's end.
     longest: u64,
     last: u64,
@@ -48,19 +74,59 @@ impl Sums {
     /// A submission that ran from `start` to `end` (card ticks), after those
     /// before it. The start's stamp may be of before the last one's end: the
     /// part before that end is the last one's.
-    fn add(&mut self, start: u64, end: u64) {
+    fn add(&mut self, start: u64, end: u64) -> u64 {
         if start == 0 || end < start {
-            return;
+            return 0;
         }
-        let start = start.max(self.last);
-        let took = end.saturating_sub(start);
-        if self.last != 0 {
-            self.between += start - self.last;
+        let clamped_start = start.max(self.last);
+        let took = end.saturating_sub(clamped_start);
+        if self.last != 0 && clamped_start > self.last {
+            self.between += clamped_start - self.last;
         }
         self.count += 1;
         self.busy += took;
         self.longest = self.longest.max(took);
         self.last = end.max(self.last);
+        took
+    }
+
+    fn record(&mut self, kind: SpanKind, stamps: [u64; TIMESTAMPS_PER_SPAN]) {
+        match kind {
+            SpanKind::Empty => {}
+            SpanKind::CardSync => {
+                let took = self.add(stamps[0], stamps[1]);
+                self.card_sync += took;
+            }
+            SpanKind::Submission { has_steps, has_check } => {
+                let [t0, t1, t2, t3] = stamps;
+                let total = self.add(t0, t3);
+                if total == 0 {
+                    return;
+                }
+                let raw_span = t3.saturating_sub(t0);
+                let steps = if has_steps && t1 >= t0 && t1 <= t3 { t1 - t0 } else { 0 };
+                let check = if has_check && t2 >= t0 && t3 >= t2 && t2 >= t1.max(t0) {
+                    t3 - t2
+                } else {
+                    0
+                };
+                // Scale phase components proportionally if overlapping previous submission clamped `t0`.
+                let (steps, check) = if raw_span > total && raw_span > 0 {
+                    (
+                        ((u128::from(steps) * u128::from(total)) / u128::from(raw_span)) as u64,
+                        ((u128::from(check) * u128::from(total)) / u128::from(raw_span)) as u64,
+                    )
+                } else {
+                    (steps, check)
+                };
+                let steps = steps.min(total);
+                let check = check.min(total - steps);
+                let title = total - steps - check;
+                self.card_steps += steps;
+                self.card_check += check;
+                self.title += title;
+            }
+        }
     }
 }
 
@@ -74,10 +140,31 @@ fn on() -> bool {
 
 static SPANS_MADE: Mutex<Option<Option<Spans>>> = Mutex::new(None);
 
+impl Spans {
+    fn alloc_slot(&mut self, kind: SpanKind) -> usize {
+        let i = self.next;
+        self.next = (i + 1) % SPANS;
+        let prev_kind = std::mem::replace(&mut self.kinds[i], kind);
+        // The stamps of the submission that had these lists, that many
+        // submissions ago: long done.
+        // SAFETY: inside the mapping; written by the card at whole words.
+        let stamps = unsafe {
+            let at = (self.data as *mut u64).add(TIMESTAMPS_PER_SPAN * i);
+            let mut read = [0u64; TIMESTAMPS_PER_SPAN];
+            for (k, out) in read.iter_mut().enumerate() {
+                *out = at.add(k).read_volatile();
+                at.add(k).write_volatile(0);
+            }
+            read
+        };
+        self.sums.record(prev_kind, stamps);
+        i
+    }
+}
+
 impl Host {
-    /// The lists that go in front of and behind a submission about to be
-    /// sent to the drawing queue, if stamps are asked for.
-    pub(super) fn span_lists(&self) -> Option<[ID3D12CommandList; 2]> {
+    /// Two timestamp lists wrapping `card_before`'s CPU->GPU sync pass.
+    pub(super) fn span_sync_lists(&self) -> Option<[ID3D12CommandList; 2]> {
         if !on() {
             return None;
         }
@@ -89,20 +176,32 @@ impl Host {
                     .ok()
             })
             .as_mut()?;
-        let i = spans.next;
-        spans.next = (i + 1) % SPANS;
-        // The stamps of the submission that had these lists, that many
-        // submissions ago: long done.
-        // SAFETY: inside the mapping; written by the card at whole words.
-        let (start, end) = unsafe {
-            let at = (spans.data as *mut u64).add(2 * i);
-            let read = (at.read_volatile(), at.add(1).read_volatile());
-            at.write_volatile(0);
-            at.add(1).write_volatile(0);
-            read
-        };
-        spans.sums.add(start, end);
-        Some([spans.lists[2 * i].clone(), spans.lists[2 * i + 1].clone()])
+        let i = spans.alloc_slot(SpanKind::CardSync);
+        let base = TIMESTAMPS_PER_SPAN * i;
+        Some([spans.lists[base].clone(), spans.lists[base + 1].clone()])
+    }
+
+    /// Timestamp lists around (and optionally between) `card_steps`, title work, and `card_check`.
+    pub(super) fn span_submission(&self, has_steps: bool, has_check: bool) -> Option<SubSpans> {
+        if !on() {
+            return None;
+        }
+        let mut made = SPANS_MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let spans = made
+            .get_or_insert_with(|| {
+                self.make_spans()
+                    .inspect_err(|e| tracing::warn!(error = %e, "no stamps around submissions"))
+                    .ok()
+            })
+            .as_mut()?;
+        let i = spans.alloc_slot(SpanKind::Submission { has_steps, has_check });
+        let base = TIMESTAMPS_PER_SPAN * i;
+        Some(SubSpans {
+            front: spans.lists[base].clone(),
+            after_steps: has_steps.then(|| spans.lists[base + 1].clone()),
+            before_check: has_check.then(|| spans.lists[base + 2].clone()),
+            behind: spans.lists[base + 3].clone(),
+        })
     }
 
     fn make_spans(&self) -> windows::core::Result<Spans> {
@@ -114,19 +213,21 @@ impl Host {
             device.CreateQueryHeap(
                 &D3D12_QUERY_HEAP_DESC {
                     Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
-                    Count: 2 * SPANS as u32,
+                    Count: (TIMESTAMPS_PER_SPAN * SPANS) as u32,
                     NodeMask: 0,
                 },
                 &mut heap,
             )?;
             let heap = heap.ok_or_else(windows::core::Error::empty)?;
-            let back = self.read_back_buffer(16 * SPANS as u64).ok_or_else(windows::core::Error::empty)?;
+            let back = self
+                .read_back_buffer((8 * TIMESTAMPS_PER_SPAN * SPANS) as u64)
+                .ok_or_else(windows::core::Error::empty)?;
             let mut data = std::ptr::null_mut();
             back.Map(0, None, Some(&mut data))?;
-            std::ptr::write_bytes(data.cast::<u8>(), 0, 16 * SPANS);
+            std::ptr::write_bytes(data.cast::<u8>(), 0, 8 * TIMESTAMPS_PER_SPAN * SPANS);
             let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let mut lists = Vec::with_capacity(2 * SPANS);
-            for i in 0..2 * SPANS as u32 {
+            let mut lists = Vec::with_capacity(TIMESTAMPS_PER_SPAN * SPANS);
+            for i in 0..(TIMESTAMPS_PER_SPAN * SPANS) as u32 {
                 let list: ID3D12GraphicsCommandList =
                     device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
                 list.EndQuery(&heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
@@ -140,6 +241,7 @@ impl Host {
                 _back: back,
                 data: data as usize,
                 lists,
+                kinds: vec![SpanKind::Empty; SPANS],
                 ticks_per_ms: self.queue.GetTimestampFrequency()? as f64 / 1000.0,
                 next: 0,
                 sums: Sums::default(),
@@ -205,9 +307,13 @@ pub(super) fn line(frames: f64) {
     let s = std::mem::replace(&mut spans.sums, Sums { last, ..Sums::default() });
     let ms = |ticks: u64| ticks as f64 / spans.ticks_per_ms / frames;
     tracing::info!(
-        "the card's own stamps per frame: {:.1} submissions, working {:.1} ms, idle between them {:.1} ms, the longest {:.1} ms",
+        "the card's own stamps per frame: {:.1} submissions, working {:.1} ms (card_sync {:.1}, card_steps {:.1}, title {:.1}, card_check {:.1}), idle between them {:.1} ms, the longest {:.1} ms",
         s.count as f64 / frames,
         ms(s.busy),
+        ms(s.card_sync),
+        ms(s.card_steps),
+        ms(s.title),
+        ms(s.card_check),
         ms(s.between),
         s.longest as f64 / spans.ticks_per_ms
     );
@@ -215,7 +321,7 @@ pub(super) fn line(frames: f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::Sums;
+    use super::{SpanKind, Sums};
 
     #[test]
     fn submissions_add_up_without_counting_anything_twice() {
@@ -231,5 +337,21 @@ mod tests {
         // Whole inside the last one.
         s.add(265, 268);
         assert_eq!((s.count, s.busy, s.between), (4, 110, 60));
+    }
+
+    #[test]
+    fn per_phase_stamps_account_for_card_sync_steps_title_and_check() {
+        let mut s = Sums::default();
+        s.record(SpanKind::CardSync, [100, 120, 0, 0]);
+        s.record(SpanKind::Submission { has_steps: true, has_check: true }, [130, 145, 210, 230]);
+        s.record(SpanKind::Submission { has_steps: false, has_check: false }, [240, 0, 0, 290]);
+        s.record(SpanKind::Submission { has_steps: true, has_check: false }, [300, 310, 0, 340]);
+        s.record(SpanKind::Submission { has_steps: false, has_check: true }, [350, 0, 380, 395]);
+        assert_eq!(s.count, 5);
+        assert_eq!(s.card_sync, 20);
+        assert_eq!(s.card_steps, 15 + 10);
+        assert_eq!(s.title, 65 + 50 + 30 + 30);
+        assert_eq!(s.card_check, 20 + 15);
+        assert_eq!(s.busy, s.card_sync + s.card_steps + s.title + s.card_check);
     }
 }

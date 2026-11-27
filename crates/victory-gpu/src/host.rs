@@ -4817,7 +4817,15 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    #[cfg(feature = "diagnostics")]
+                    let exec = if let Some([front, behind]) = self.span_sync_lists() {
+                        vec![Some(front), Some(list.cast()?), Some(behind)]
+                    } else {
+                        vec![Some(list.cast()?)]
+                    };
+                    #[cfg(not(feature = "diagnostics"))]
+                    let exec = [Some(list.cast()?)];
+                    self.queue.ExecuteCommandLists(&exec);
                     Ok(())
                 })()
             };
@@ -6125,13 +6133,18 @@ impl Host {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        for list in runs {
+        let has_steps = own.is_some();
+        let mut steps_end_idx = 0usize;
+        for (idx, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+            if idx == 0 && has_steps {
+                steps_end_idx = lists.len();
+            }
         }
         batch.fill();
         stage.next("submit: the last refreshes");
@@ -6175,9 +6188,16 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
-        if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
+        #[allow(unused_mut)]
+        let mut check_start_idx = lists.len();
+        let has_check = if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
-        }
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (has_steps, steps_end_idx, has_check, check_start_idx);
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -6201,15 +6221,33 @@ impl Host {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
+            steps_end_idx += 1;
+            check_start_idx += 1;
         }
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists() {
-                lists.insert(0, Some(front));
-                lists.push(Some(behind));
+            if let Some(sub) = self.span_submission(has_steps, has_check) {
+                if let Some(before_check) = sub.before_check {
+                    lists.insert(check_start_idx, Some(before_check));
+                    for first in &mut firsts {
+                        if *first >= check_start_idx {
+                            *first += 1;
+                        }
+                    }
+                }
+                if let Some(after_steps) = sub.after_steps {
+                    lists.insert(steps_end_idx, Some(after_steps));
+                    for first in &mut firsts {
+                        if *first >= steps_end_idx {
+                            *first += 1;
+                        }
+                    }
+                }
+                lists.insert(0, Some(sub.front));
+                lists.push(Some(sub.behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
@@ -8205,7 +8243,7 @@ fn split_line(frames: f64) {
     let fd = crate::list::thin::take_front_diag();
     let vd = crate::watch::take_veh_diag();
     tracing::info!(
-        "title hooks per frame (all threads): cbv {:.1}ms ({:.0}), placed {:.1}ms ({:.0}), srv/uav {:.1}ms ({:.0}), copy_desc {:.1}ms ({:.0}), mirror {:.1}ms ({:.0}), thin_front {:.1}ms ({:.0} calls, handover {:.1}ms), veh_fault {:.1}ms ({:.0} calls, open {:.1}ms)",
+        "title hooks per frame (all threads): cbv {:.1}ms ({:.0}), placed {:.1}ms ({:.0}), srv/uav {:.1}ms ({:.0}), copy_desc {:.1}ms ({:.0}), mirror {:.1}ms ({:.0}), thin_front {:.1}ms ({:.0} calls, handover {:.1}ms), veh_fault {:.1}ms ({:.0} calls, open {:.1}ms/{:.0}, non_w {:.1}ms/{:.0}, already {:.1}ms/{:.0})",
         dd[1] as f64 / 1e6 / frames,
         dd[0] as f64 / frames,
         dd[3] as f64 / 1e6 / frames,
@@ -8222,6 +8260,11 @@ fn split_line(frames: f64) {
         vd[1] as f64 / 1e6 / frames,
         vd[0] as f64 / frames,
         vd[3] as f64 / 1e6 / frames,
+        vd[2] as f64 / frames,
+        vd[5] as f64 / 1e6 / frames,
+        vd[4] as f64 / frames,
+        vd[7] as f64 / 1e6 / frames,
+        vd[6] as f64 / frames,
     );
 }
 
@@ -9572,7 +9615,17 @@ impl Meter {
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
         #[cfg(feature = "diagnostics")]
-        spans::line(frames);
+        {
+            spans::line(frames);
+            let [kept, elided] = crate::list::take_uav_barrier_diag();
+            if kept + elided > 0 {
+                tracing::info!(
+                    "global UAV barriers per frame (VICTORY_UAV_ELIDE=0: off): {:.0} kept, {:.0} elided",
+                    kept as f64 / frames,
+                    elided as f64 / frames
+                );
+            }
+        }
         crate::shadow::back_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);

@@ -400,6 +400,8 @@ pub(crate) struct HostPipeline {
     pub(crate) bake_shader: bool,
     /// Whether any stage can store to buffers (`Translated::stores`).
     pub(crate) stores: bool,
+    /// Whether any stage can store to any UAV (buffer or image/texture).
+    pub(crate) writes_uav: bool,
     /// Whether any stage binds title root SRVs or UAVs (needs a view heap).
     pub(crate) needs_view_heap: bool,
     /// Its shaders, for reports of slow submissions.
@@ -410,14 +412,17 @@ pub(crate) struct HostPipeline {
     pub(crate) state: String,
 }
 
-fn pipeline_flags(stages: &[Stage]) -> (bool, bool, bool) {
+fn pipeline_flags(stages: &[Stage]) -> (bool, bool, bool, bool) {
     let bake_shader = stages.iter().any(|s| {
         let h = s.shader.hash.as_str();
         crate::draw::BAKE_PIXEL_SHADERS.contains(&h) || crate::draw::BAKE_GEOMETRY_SHADERS.contains(&h)
     });
     let stores = stages.iter().any(|s| s.translated().stores);
+    let writes_uav = stages
+        .iter()
+        .any(|s| s.translated().stores_any_uav || !s.root_uavs.is_empty());
     let needs_view_heap = stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty());
-    (bake_shader, stores, needs_view_heap)
+    (bake_shader, stores, writes_uav, needs_view_heap)
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -661,7 +666,7 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            let (bake_shader, stores, needs_view_heap) = pipeline_flags(&bound);
+            let (bake_shader, stores, writes_uav, needs_view_heap) = pipeline_flags(&bound);
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -670,6 +675,7 @@ impl HostPipeline {
                 stages: bound,
                 bake_shader,
                 stores,
+                writes_uav,
                 needs_view_heap,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -718,7 +724,7 @@ impl HostPipeline {
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            let (bake_shader, stores, needs_view_heap) = pipeline_flags(&bound);
+            let (bake_shader, stores, writes_uav, needs_view_heap) = pipeline_flags(&bound);
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -727,6 +733,7 @@ impl HostPipeline {
                 stages: bound,
                 bake_shader,
                 stores,
+                writes_uav,
                 needs_view_heap,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -838,7 +845,7 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
-        let (bake_shader, stores, needs_view_heap) = pipeline_flags(&bound);
+        let (bake_shader, stores, writes_uav, needs_view_heap) = pipeline_flags(&bound);
         Some(HostPipeline {
             compute: false,
             mesh: false,
@@ -847,6 +854,7 @@ impl HostPipeline {
             stages: bound,
             bake_shader,
             stores,
+            writes_uav,
             needs_view_heap,
             name: format!("{shaders:?}"),
             slots: g.slots(),

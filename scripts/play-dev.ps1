@@ -1,6 +1,6 @@
 # Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p).
 #   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-s|series-x]
-#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-Warm] [-Safe]
+#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-BarrierTest groups|indirect|both] [-Warm] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
 # Note: -Console series-x is now viable to test on 16 GB VRAM for sharper visuals.
 # Run from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified.
@@ -17,6 +17,7 @@ param(
     [switch]$InplaceProbe,
     [switch]$NoKeepShown,
     [switch]$LearnWriteSites,
+    [ValidateSet('', 'groups', 'indirect', 'both')][string]$BarrierTest = '',
     [switch]$Warm,
     [switch]$Safe,
     [string]$LogFile,
@@ -111,6 +112,7 @@ if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
 if ($InplaceProbe) { $settings.VICTORY_INPLACE_PROBE = '1' }
 if ($NoKeepShown) { $settings.VICTORY_KEEP_SHOWN = '0' }
+if ($BarrierTest) { $settings.VICTORY_BARRIER_TEST = $BarrierTest }
 
 foreach ($k in $More.Keys) { $settings[$k] = [string]$More[$k] }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }

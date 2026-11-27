@@ -134,6 +134,9 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether the shader's code can store to any UAV (buffer or texture/image);
+    /// true when its code is not known.
+    pub(crate) stores_any_uav: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
     /// Whether it stores through a view it picks from the heap by an index,
@@ -208,6 +211,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let stores_any_uav = programs.is_empty() || programs.iter().any(stores_any_uav);
     let threads = programs.iter().find_map(|p| match &p.io {
         victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
         _ => None,
@@ -230,6 +234,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         used,
         tables,
         stores,
+        stores_any_uav,
         stores_by_address,
         picks: Default::default(),
     })
@@ -383,6 +388,33 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to *any* UAV (buffer or image/texture),
+/// used to safely elide global `UAV_BARRIER`s when no UAV-writing shader ran since
+/// the last barrier.
+#[cfg(windows)]
+fn stores_any_uav(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Mubuf
+            | Encoding::Mtbuf
+            | Encoding::Smem
+            | Encoding::Flat
+            | Encoding::Global => name.is_none_or(|n| {
+                (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
+            }),
+            Encoding::Mimg => name.is_none_or(|n| n.contains("store") || n.contains("atomic")),
+            Encoding::Ds => name.is_none_or(|n| n.contains("gds")),
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }

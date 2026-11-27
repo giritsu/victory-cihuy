@@ -142,12 +142,18 @@ thread_local! {
 #[cfg(feature = "diagnostics")]
 #[inline]
 fn record_desc_diag(bucket: usize, ns: u64) {
+    record_desc_diag_n(bucket, 1, ns);
+}
+
+#[cfg(feature = "diagnostics")]
+#[inline]
+fn record_desc_diag_n(bucket: usize, count: u64, ns: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     DESC_DIAG_LOCAL.with(|cell| {
         let (mut vals, mut n) = cell.get();
-        vals[bucket * 2] += 1;
+        vals[bucket * 2] += count;
         vals[bucket * 2 + 1] += ns;
-        n += 1;
+        n += count.min(64) as u32;
         if n >= 64 {
             for (dst, &val) in DESC_DIAG.iter().zip(&vals) {
                 if val != 0 {
@@ -190,18 +196,87 @@ fn mirror(handle: u64) {
         record_desc_diag(4, began.elapsed().as_nanos() as u64);
         return;
     };
-    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
-    match heap.host.get() {
-        None => pending.push(index),
-        Some(host) => {
-            drop(pending);
-            if let Some(host) = host {
-                host.mirror(index, handle, false);
+    if let Some(host) = heap.host.get() {
+        if let Some(host) = host {
+            host.mirror_sync(index, handle);
+        }
+    } else {
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.push(index),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    host.mirror_sync(index, handle);
+                }
             }
         }
     }
     #[cfg(feature = "diagnostics")]
     record_desc_diag(4, began.elapsed().as_nanos() as u64);
+}
+
+/// Batched counterpart of [`mirror`] for contiguous copies of `count`
+/// descriptors of size `step` bytes starting at `dst`, resolving `SHADER_HEAPS`
+/// and `heap.host` once across the whole range when contained in a single heap.
+#[cfg(windows)]
+fn mirror_range(dst: u64, count: u32, step: u64) {
+    if count == 0 {
+        return;
+    }
+    if count == 1 {
+        mirror(dst);
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    let end = dst.saturating_add(u64::from(count).saturating_mul(step));
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(&(h_start, h_end, at)) = heaps
+        .iter()
+        .find(|&&(start, heap_end, _)| dst < heap_end && end > start)
+    else {
+        #[cfg(feature = "diagnostics")]
+        record_desc_diag_n(4, u64::from(count), began.elapsed().as_nanos() as u64);
+        return;
+    };
+    if dst >= h_start && end <= h_end {
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock we hold here.
+        let heap = unsafe { &*(at as *const Heap) };
+        if increment(heap.desc.kind).map(u64::from) == Some(step)
+            && let Some(first) = heap.index(dst)
+            && first.saturating_add(count) <= heap.desc.count
+        {
+            if let Some(host) = heap.host.get() {
+                if let Some(host) = host {
+                    for i in 0..count {
+                        host.mirror_sync(first + i, dst + u64::from(i) * step);
+                    }
+                }
+            } else {
+                let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+                match heap.host.get() {
+                    None => pending.extend(first..first + count),
+                    Some(host) => {
+                        drop(pending);
+                        if let Some(host) = host {
+                            for i in 0..count {
+                                host.mirror_sync(first + i, dst + u64::from(i) * step);
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            record_desc_diag_n(4, u64::from(count), began.elapsed().as_nanos() as u64);
+            return;
+        }
+    }
+    drop(heaps);
+    for i in 0..u64::from(count) {
+        mirror(dst + i * step);
+    }
 }
 
 /// Whether [`sync_heaps`] is done (`VICTORY_HEAP_SYNC=0`: not).
@@ -1664,9 +1739,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
     #[cfg(feature = "diagnostics")]
     record_desc_diag(3, began.elapsed().as_nanos() as u64);
@@ -2190,5 +2263,56 @@ mod tests {
         for th in threads {
             th.join().unwrap();
         }
+    }
+
+    #[test]
+    fn copy_simple_batched_mirror_preserves_views_and_handles_non_shader_heaps() {
+        let null = std::ptr::null();
+        let src_slots = vec![0u64; 8 * 4];
+        let src = src_slots.as_ptr() as u64;
+        for i in 0..8u64 {
+            let addr = 0x8_0000_0000 + i * 0x100;
+            create_cbv(null, &[addr as u32, (addr >> 32) as u32, 256, 0], src + i * 32);
+        }
+
+        // Copy into non-shader-visible memory should copy words cleanly and skip mirroring.
+        let plain_dst = vec![0u64; 8 * 4];
+        copy_simple(null, 8, plain_dst.as_ptr() as u64, src, 0);
+        for i in 0..8u64 {
+            assert_eq!(
+                view(plain_dst.as_ptr() as u64 + i * 32),
+                Some(View::Constant(0x8_0000_0000 + i * 0x100, 256))
+            );
+        }
+
+        // Copy into a placed shader-visible heap (`count = 8`) mirrors all slots via `mirror_range`.
+        let mut heap_mem = vec![0u8; 8 * 32];
+        let address = heap_mem.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: 0,
+            count: 8,
+            flags: 1,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        assert_eq!(
+            create(
+                desc,
+                Placement {
+                    address,
+                    size: 8 * 32,
+                },
+                &mut h,
+            ),
+            S_OK
+        );
+        copy_simple(null, 8, address, src, 0);
+        for i in 0..8u64 {
+            assert_eq!(
+                view(address + i * 32),
+                Some(View::Constant(0x8_0000_0000 + i * 0x100, 256))
+            );
+        }
+        unsafe { drop(Box::from_raw(h.cast_mut().cast::<Heap>())) };
     }
 }
