@@ -399,6 +399,40 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     out
 }
 
+/// Batched [`shown_elsewhere`] across multiple `(address, bytes)` spans under one
+/// lock of [`VIEWS`], returning pages deduplicated in address order.
+pub(crate) fn shown_elsewhere_spans(spans: &[(usize, usize)]) -> Vec<(usize, Vec<usize>)> {
+    let v = views();
+    let mut out = Vec::new();
+    if spans.is_empty() || v.pages_twice == 0 {
+        return out;
+    }
+    for &(start, len) in spans {
+        if len == 0 {
+            continue;
+        }
+        let end = start.saturating_add(len);
+        if start >= end {
+            continue;
+        }
+        let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+        for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
+            let from = start.max(base) & !(K64 - 1);
+            for page in (from..end.min(base + bytes)).step_by(K64) {
+                let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
+                    continue;
+                };
+                if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
+                    out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
+                }
+            }
+        }
+    }
+    out.sort_unstable_by_key(|e| e.0);
+    out.dedup_by_key(|e| e.0);
+    out
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
@@ -1455,5 +1489,30 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn shown_elsewhere_spans_matches_union_with_dedup() {
+        let sec = 0xDEAD_BEEFusize;
+        let a = 0x6_1000_0000usize;
+        let b = 0x6_2000_0000usize;
+        let c = 0x6_3000_0000usize;
+        title_memory_view(a, 3 * K64, sec, 0);
+        title_memory_view(b, 2 * K64, sec, 0);
+        title_memory_view(c, K64, sec, 2 * K64 as u64);
+
+        let spans = [(a, K64 + 64), (a + K64, 2 * K64), (c, K64)];
+        let batched = shown_elsewhere_spans(&spans);
+        let mut expected: Vec<(usize, Vec<usize>)> = spans
+            .iter()
+            .flat_map(|&(at, len)| shown_elsewhere(at, at + len))
+            .collect();
+        expected.sort_unstable_by_key(|e| e.0);
+        expected.dedup_by_key(|e| e.0);
+        assert_eq!(batched, expected);
+
+        views_gone(a, 3 * K64);
+        views_gone(b, 2 * K64);
+        views_gone(c, K64);
     }
 }

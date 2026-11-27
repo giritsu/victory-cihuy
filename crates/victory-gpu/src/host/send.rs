@@ -123,7 +123,13 @@ fn kept() -> u64 {
     if on_card() {
         256 << 20
     } else if crate::residency::compact_host_ram() {
-        128 << 20
+        if crate::residency::critical_commit() {
+            0
+        } else if crate::residency::shared_pressured() {
+            128 << 20
+        } else {
+            256 << 20
+        }
     } else {
         768 << 20
     }
@@ -151,7 +157,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     }
     // By doubles, so that the next of about this size finds it: what
     // submissions send differs from frame to frame.
-    let size = size.max(8 << 20).next_power_of_two();
+    let size = size.max(2 << 20).next_power_of_two();
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
@@ -165,14 +171,25 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     })
 }
 
+fn trim_spare_vec<T>(spare: &mut Vec<T>, size_of: impl Fn(&T) -> u64, limit: u64) {
+    const SPIKE_BYTES: u64 = 32 << 20;
+    spare.sort_by_key(|m| std::cmp::Reverse(size_of(m)));
+    let mut total: u64 = spare.iter().map(&size_of).sum();
+    while total > limit && !spare.is_empty() {
+        let removed = if size_of(&spare[0]) > SPIKE_BYTES {
+            spare.remove(0)
+        } else {
+            spare.pop().expect("non-empty spare")
+        };
+        total -= size_of(&removed);
+    }
+}
+
 /// The submission has run.
 pub(super) fn give_back(memory: Memory) {
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
-    spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
-        spare.remove(0);
-    }
+    trim_spare_vec(&mut spare, |m| m.size, kept());
 }
 
 /// Drops spare submission-send upload buffers under critical memory pressure or OOM.
@@ -201,48 +218,108 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
+/// Splits large moves (`> chunk_bytes`) and packs small moves into `~chunk_bytes` groups.
+fn build_copy_groups(
+    moves: &[(usize, u64, usize)],
+    chunk_bytes: usize,
+) -> (Vec<(usize, u64, usize)>, Vec<std::ops::Range<usize>>) {
+    let chunk_bytes = chunk_bytes.max(1);
+    let mut slices = Vec::with_capacity(moves.len());
+    let mut groups = Vec::new();
+    let mut group_start = 0usize;
+    let mut group_bytes = 0usize;
+    for &(src, dst, len) in moves {
+        if len == 0 {
+            continue;
+        }
+        let mut off = 0usize;
+        while off < len {
+            let take = (len - off).min(chunk_bytes - group_bytes);
+            slices.push((src + off, dst + off as u64, take));
+            off += take;
+            group_bytes += take;
+            if group_bytes >= chunk_bytes {
+                groups.push(group_start..slices.len());
+                group_start = slices.len();
+                group_bytes = 0;
+            }
+        }
+    }
+    if group_start < slices.len() {
+        groups.push(group_start..slices.len());
+    }
+    (slices, groups)
+}
+
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| short(a, b - a);
+    let is_short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
+    let mut raw_moves: Vec<(usize, u64, usize)> = Vec::new();
+    let mut total_move_bytes = 0usize;
+    let mut total_words = 0usize;
+    let mut chunk_words: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
+    let mut scatter_work: Vec<(usize, &[(usize, usize)], u64)> = Vec::new();
+    for (shadow, ranges) in dirty {
+        let from = shadow.card_data() as usize;
         let mut runs = Vec::new();
-        for &(a, b) in ranges.iter().filter(|r| !short(r)) {
-            runs.push((a, at, b - a));
-            at += ((b - a) as u64).next_multiple_of(16);
+        let chunk_begin = chunk_words.len();
+        let mut copy_words = 0usize;
+        for chunk in ranges.chunks(RUNS_AT_A_TIME) {
+            let mut words = 0usize;
+            for &(a, b) in chunk {
+                let len = b - a;
+                if short(a, len) {
+                    words += len / 4;
+                } else {
+                    runs.push((a, at, len));
+                    raw_moves.push((from + a, at, len));
+                    total_move_bytes += len;
+                    at += (len as u64).next_multiple_of(16);
+                }
+            }
+            if words > 0 {
+                chunk_words.push((from, chunk, words));
+                copy_words += words;
+            }
         }
-        let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-        copies.push(Copy { runs, pairs: (at, words as u32) });
-        at += (words as u64 * 8).next_multiple_of(16);
+        copies.push(Copy {
+            runs,
+            pairs: (at, copy_words as u32),
+        });
+        let mut pair_at = at;
+        for &(c_from, chunk, words) in &chunk_words[chunk_begin..] {
+            scatter_work.push((c_from, chunk, pair_at));
+            pair_at += words as u64 * 8;
+        }
+        chunk_words.truncate(chunk_begin);
+        total_words += copy_words;
+        at += (copy_words as u64 * 8).next_multiple_of(16);
     }
     if at == 0 {
         return None;
     }
     let memory = memory(host, at)?;
-    let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
-    for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
-        let from = shadow.card_data() as usize;
-        moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
-        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
-            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
-            if words > 0 {
-                work.push((from, ranges, to));
-                to += words * 8;
+    let mem_data = memory.data;
+    let (copy_slices, copy_groups) = build_copy_groups(&raw_moves, 256 << 10);
+    let copy_count = copy_groups.len();
+    let total_jobs = copy_count + scatter_work.len();
+    let run_job = |i: usize| {
+        if i < copy_count {
+            for &(src, rel_dst, len) in &copy_slices[copy_groups[i].clone()] {
+                // SAFETY: non-overlapping slices inside source mapping and freshly allocated `memory`.
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, (mem_data + rel_dst as usize) as *mut u8, len) };
             }
+            return;
         }
-    }
-    let one = |i: usize| {
-        let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
-        for &(a, b) in ranges.iter().filter(|r| short(r)) {
+        let (from, ranges, pair_rel) = scatter_work[i - copy_count];
+        let mut to = (mem_data + pair_rel as usize) as *mut [u32; 2];
+        for &(a, b) in ranges.iter().filter(|r| is_short(r)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
@@ -256,11 +333,15 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     };
-    crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
-    STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    let total_bytes = total_move_bytes + total_words * 8;
+    if total_jobs >= 2 && total_bytes >= (256 << 10) {
+        crate::land::each_under(total_jobs, &run_job);
+    } else {
+        (0..total_jobs).for_each(run_job);
+    }
+    STATS[0].fetch_add(total_move_bytes as u64, Ordering::Relaxed);
+    STATS[1].fetch_add(raw_moves.len() as u64, Ordering::Relaxed);
+    STATS[2].fetch_add(total_words as u64, Ordering::Relaxed);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
 }
@@ -337,5 +418,52 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_copy_groups, trim_spare_vec};
+
+    #[test]
+    fn copy_groups_split_large_and_pack_small_runs() {
+        let moves = [
+            (0x1000, 0, 100),
+            (0x2000, 200, 200),
+            (0x3000, 1000, 700),
+            (0x4000, 2000, 0),
+        ];
+        let (slices, groups) = build_copy_groups(&moves, 256);
+        assert!(groups.len() >= 4);
+        let mut unpacked = Vec::new();
+        for g in &groups {
+            let group_bytes: usize = slices[g.clone()].iter().map(|s| s.2).sum();
+            assert!(group_bytes <= 256);
+            for &(src, dst, len) in &slices[g.clone()] {
+                for off in 0..len {
+                    unpacked.push((src + off, dst + off as u64));
+                }
+            }
+        }
+        let mut expected = Vec::new();
+        for &(src, dst, len) in &moves {
+            for off in 0..len {
+                expected.push((src + off, dst + off as u64));
+            }
+        }
+        assert_eq!(unpacked, expected);
+    }
+
+    #[test]
+    fn trim_spare_evicts_oversized_spikes_first_then_smallest() {
+        let mut items = vec![4u64 << 20, 16 << 20, 8 << 20, 64 << 20, 16 << 20];
+        // Total = 108 MiB, limit = 40 MiB:
+        // First evicts 64 MiB spike (>32 MiB) -> remaining 44 MiB (16, 16, 8, 4),
+        // then evicts smallest (4 MiB) -> remaining 40 MiB (16, 16, 8).
+        trim_spare_vec(&mut items, |&s| s, 40 << 20);
+        assert_eq!(items, vec![16 << 20, 16 << 20, 8 << 20]);
+
+        trim_spare_vec(&mut items, |&s| s, 0);
+        assert!(items.is_empty());
     }
 }

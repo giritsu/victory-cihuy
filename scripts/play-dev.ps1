@@ -1,23 +1,33 @@
-# Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p).
-#   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-s|series-x]
-#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-InplaceProbe] [-Safe]
+# Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p, Series X + Ray Tracing default).
+#   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-x|series-s]
+#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-NoRayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-BarrierTest groups|indirect|both] [-Warm] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
+# Note: -Console series-x and -RayTracing (VICTORY_BVH_BUILDER=1) are enabled by default; pass -NoRayTracing for A/B comparison.
 # Run from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified.
 param(
     [string]$GameDir = $env:VICTORY_GAME_DIR,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
+    [ValidateSet('series-s', 'series-x')][string]$Console = 'series-x',
     [switch]$Panel,
     [switch]$DebugLayer,
     [switch]$DredLight,
     [switch]$MemoryMap,
     [switch]$RayTracing,
+    [switch]$NoRayTracing,
     [switch]$LevelsOnDemand,
     [switch]$InplaceProbe,
+    [switch]$NoKeepShown,
+    [switch]$LearnWriteSites,
+    [ValidateSet('', 'groups', 'indirect', 'both')][string]$BarrierTest = '',
+    [switch]$Warm,
     [switch]$Safe,
-    [string]$LogFile = (Join-Path $env:LOCALAPPDATA 'victory\dev-run.log'),
+    [string]$LogFile,
     [hashtable]$More = @{}
 )
+
+if (-not $LogFile) {
+    $LogFile = Join-Path $env:LOCALAPPDATA "victory\dev-run-$Console-$Build.log"
+}
 
 if (-not $GameDir) {
     Write-Host "Set -GameDir or `$env:VICTORY_GAME_DIR to your game dump folder containing game_scarlett_master.exe."
@@ -68,6 +78,7 @@ $settings = @{
     VICTORY_AMBIENT              = '0.8'
     VICTORY_AMBIENT_AIR          = '1.5'
     VICTORY_CARD_BUFFERS_MIN_KB  = '256'
+    VICTORY_TEXTURE_STAGE_MS     = '12'
 }
 
 if ($Build -eq 'diag') {
@@ -75,7 +86,7 @@ if ($Build -eq 'diag') {
     $settings.VICTORY_D3D12_DRED = if ($DredLight) { 'light' } else { 'faults' }
     $settings.VICTORY_MEMORY_MAP = if ($MemoryMap) { '1' } else { '0' }
 } else {
-    $settings.VICTORY_LOG = 'warn'
+    $settings.VICTORY_LOG = 'warn,victory_gpu::fps=info'
 }
 
 if ($Safe) {
@@ -85,22 +96,41 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'
     $settings.VICTORY_JOIN_PARTS = '8'
     $settings.VICTORY_UPLOAD_AHEAD = '1'
+    $settings.VICTORY_PLACED_ORDER = '1'
+    $settings.VICTORY_COPY_BESIDE = '1'
+    $settings.VICTORY_WRITE_SITES = (Join-Path $env:VICTORY_CACHE_DIR 'write-sites.txt')
+    if ($LearnWriteSites) { $settings.VICTORY_STORE_BESIDE = '1' }
+    $settings.VICTORY_THIN_THREADS = '4'
+    $settings.VICTORY_LAND_THREADS = '4'
+    $settings.VICTORY_WIDE_THREADS = '4'
+    $settings.VICTORY_VIEW_THREADS = '4'
+    $settings.VICTORY_UNDER_THREADS = '4'
 }
 
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
 if ($DebugLayer) { $settings.VICTORY_D3D12_DEBUG = '1' }
-if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if (-not $NoRayTracing -or $RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
 if ($InplaceProbe) { $settings.VICTORY_INPLACE_PROBE = '1' }
+if ($NoKeepShown) { $settings.VICTORY_KEEP_SHOWN = '0' }
+if ($BarrierTest) { $settings.VICTORY_BARRIER_TEST = $BarrierTest }
 
 foreach ($k in $More.Keys) { $settings[$k] = [string]$More[$k] }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
+
+if ($Warm) {
+    Write-Host "Pre-warming driver pipelines (`$env:VICTORY_CACHE_DIR = $($env:VICTORY_CACHE_DIR))..."
+    & $victory warm --used --jobs 6
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "warning: victory warm returned exit code $LASTEXITCODE"
+    }
+}
 
 $logDir = Split-Path -Parent $LogFile
 if ($logDir) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 
 $Exe = (Resolve-Path $Exe).Path
-Write-Host "Running [$Build] ($Console) -> log: $LogFile"
+Write-Host "Running [$Build] ($Console, RT=$($settings.ContainsKey('VICTORY_BVH_BUILDER'))) -> log: $LogFile"
 Write-Host "Cache: $($env:VICTORY_CACHE_DIR)"
 
 $stream = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)

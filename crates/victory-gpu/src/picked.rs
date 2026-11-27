@@ -118,6 +118,8 @@ fn ask(shader: Arc<crate::pipeline::Shader>) {
     let asks = ASKS.get_or_init(|| {
         let (send, asks) = channel::<Arc<crate::pipeline::Shader>>();
         let _ = std::thread::Builder::new().name("victory-picked".into()).spawn(move || {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::register_worker("picked");
             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
             // SAFETY: this thread's own.
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };

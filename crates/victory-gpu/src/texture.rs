@@ -625,12 +625,23 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
 /// Whether the host GPU wrote `resource` by a copy or resolve
 /// ([`host_written`]): its host copy cannot be made again from title
 /// memory.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn host_wrote(resource: usize) -> bool {
     HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
         .is_some_and(|set| set.contains(&resource))
+}
+
+/// Snapshot of [`HOST_WRITTEN`] for batch lookups during [`crate::resource::let_go_idle`].
+pub(crate) fn host_written_snapshot() -> Option<std::collections::HashSet<usize>> {
+    HOST_WRITTEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .filter(|set| !set.is_empty())
+        .cloned()
 }
 
 /// The title released a resource.
@@ -1040,7 +1051,7 @@ pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12R
     if bytes == 0 || bytes == u64::MAX {
         return;
     }
-    let Some((buffer, data)) = list.upload(host, bytes) else {
+    let Some((buffer, data)) = list.upload_cpu(host, bytes) else {
         return;
     };
     // SAFETY: a mapped buffer of `bytes` bytes, just made.
@@ -1106,7 +1117,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 host.device
                     .GetCopyableFootprints(&d, level, 1, 0, Some(&mut footprint), None, None, Some(&mut bytes));
             }
-            let Some((buffer, data)) = list.upload(host, bytes) else {
+            let Some((buffer, data)) = list.upload_cpu(host, bytes) else {
                 // (With the levels that share its tiles, if it is one of
                 // the small ones.)
                 unzeroed |= tiled.with_level(level);

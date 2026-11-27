@@ -434,6 +434,63 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+fn parse_title_affinity_unpin(val: Option<&std::ffi::OsStr>) -> bool {
+    val.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("unpin"))
+}
+
+/// Whether the title's CPU core pinning should be ignored so Windows
+/// schedules freely across all PC cores (`VICTORY_TITLE_AFFINITY=1` or
+/// `unpin`). Defaults to pass-through to avoid oversubscribing 6C/12T CPUs
+/// alongside VIctory's worker pools.
+fn title_affinity_unpin() -> bool {
+    static UNPIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNPIN.get_or_init(|| parse_title_affinity_unpin(std::env::var_os("VICTORY_TITLE_AFFINITY").as_deref()))
+}
+
+#[cfg(windows)]
+pub type GroupAffinity = windows_sys::Win32::System::SystemInformation::GROUP_AFFINITY;
+
+#[cfg(not(windows))]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+#[allow(non_snake_case)]
+pub struct GroupAffinity {
+    pub Mask: usize,
+    pub Group: u16,
+    pub Reserved: [u16; 3],
+}
+
+/// Passes the title's thread group affinity through to Windows by default;
+/// `VICTORY_TITLE_AFFINITY=1` or `unpin` leaves threads unpinned across host cores.
+pub extern "system" fn SetThreadGroupAffinity(
+    thread: *mut c_void,
+    group_affinity: *const GroupAffinity,
+    previous_group_affinity: *mut GroupAffinity,
+) -> i32 {
+    if group_affinity.is_null() || !title_affinity_unpin() {
+        return host::set_thread_group_affinity(thread, group_affinity, previous_group_affinity);
+    }
+    if !previous_group_affinity.is_null() {
+        return host::get_thread_group_affinity(thread, previous_group_affinity);
+    }
+    1
+}
+
+/// Passes the title's legacy processor affinity mask through by default;
+/// `VICTORY_TITLE_AFFINITY=1` or `unpin` leaves threads unpinned.
+pub extern "system" fn SetThreadAffinityMask(thread: *mut c_void, mask: usize) -> usize {
+    if mask == 0 || !title_affinity_unpin() {
+        return host::set_thread_affinity_mask(thread, mask);
+    }
+    let mut current = std::mem::MaybeUninit::<GroupAffinity>::zeroed();
+    if host::get_thread_group_affinity(thread, current.as_mut_ptr()) != 0 {
+        // SAFETY: `get_thread_group_affinity` succeeded and initialized `current`.
+        unsafe { current.assume_init() }.Mask
+    } else {
+        0
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +499,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +527,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(SetThreadGroupAffinity),
+            hle_export!(SetThreadAffinityMask),
         ],
     }
 }
@@ -489,7 +549,9 @@ mod host {
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
         GetModuleHandleW, GetProcAddress, LoadLibraryExA, LoadLibraryExW,
     };
-    use windows_sys::Win32::System::Threading::TerminateProcess;
+    use windows_sys::Win32::System::Threading::{
+        GetThreadGroupAffinity, SetThreadAffinityMask, SetThreadGroupAffinity, TerminateProcess,
+    };
 
     unsafe extern "C" {
         #[link_name = "exit"]
@@ -571,6 +633,25 @@ mod host {
     pub(super) fn terminate_process(process: *mut c_void, code: u32) -> i32 {
         // SAFETY: see above.
         unsafe { TerminateProcess(process, code) }
+    }
+
+    pub(super) fn get_thread_group_affinity(thread: *mut c_void, out: *mut super::GroupAffinity) -> i32 {
+        // SAFETY: see above.
+        unsafe { GetThreadGroupAffinity(thread, out) }
+    }
+
+    pub(super) fn set_thread_group_affinity(
+        thread: *mut c_void,
+        group_affinity: *const super::GroupAffinity,
+        previous_group_affinity: *mut super::GroupAffinity,
+    ) -> i32 {
+        // SAFETY: see above.
+        unsafe { SetThreadGroupAffinity(thread, group_affinity, previous_group_affinity) }
+    }
+
+    pub(super) fn set_thread_affinity_mask(thread: *mut c_void, mask: usize) -> usize {
+        // SAFETY: see above.
+        unsafe { SetThreadAffinityMask(thread, mask) }
     }
 
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
@@ -668,6 +749,26 @@ mod host {
         std::process::exit(code as i32)
     }
 
+    pub(super) fn get_thread_group_affinity(_: *mut c_void, out: *mut super::GroupAffinity) -> i32 {
+        if !out.is_null() {
+            // SAFETY: caller provides a writable affinity struct.
+            unsafe { *out = super::GroupAffinity { Mask: usize::MAX, ..Default::default() } };
+        }
+        1
+    }
+
+    pub(super) fn set_thread_group_affinity(
+        _: *mut c_void,
+        _: *const super::GroupAffinity,
+        previous_group_affinity: *mut super::GroupAffinity,
+    ) -> i32 {
+        get_thread_group_affinity(std::ptr::null_mut(), previous_group_affinity)
+    }
+
+    pub(super) fn set_thread_affinity_mask(_: *mut c_void, _: usize) -> usize {
+        usize::MAX
+    }
+
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
 
     pub(super) fn report_unhandled(_: *const c_void) {}
@@ -699,6 +800,48 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn title_thread_affinity_passes_through_by_default() {
+        use std::ffi::OsStr;
+        assert!(!parse_title_affinity_unpin(None));
+        assert!(!parse_title_affinity_unpin(Some(OsStr::new("0"))));
+        assert!(parse_title_affinity_unpin(Some(OsStr::new("1"))));
+        assert!(parse_title_affinity_unpin(Some(OsStr::new("unpin"))));
+        assert!(parse_title_affinity_unpin(Some(OsStr::new("UNPIN"))));
+
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadGroupAffinity};
+            std::thread::spawn(|| {
+                // SAFETY: plain calls on this thread.
+                let thread = unsafe { GetCurrentThread() };
+                let mut before = std::mem::MaybeUninit::<GroupAffinity>::zeroed();
+                assert_ne!(unsafe { GetThreadGroupAffinity(thread, before.as_mut_ptr()) }, 0);
+                let before = unsafe { before.assume_init() };
+
+                let one = before.Mask & before.Mask.wrapping_neg();
+                let asked = GroupAffinity { Mask: one, Group: before.Group, Reserved: [0; 3] };
+                let mut prev = std::mem::MaybeUninit::<GroupAffinity>::zeroed();
+                assert_ne!(SetThreadGroupAffinity(thread, &asked, prev.as_mut_ptr()), 0);
+                let prev = unsafe { prev.assume_init() };
+                assert_eq!(prev.Mask, before.Mask);
+
+                let mut after = std::mem::MaybeUninit::<GroupAffinity>::zeroed();
+                assert_ne!(unsafe { GetThreadGroupAffinity(thread, after.as_mut_ptr()) }, 0);
+                let after = unsafe { after.assume_init() };
+                assert_eq!(after.Mask, one);
+
+                assert_eq!(SetThreadAffinityMask(thread, before.Mask), one);
+                let mut restored = std::mem::MaybeUninit::<GroupAffinity>::zeroed();
+                assert_ne!(unsafe { GetThreadGroupAffinity(thread, restored.as_mut_ptr()) }, 0);
+                let restored = unsafe { restored.assume_init() };
+                assert_eq!(restored.Mask, before.Mask);
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     #[test]

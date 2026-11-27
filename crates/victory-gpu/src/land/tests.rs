@@ -206,10 +206,54 @@ fn a_piece_lands_what_the_card_wrote_in_its_parts() {
         }
         assert!(held == expect_held, "round {round}");
         assert!(title.bytes()[from..from + len] == expect[..], "round {round}");
-        // Told: a refresh from now on takes the block again.
-        let (_, written) = crate::watch::writes(title.at, title.at + BLOCK, true).expect("a view");
+        let again = crate::watch::writes(title.at, title.at + BLOCK, true).expect("a view");
+        let (_, written) = again;
         let told = written.iter().any(|&(page, at)| page == title.at / BLOCK && at > asked);
         assert!(told || put == 0, "round {round}: {put} bytes, {written:?} after {asked}");
+    }
+}
+
+#[test]
+fn notes_extend_and_unguarded_direct_landings_note_pages() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    assert!(crate::safecopy::on());
+    let title = Title::new(2 * BLOCK);
+    assert!(crate::watch::writes(title.at, title.at + BLOCK, true).is_some());
+    // SAFETY: plain private test buffer for unguarded direct merge.
+    let direct = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+    assert_ne!(direct, 0);
+
+    let now_beside = vec![0xAAu8; 4096];
+    let mut held_beside = vec![0u8; 4096];
+    let now_direct = vec![0xBBu8; 4096];
+    let mut held_direct = vec![0u8; 4096];
+    let mut j1 = Notes::default();
+    let mut j2 = Notes::default();
+    // SAFETY: valid test views and private test allocations.
+    unsafe {
+        piece(title.at, now_beside.as_ptr(), held_beside.as_mut_ptr(), &[(0, 4096)], true, &mut j1, std::ptr::null());
+        piece(direct, now_direct.as_ptr(), held_direct.as_mut_ptr(), &[(0, 4096)], true, &mut j2, std::ptr::null());
+    }
+    let mut merged = Notes::default();
+    merged.extend(j1);
+    merged.extend(j2);
+    merged.flush();
+    assert!(crate::watch::landed_lately(title.at, 4096, 1));
+    assert!(crate::watch::landed_lately(direct, 4096, 1));
+
+    // SAFETY: test allocation cleanup.
+    unsafe { VirtualFree(direct as *mut _, 0, MEM_RELEASE) };
+}
+
+#[test]
+fn pool_handles_zero_one_two_and_large_counts_without_duplicates() {
+    let pool = Pool::new("victory-land", 4);
+    for count in [0usize, 1, 2, 7, 257] {
+        let seen: Vec<AtomicUsize> = (0..count).map(|_| AtomicUsize::new(0)).collect();
+        pool.each(count, &|i| {
+            seen[i].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(seen.iter().all(|c| c.load(Ordering::Relaxed) == 1), "count={count}");
     }
 }
 

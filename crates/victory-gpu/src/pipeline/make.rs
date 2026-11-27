@@ -46,6 +46,9 @@ pub(crate) struct Pending {
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
+    /// Heavy RT resolve / ray-activation shader: queue cleanly on first request
+    /// without stalling recording threads against the per-frame wait budget.
+    non_blocking: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
 }
@@ -118,10 +121,14 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
+        let non_blocking = !screen
+            && (named(&shaders, b"CS_RaytracingResolve")
+                || named(&shaders, b"CS_ScreenProbes_ActivateRays"));
         let left_out = left_out(&shaders);
         Pending {
             screen,
             scene_input,
+            non_blocking,
             left_out,
             shaders,
             graphics,
@@ -150,10 +157,13 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Why a pipeline has no host pipeline (diagnostics): its skip reason, shaders
+/// that do not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
+    if let Some(why) = p.left_out {
+        return Some(why.into());
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some("being made".into()),
@@ -272,9 +282,29 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_PIPELINE_WAIT_SLOW=1`: wait within the frame budget even for
+/// RT resolve / known-slow pipelines (default: off — queue and return
+/// immediately so recording threads never stall 500 ms/frame).
+fn wait_slow() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SLOW").is_some_and(|v| v == "1"))
+}
+
+fn should_wait_for(screen: bool, non_blocking: bool, is_slow: bool, wait_slow: bool) -> bool {
+    screen || wait_slow || (!non_blocking && !is_slow)
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
+    if !should_wait_for(
+        screen,
+        p.non_blocking,
+        !screen && super::library::slow(&p.key),
+        wait_slow(),
+    ) {
+        return;
+    }
     let budget = if screen { screen_budget() } else { wait_budget() };
     if budget.is_zero() {
         return;
@@ -485,6 +515,15 @@ fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool, 
     }
 }
 
+fn set_worker_priority(lowest: bool) {
+    // SAFETY: a plain call on our own thread.
+    unsafe {
+        use windows::Win32::System::Threading::*;
+        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+        let _ = SetThreadPriority(GetCurrentThread(), priority);
+    }
+}
+
 /// Starts the workers ([`worker_count`]) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -509,15 +548,17 @@ fn workers() -> bool {
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
                     let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
+                    set_worker_priority(lowest);
                     loop {
                         let p = next(screens_only);
+                        let boost = lowest && p.used.load(Ordering::Relaxed);
+                        if boost {
+                            set_worker_priority(false);
+                        }
                         p.make();
+                        if boost {
+                            set_worker_priority(true);
+                        }
                         if p.was_slow.load(Ordering::Relaxed) {
                             let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
                             queue.slow_now -= 1;
@@ -665,5 +706,22 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn rt_resolve_and_slow_pipelines_do_not_block_recording_threads() {
+        // Screen passes always wait; non-screen RT / slow pipelines do not wait unless forced.
+        assert!(should_wait_for(true, true, true, false));
+        assert!(!should_wait_for(false, true, false, false));
+        assert!(!should_wait_for(false, false, true, false));
+        assert!(should_wait_for(false, false, false, false));
+        assert!(should_wait_for(false, true, true, true));
+
+        let rt = super::super::shader("compute", b"test_CS_RaytracingResolve_pass");
+        let activate = super::super::shader("compute", b"test_CS_ScreenProbes_ActivateRays");
+        let regular = super::super::shader("compute", b"test_regular_compute");
+        assert!(Pending::new(vec![rt], None).non_blocking);
+        assert!(Pending::new(vec![activate], None).non_blocking);
+        assert!(!Pending::new(vec![regular], None).non_blocking);
     }
 }

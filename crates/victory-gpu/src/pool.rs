@@ -39,8 +39,8 @@ const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
-/// Staging blocks kept on compact (<= 16 GiB RAM) hosts: 128 MiB.
-const STAGING_COMPACT: usize = 2;
+/// Staging blocks kept on compact (<= 16 GiB RAM) hosts: 48 MiB (6 x 8 MiB).
+const STAGING_COMPACT: usize = 6;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 static STAGING_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
@@ -55,7 +55,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     let staging_limit = if crate::residency::critical_commit() {
         0
     } else if pressure {
-        usize::from(!crate::residency::compact_host_ram())
+        if crate::residency::compact_host_ram() {
+            usize::from(!crate::residency::shared_pressured())
+        } else {
+            1
+        }
     } else if crate::residency::compact_host_ram() {
         STAGING_COMPACT
     } else {

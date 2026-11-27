@@ -19,6 +19,20 @@ use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
+fn uav_elide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UAV_ELIDE").is_none_or(|v| v != "0"))
+}
+
+#[cfg(feature = "diagnostics")]
+static UAV_BARRIER_DIAG: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_uav_barrier_diag() -> [u64; 2] {
+    std::array::from_fn(|i| UAV_BARRIER_DIAG[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(windows)]
 pub(crate) mod thin;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
@@ -243,9 +257,22 @@ const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 #[cfg(windows)]
 fn idle_most() -> (usize, u64) {
     if crate::residency::compact_host_ram() {
-        (320, 64 << 20)
+        (448, 64 << 20)
     } else {
         IDLE_MOST
+    }
+}
+
+#[cfg(any(windows, test))]
+fn idle_trim_keep(compact: bool, shared_pressured: bool, critical: bool) -> usize {
+    if critical {
+        128
+    } else if shared_pressured {
+        256
+    } else if compact {
+        384
+    } else {
+        256
     }
 }
 
@@ -271,13 +298,11 @@ pub(crate) fn trim_idle_to(keep: usize) {
 #[cfg(windows)]
 pub(crate) fn trim_idle() {
     thin::trim_idle();
-    let keep = if crate::residency::compact_host_ram() {
-        if crate::residency::critical_commit() { 128 } else { 256 }
-    } else if crate::residency::critical_commit() {
-        128
-    } else {
-        256
-    };
+    let keep = idle_trim_keep(
+        crate::residency::compact_host_ram(),
+        crate::residency::shared_pressured(),
+        crate::residency::critical_commit(),
+    );
     trim_idle_to(keep);
 }
 
@@ -346,19 +371,91 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         return;
     }
     let most = idle_most();
+    let room = {
+        let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        most.0.saturating_sub(idle.0.len())
+    };
+    let mut to_reset = Vec::with_capacity(room.min(ran.len()));
     for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most.0 {
-            continue;
+        if to_reset.len() < room && ran.contains(&i) {
+            to_reset.push(host);
         }
+    }
+    if to_reset.is_empty() {
+        return;
+    }
+    for host in &to_reset {
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+    }
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    for host in to_reset {
+        if idle.0.len() >= most.0 {
+            break;
+        }
         let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < most.0 && idle.1 + bytes <= most.1 {
+        if idle.1 + bytes <= most.1 {
+            idle.0.push(Idle(host, bytes));
+            idle.1 += bytes;
+        }
+    }
+}
+
+/// Parallel batch version of [`recycle`] called by [`crate::host::land`]
+/// outside `victory-land` worker threads.
+#[cfg(windows)]
+pub(crate) fn recycle_many(batches: Vec<(Vec<Detached>, Vec<usize>)>) {
+    if !pools() {
+        return;
+    }
+    let most = idle_most();
+    let room = {
+        let idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        most.0.saturating_sub(idle.0.len())
+    };
+    let mut to_reset = Vec::with_capacity(room);
+    for (lists, ran) in batches {
+        for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+            drop(_state);
+            drop(_uploads);
+            if to_reset.len() < room && ran.contains(&i) {
+                to_reset.push(host);
+            }
+        }
+    }
+    if to_reset.is_empty() {
+        return;
+    }
+    if to_reset.len() >= 4 {
+        struct ResetBatch(Vec<crate::host::HostList>);
+        // SAFETY: D3D12 command allocators/lists and COM references are
+        // free-threaded, and each worker accesses a disjoint index `i` across
+        // distinct `HostList` instances.
+        unsafe impl Sync for ResetBatch {}
+        impl ResetBatch {
+            fn reset(&self, i: usize) {
+                self.0[i].reset();
+            }
+        }
+        let batch = ResetBatch(to_reset);
+        crate::land::each_reset(batch.0.len(), &|i| batch.reset(i));
+        to_reset = batch.0;
+    } else {
+        for host in &to_reset {
+            host.reset();
+        }
+    }
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    for host in to_reset {
+        if idle.0.len() >= most.0 {
+            break;
+        }
+        let bytes = host.scratch_kept();
+        if idle.1 + bytes <= most.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -909,6 +1006,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
+            with_state(this, |_, state| state.clear_uav_dirty());
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
@@ -1672,7 +1770,15 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size: u64) {
     #[cfg(windows)]
     {
-        with_state(this, |_, state| state.synced());
+        let mut emit = true;
+        with_state(this, |_, state| {
+            state.synced();
+            if uav_elide() {
+                emit = state.take_uav_dirty();
+            } else {
+                state.clear_uav_dirty();
+            }
+        });
         if let Some(list) = host_list(this) {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             #[cfg(feature = "diagnostics")]
@@ -1692,11 +1798,14 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                     );
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
+                UAV_BARRIER_DIAG[usize::from(!emit)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            // SAFETY: the same layout; no resource named.
-            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-            // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            if emit {
+                // SAFETY: the same layout; no resource named.
+                let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[barrier]) };
+            }
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2265,7 +2374,22 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-        with_state(this, |_, state| state.synced());
+        let mut emit = true;
+        with_state(this, |_, state| {
+            state.synced();
+            if uav_elide() {
+                emit = state.take_uav_dirty();
+            } else {
+                state.clear_uav_dirty();
+            }
+        });
+        if !emit {
+            #[cfg(feature = "diagnostics")]
+            UAV_BARRIER_DIAG[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        UAV_BARRIER_DIAG[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
@@ -2560,5 +2684,16 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn idle_trim_keep_scales_with_compact_ram_and_pressure() {
+        assert_eq!(idle_trim_keep(true, false, false), 384);
+        assert_eq!(idle_trim_keep(true, true, false), 256);
+        assert_eq!(idle_trim_keep(true, true, true), 128);
+        assert_eq!(idle_trim_keep(true, false, true), 128);
+        assert_eq!(idle_trim_keep(false, false, false), 256);
+        assert_eq!(idle_trim_keep(false, true, false), 256);
+        assert_eq!(idle_trim_keep(false, false, true), 128);
     }
 }

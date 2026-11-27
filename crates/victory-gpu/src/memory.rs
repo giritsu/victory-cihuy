@@ -84,8 +84,17 @@ const PAGE: u64 = 1 << 16;
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
 const PIECE: usize = 4096;
-/// Pages held, at most (3 GiB).
+/// Pages held, at most (3 GiB, or 2 GiB on <=18 GiB RAM hosts).
 const MOST: usize = 3 << 14;
+const MOST_COMPACT: usize = 2 << 14;
+
+fn max_pages_for(compact: bool) -> usize {
+    if compact { MOST_COMPACT } else { MOST }
+}
+
+fn max_pages() -> usize {
+    max_pages_for(crate::residency::compact_host_ram())
+}
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
 /// The biggest packed structure taken for one.
@@ -100,7 +109,7 @@ const AGAIN: u64 = 8;
 const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
 /// The biggest title buffer whose builder results come back.
-const BACK: u64 = 256 << 10;
+pub(crate) const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
 /// pages there are in the first seconds (run light-4).
@@ -178,6 +187,10 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// Last frame each arena copy (`copies` index) was allocated or mutated by us.
+    arena_written: HashMap<usize, u64>,
+    /// Last frame `directory` was mutated by us.
+    dir_written: u64,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -253,12 +266,22 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            arena_written: HashMap::new(),
+            dir_written: 0,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
             #[cfg(feature = "diagnostics")]
             trace: Default::default(),
         })
+    }
+
+    fn mark_arena(&mut self, copy: usize) {
+        self.arena_written.insert(copy, self.frame);
+    }
+
+    fn mark_dir(&mut self) {
+        self.dir_written = self.frame;
     }
 
     /// The directory's entry of `page`.
@@ -342,18 +365,24 @@ impl Memory {
             if fresh {
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
+                let mut wrote_dir = false;
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     let entry = self.entry(at / PAGE);
                     // SAFETY: an entry of the directory.
                     if unsafe { entry.read() } == 0 {
                         close(entry, n, at - first);
+                        wrote_dir = true;
                     }
                     at += PAGE;
+                }
+                if wrote_dir {
+                    self.mark_dir();
                 }
             }
             // SAFETY: as above.
             if unsafe { self.entry(page).read() } == 0 {
                 close(self.entry(page), n, start - shadow.span().0);
+                self.mark_dir();
             }
             return true;
         }
@@ -365,13 +394,15 @@ impl Memory {
             {
                 self.windows += 1;
                 fill(self.entry(page), n, 0);
+                self.mark_dir();
                 return true;
             }
             return false;
         }
-        if self.pages.len() >= MOST {
+        let limit = max_pages();
+        if self.pages.len() >= limit {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
+            ONCE.call_once(|| tracing::warn!(max = limit, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
         if let Some((copy, at)) = self.free.pop() {
@@ -397,6 +428,7 @@ impl Memory {
             return false;
         };
         self.arenas.push((n, at));
+        self.mark_arena(n);
         // The lowest first.
         self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
         true
@@ -407,12 +439,14 @@ impl Memory {
         self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
         self.order.push(page);
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+        self.mark_dir();
     }
 
     /// The packed structure at `address` is gone: the pages it alone had are
     /// given back.
     fn gone(&mut self, address: u64) {
         let Some(packed) = self.packed.remove(&address) else { return };
+        let mut wrote_dir = false;
         for page in address / PAGE..=(address + packed.len - 1) / PAGE {
             let Some(held) = self.pages.get_mut(&page) else { continue };
             held.owners = held.owners.saturating_sub(1);
@@ -421,7 +455,11 @@ impl Memory {
                 self.pages.remove(&page);
                 // SAFETY: an entry of the directory, under the mutex.
                 unsafe { self.entry(page).write_volatile(0) };
+                wrote_dir = true;
             }
+        }
+        if wrote_dir {
+            self.mark_dir();
         }
         self.stats.gone += 1;
     }
@@ -480,10 +518,15 @@ impl Memory {
             len,
             "title memory by address: the structure builder may store in a title buffer"
         );
+        let mut wrote_dir = false;
         for page in first.div_ceil(PAGE)..(first + len) / PAGE {
             if self.copy_of(page) == Some(n) {
                 fill(self.entry(page), n, page * PAGE - first);
+                wrote_dir = true;
             }
+        }
+        if wrote_dir {
+            self.mark_dir();
         }
     }
 
@@ -527,19 +570,29 @@ impl Memory {
                 continue;
             }
             let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
-            let shadow = &self.copies[held.copy];
-            let base = held.at - shadow.span().0 as usize;
+            let copy = held.copy;
+            let held_at = held.at;
+            let shadow = &self.copies[copy];
+            let base = held_at - shadow.span().0 as usize;
             let mut title = [0u8; PIECE];
+            let mut dirty = never;
             for piece in (0..PAGE as usize).step_by(PIECE) {
                 let from = (page * PAGE) as usize + piece;
                 // (Pages that are not there read as zeros.)
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
-                let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+                let ours = unsafe { std::slice::from_raw_parts_mut((held_at + piece) as *mut u8, PIECE) };
+                let changed = merge(&title, ours, never);
+                if changed > 0 {
+                    dirty = true;
+                }
+                self.stats.changed += changed as u64 * 4;
             }
             if never {
                 shadow.resend(base, base + PAGE as usize);
+            }
+            if dirty {
+                self.arena_written.insert(copy, frame);
             }
         }
         self.stats.micros += started.elapsed().as_micros() as u64;
@@ -635,23 +688,29 @@ impl Memory {
     /// or not.
     fn take(&mut self, page: u64, from: usize, to: usize, whole: bool) {
         let Some(held) = self.pages.get(&page) else { return };
-        let shadow = &self.copies[held.copy];
-        let base = held.at - shadow.span().0 as usize;
+        let (copy, held_at) = (held.copy, held.at);
+        let shadow = &self.copies[copy];
+        let base = held_at - shadow.span().0 as usize;
         let mut title = [0u8; PIECE];
         let mut at = from;
+        let mut dirty = whole;
         while at < to {
             let n = (PIECE - at % PIECE).min(to - at);
             crate::host::copy_mapped(title.as_mut_ptr(), (page as usize * PAGE as usize + at) as *const u8, n, false);
             // SAFETY: a page of an arena of ours, under the mutex.
-            let ours = unsafe { std::slice::from_raw_parts_mut((held.at + at) as *mut u8, n) };
+            let ours = unsafe { std::slice::from_raw_parts_mut((held_at + at) as *mut u8, n) };
             if *ours != title[..n] {
                 ours.copy_from_slice(&title[..n]);
-                crate::watch::wrote(held.at + at, n);
+                crate::watch::wrote(held_at + at, n);
+                dirty = true;
             }
             at += n;
         }
         if whole {
             shadow.resend(base + from, base + to);
+        }
+        if dirty {
+            self.arena_written.insert(copy, self.frame);
         }
     }
 
@@ -741,12 +800,22 @@ impl Memory {
         }
     }
 
-    /// Every copy is brought up to date when `list` is submitted, after what
-    /// it deferred so far (once until a copy of the title's intervenes).
+    /// Every copy that may have fresh bytes is brought up to date when `list`
+    /// is submitted, after what it deferred so far (once until a copy of the
+    /// title's intervenes). Static RT arenas and directory skip refresh once
+    /// untouched for [`ARENA_FRESH_FRAMES`] frames.
     fn bring_up(&self, list: &HostList) {
-        let (start, len) = self.directory.1.span();
-        self.directory.1.refresh(list, start, len);
-        for shadow in &self.copies {
+        let all = refresh_all_arenas();
+        if arena_needs_refresh(self.frame, self.dir_written, all) {
+            let (start, len) = self.directory.1.span();
+            self.directory.1.refresh(list, start, len);
+        }
+        for (n, shadow) in self.copies.iter().enumerate() {
+            if let Some(&written) = self.arena_written.get(&n)
+                && !arena_needs_refresh(self.frame, written, all)
+            {
+                continue;
+            }
             let (start, len) = shadow.span();
             shadow.refresh(list, start, len);
         }
@@ -791,6 +860,19 @@ impl Memory {
         );
         self.stats.from = Some((now, self.frame));
     }
+}
+
+/// Frames an arena or directory stays eligible for `Shadow::refresh` after
+/// `memory.rs` last wrote to it (covering `VICTORY_RELAY=2` in-flight queues).
+const ARENA_FRESH_FRAMES: u64 = 4;
+
+fn arena_needs_refresh(frame: u64, written_frame: u64, refresh_all: bool) -> bool {
+    refresh_all || frame <= written_frame.saturating_add(ARENA_FRESH_FRAMES)
+}
+
+fn refresh_all_arenas() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_REFRESH_ALL").is_some_and(|v| v == "1"))
 }
 
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
@@ -879,10 +961,15 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
         return 0;
     }
     let mut changed = 0;
-    for (t, o) in title.chunks_exact(4).zip(ours.chunks_exact_mut(4)) {
-        if t != o {
-            o.copy_from_slice(t);
-            changed += 1;
+    for (t_line, o_line) in title.chunks_exact(64).zip(ours.chunks_exact_mut(64)) {
+        if t_line == o_line {
+            continue;
+        }
+        for (t, o) in t_line.chunks_exact(4).zip(o_line.chunks_exact_mut(4)) {
+            if t != o {
+                o.copy_from_slice(t);
+                changed += 1;
+            }
         }
     }
     changed
@@ -910,6 +997,9 @@ pub(crate) fn ready(
     let m = guard.as_mut()?;
     let frame = crate::frame::current();
     if m.frame != frame {
+        if m.frame == u64::MAX {
+            m.dir_written = frame;
+        }
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
@@ -926,7 +1016,7 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < max_pages() && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -956,6 +1046,7 @@ pub(crate) fn ready(
         }
     }
     let mut came = [held(m) - before, 0, 0, 0];
+    let mut landed_any = false;
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
@@ -984,7 +1075,7 @@ pub(crate) fn ready(
                     m.land(at);
                 }
             });
-            m.bring_up(list);
+            landed_any = true;
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
@@ -1050,7 +1141,8 @@ pub(crate) fn ready(
     // written over by the arena's first upload: in frames that stream much in
     // half of them, run light-8).
     let first_read = list.first_use(READ);
-    if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
+    let new_copies = list.first_use(usize::MAX - (6 << 33) - m.copies.len());
+    if landed_any || new_copies {
         m.bring_up(list);
     }
     if first_read {
@@ -1288,6 +1380,11 @@ mod tests {
         title[41] = 8;
         assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
+        // Sparse updates across multiple 64-byte chunks.
+        title[0] = 9;
+        title[PIECE - 4] = 10;
+        assert_eq!(merge(&title, &mut ours, false), 2);
+        assert_eq!(ours, title);
     }
 
     #[test]
@@ -1300,5 +1397,19 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    #[test]
+    fn max_pages_for_caps_compact_ram_at_2_gib() {
+        assert_eq!(max_pages_for(true), 2 << 14);
+        assert_eq!(max_pages_for(false), 3 << 14);
+    }
+
+    #[test]
+    fn arena_needs_refresh_covers_relay_window_then_skips() {
+        assert!(arena_needs_refresh(100, 100, false));
+        assert!(arena_needs_refresh(104, 100, false));
+        assert!(!arena_needs_refresh(105, 100, false));
+        assert!(arena_needs_refresh(105, 100, true));
     }
 }

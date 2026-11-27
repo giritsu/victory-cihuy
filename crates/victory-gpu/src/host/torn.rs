@@ -183,12 +183,18 @@ fn step(h: &mut [u32; 4], with: [u32; 4]) {
     *h = std::array::from_fn(|i| x[(i + 1) % 4] ^ (x[i] >> 15));
 }
 
-/// The 64 threads' hashes as one, folded to 31 bits.
+/// The 64 threads' hashes as one via parallel tree reduction, folded to 31 bits.
 fn finish(parts: &[[u32; 4]; 64]) -> u32 {
-    let mut h = parts[0];
-    for part in &parts[1..] {
-        step(&mut h, *part);
+    let mut work = *parts;
+    let mut stride = 32;
+    while stride > 0 {
+        for i in 0..stride {
+            let o = work[i + stride];
+            step(&mut work[i], o);
+        }
+        stride >>= 1;
     }
+    let h = work[0];
     let f = h[0] ^ h[1].wrapping_mul(3) ^ h[2].wrapping_mul(5) ^ h[3].wrapping_mul(7);
     f & 0x7FFF_FFFF
 }
