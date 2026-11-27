@@ -1998,7 +1998,9 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             let rv_began = std::time::Instant::now();
+            let bounded_root_srvs = crate::pipeline::host::bounded_root_srvs();
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+                let tabled = srv && bounded_root_srvs;
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
@@ -2050,7 +2052,6 @@ impl State {
                         }
                         continue;
                     }
-                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -2444,7 +2445,7 @@ impl State {
         } else {
             (list.fill_scratch(address as *const u8, len)?, None)
         };
-        if self.root_view_cache.len() >= 1024 {
+        if self.root_view_cache.len() >= 4096 {
             self.root_view_cache.clear();
         }
         self.root_view_cache.insert(
@@ -3194,42 +3195,46 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
-                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let first = crate::resource::first_mip(&desc);
-                let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
-                if mapped == 0 {
-                    HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
-                    continue;
-                }
-                host.texture_slot_here(index);
-                there = Some(mapped);
-                if mapped < len {
-                    if mapped <= host.texture_slot_mapped(index) {
-                        HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
+            let view = heap.handle(index).and_then(crate::descriptor::view);
+            match &view {
+                Some(View::Placed(false, resource, desc)) => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    let first = crate::resource::first_mip(desc);
+                    let len = crate::resource::placed_bytes_from(resource, first).unwrap_or(1);
+                    let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                    if mapped == 0 {
+                        HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                        // Streamed out: what the slot showed is let go.
+                        host.texture_slot_gone(index);
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
-                    if !crate::texture::committed(address as *const u8, 1) {
-                        HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
+                    host.texture_slot_here(index);
+                    there = Some(mapped);
+                    if mapped < len {
+                        if mapped <= host.texture_slot_mapped(index) {
+                            HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
+                            host.texture_slot_later(index, write, frame, most);
+                            continue;
+                        }
+                        if !crate::texture::committed(address as *const u8, 1) {
+                            HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                        partly = Some(mapped);
                     }
-                    partly = Some(mapped);
                 }
-            }
-            // A texture object the host renders to or writes holds the
-            // host's own contents: nothing to bring up to date, and this
-            // pass is no use of it (its host copy is made when something
-            // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
-                && crate::resource::buffer_bytes(object as This).is_none()
-                && !crate::resource::title_fills(object as This)
-            {
-                host.texture_slot_done(index, write, None);
-                continue;
+                // A texture object the host renders to or writes holds the
+                // host's own contents: nothing to bring up to date, and this
+                // pass is no use of it (its host copy is made when something
+                // uses it, and its slots then: `descriptor::make_waiting`).
+                Some(View::Shader(object, _))
+                    if crate::resource::buffer_bytes(*object as This).is_none()
+                        && !crate::resource::title_fills(*object as This) =>
+                {
+                    host.texture_slot_done(index, write, None);
+                    continue;
+                }
+                _ => {}
             }
             // From here on a host texture is made: not without room. The
             // slot stays due.

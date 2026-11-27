@@ -163,7 +163,8 @@ pub(crate) struct Shadow {
 struct CopiedState {
     pages: Vec<u64>,
     zero_pages: usize,
-    ranged: [(usize, usize, u64); 2],
+    ranged: [(usize, usize, u64); 4],
+    ranged_next: u8,
 }
 
 impl CopiedState {
@@ -171,7 +172,8 @@ impl CopiedState {
         Self {
             pages: vec![0; pages],
             zero_pages: pages,
-            ranged: [(0, 0, 0); 2],
+            ranged: [(0, 0, 0); 4],
+            ranged_next: 0,
         }
     }
 
@@ -195,6 +197,33 @@ impl CopiedState {
             .map(|r| r.2)
             .max()
             .unwrap_or(0)
+    }
+
+    #[inline]
+    fn note_ranged(&mut self, from: usize, to: usize, now: u64) {
+        let len = to.saturating_sub(from);
+        if len == 0 {
+            return;
+        }
+        for r in &mut self.ranged {
+            if (r.0, r.1) == (from, to) {
+                r.2 = r.2.max(now);
+                return;
+            }
+        }
+        let entry = (from, to, now);
+        if len >= self.ranged[0].1.saturating_sub(self.ranged[0].0) {
+            let displaced = std::mem::replace(&mut self.ranged[0], entry);
+            if displaced.2 != 0 {
+                let slot = 1 + (usize::from(self.ranged_next) % 3);
+                self.ranged[slot] = displaced;
+                self.ranged_next = self.ranged_next.wrapping_add(1);
+            }
+            return;
+        }
+        let slot = 1 + (usize::from(self.ranged_next) % 3);
+        self.ranged[slot] = entry;
+        self.ranged_next = self.ranged_next.wrapping_add(1);
     }
 }
 
@@ -4549,10 +4578,7 @@ impl Shadow {
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.
-            copied.ranged[0] = (from, to, now);
-            if to - from >= copied.ranged[1].1 - copied.ranged[1].0 {
-                copied.ranged[1] = (from, to, now);
-            }
+            copied.note_ranged(from, to, now);
         }
         bytes
     }
@@ -5082,7 +5108,7 @@ impl Shadow {
 
     /// What is to go up to the card, taken.
     pub(crate) fn take_dirty(&self) -> Vec<(usize, usize)> {
-        self.card.as_ref().unwrap().take_dirty_all()
+        joined(self.card.as_ref().unwrap().take_dirty_all())
     }
 }
 
@@ -5403,13 +5429,14 @@ mod land_tests {
 }
 
 /// Whether [`Shadow::ranged_check`] found a cached ranged asking, nothing to do,
-/// a definitive miss, or requires the full per-page [`Shadow::nothing_new`] check.
+/// a definitive miss, a uniform/minimum asking bound, or requires the full per-page [`Shadow::nothing_new`] check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RangedCheck {
     Skip,
     MustUpdate,
     Exact(usize, usize, u64),
     CheckRanged(usize, usize, u64),
+    CheckMin(usize, usize, u64),
     NeedFull,
 }
 
@@ -5431,7 +5458,7 @@ fn classify_ranged_pages(from: usize, to: usize, ranged: u64, slice: Option<&[u6
     if ranged != 0 {
         return RangedCheck::CheckRanged(from, to, ranged);
     }
-    if slice.len() <= 16 {
+    if slice.len() <= 64 {
         let (mut min_t, mut max_t) = (u64::MAX, 0u64);
         for &t in slice {
             min_t = min_t.min(t);
@@ -5443,6 +5470,7 @@ fn classify_ranged_pages(from: usize, to: usize, ranged: u64, slice: Option<&[u6
         if min_t == max_t {
             return RangedCheck::Exact(from, to, min_t);
         }
+        return RangedCheck::CheckMin(from, to, min_t);
     }
     RangedCheck::NeedFull
 }
@@ -6492,10 +6520,16 @@ mod window_tests {
         state.set_page(2, 0);
         assert_eq!(state.zero_pages, 1);
 
-        state.ranged[0] = (100, 300, 20);
-        state.ranged[1] = (50, 400, 15);
-        assert_eq!(state.ranged_for(100, 300), 20);
+        state.note_ranged(100, 300, 20);
+        state.note_ranged(50, 400, 15);
+        state.note_ranged(50, 120, 25);
+        state.note_ranged(200, 260, 30);
+        state.note_ranged(300, 380, 35);
+        state.note_ranged(200, 260, 40);
         assert_eq!(state.ranged_for(50, 350), 15);
+        assert_eq!(state.ranged_for(50, 120), 25);
+        assert_eq!(state.ranged_for(200, 260), 40);
+        assert_eq!(state.ranged_for(300, 380), 35);
         assert_eq!(state.ranged_for(40, 100), 0);
     }
 
@@ -6528,9 +6562,11 @@ mod window_tests {
         assert_eq!(classify_ranged_pages(0, 8192, 5, Some(&[1, 2])), RangedCheck::CheckRanged(0, 8192, 5));
         assert_eq!(classify_ranged_pages(0, 8192, 0, Some(&[4, 4, 4])), RangedCheck::Exact(0, 8192, 4));
         assert_eq!(classify_ranged_pages(0, 8192, 0, Some(&[4, 0, 4])), RangedCheck::MustUpdate);
-        assert_eq!(classify_ranged_pages(0, 8192, 0, Some(&[4, 5])), RangedCheck::NeedFull);
-        let seventeen = [4u64; 17];
-        assert_eq!(classify_ranged_pages(0, 17 * 4096, 0, Some(&seventeen)), RangedCheck::NeedFull);
+        assert_eq!(classify_ranged_pages(0, 8192, 0, Some(&[4, 5])), RangedCheck::CheckMin(0, 8192, 4));
+        let sixty_four = [4u64; 64];
+        assert_eq!(classify_ranged_pages(0, 64 * 4096, 0, Some(&sixty_four)), RangedCheck::Exact(0, 64 * 4096, 4));
+        let sixty_five = [4u64; 65];
+        assert_eq!(classify_ranged_pages(0, 65 * 4096, 0, Some(&sixty_five)), RangedCheck::NeedFull);
     }
 
     #[test]

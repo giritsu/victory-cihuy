@@ -8796,6 +8796,20 @@ mod written_spans_tests {
         found.sort_unstable();
         assert_eq!(found, [(1, 10, 40), (4, 7, 9)]);
     }
+
+    #[test]
+    fn compact_by_u64_masks_compacts_multi_chunk_entries() {
+        let mut items: Vec<usize> = (0..130).collect();
+        // Chunk 0 (0..64): skip evens; Chunk 1 (64..128): skip all; Chunk 2 (128..130): skip 128, keep 129.
+        let mut chunk0 = 0u64;
+        for i in (0..64).step_by(2) {
+            chunk0 |= 1u64 << i;
+        }
+        let masks = [chunk0, u64::MAX, 1u64];
+        super::compact_by_u64_masks(&mut items, &masks);
+        let expected: Vec<usize> = (1..64).step_by(2).chain(std::iter::once(129)).collect();
+        assert_eq!(items, expected);
+    }
 }
 
 /// Whether the fills of a submission's upload memory are done together on
@@ -8836,11 +8850,11 @@ static REFRESH_DIAG: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::at
 #[cfg(feature = "diagnostics")]
 static CARD_BEFORE_DIAG: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
-const REFRESH_BATCH_CHUNK: usize = 16;
+const REFRESH_BATCH_CHUNK: usize = 64;
 
 /// Returns a bitmask (bit `i` set if `slice[i]` is unchanged and can be skipped)
 /// plus the count of unchanged items, using a single `journal_read()` per chunk.
-fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> (u32, usize) {
+fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> (u64, usize) {
     use crate::shadow::{RangedCheck, Shadow};
     debug_assert!(slice.len() <= REFRESH_BATCH_CHUNK);
     #[cfg(feature = "diagnostics")]
@@ -8861,7 +8875,7 @@ fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize
                 #[cfg(feature = "diagnostics")]
                 { d_must += 1; }
             }
-            RangedCheck::Exact(..) | RangedCheck::CheckRanged(..) => has_ranged = true,
+            RangedCheck::Exact(..) | RangedCheck::CheckRanged(..) | RangedCheck::CheckMin(..) => has_ranged = true,
             RangedCheck::NeedFull => {}
         }
     }
@@ -8881,7 +8895,7 @@ fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize
                         { d_exact_miss += 1; }
                     }
                 }
-                RangedCheck::CheckRanged(lo, hi, ranged) => {
+                RangedCheck::CheckRanged(lo, hi, ranged) | RangedCheck::CheckMin(lo, hi, ranged) => {
                     if jr.ranged_nothing_new(lo, hi, ranged) {
                         Shadow::note_nothing_new_bytes(hi - lo);
                         *check = RangedCheck::Skip;
@@ -8895,7 +8909,7 @@ fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize
             }
         }
     }
-    let mut mask = 0u32;
+    let mut mask = 0u64;
     let mut skipped = 0usize;
     for (i, (check, (shadow, a, b))) in checks[..slice.len()].iter().zip(slice).enumerate() {
         let unchanged = match check {
@@ -8906,10 +8920,10 @@ fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize
                 { d_need_full += 1; }
                 shadow.nothing_new(*a, *b - *a)
             }
-            RangedCheck::Exact(..) | RangedCheck::CheckRanged(..) => false,
+            RangedCheck::Exact(..) | RangedCheck::CheckRanged(..) | RangedCheck::CheckMin(..) => false,
         };
         if unchanged {
-            mask |= 1u32 << i;
+            mask |= 1u64 << i;
             skipped += 1;
         }
     }
@@ -8924,6 +8938,76 @@ fn unchanged_refresh_mask(slice: &[(std::sync::Arc<crate::shadow::Shadow>, usize
         if d_need_full > 0 { REFRESH_DIAG[9].fetch_add(d_need_full, Ordering::Relaxed); }
     }
     (mask, skipped)
+}
+
+fn compact_by_u64_masks<T>(items: &mut Vec<T>, masks: &[u64]) {
+    let mut idx = 0usize;
+    items.retain(|_| {
+        let keep = (masks[idx / REFRESH_BATCH_CHUNK] & (1u64 << (idx % REFRESH_BATCH_CHUNK))) == 0;
+        idx += 1;
+        keep
+    });
+}
+
+/// Phase-1 read-only refresh filter: evaluates [`unchanged_refresh_mask`] across all `spans`
+/// without any concurrent `Shadow::update` writers, then compacts dirty entries in-place.
+fn filter_unchanged_refreshes(
+    spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> (Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, usize) {
+    const PARALLEL_FILTER_MIN: usize = 128;
+    if spans.is_empty() {
+        return (spans, 0);
+    }
+    if spans.len() < PARALLEL_FILTER_MIN || !wide_refresh() {
+        let mut masks = [0u64; 2];
+        let mut dyn_masks = (spans.len() > REFRESH_BATCH_CHUNK * 2)
+            .then(|| Vec::with_capacity(spans.len().div_ceil(REFRESH_BATCH_CHUNK)));
+        let mut skipped = 0usize;
+        for (c, chunk) in spans.chunks(REFRESH_BATCH_CHUNK).enumerate() {
+            let (mask, n_skipped) = unchanged_refresh_mask(chunk);
+            skipped += n_skipped;
+            if let Some(dm) = &mut dyn_masks {
+                dm.push(mask);
+            } else {
+                masks[c] = mask;
+            }
+        }
+        let mut dirty = spans;
+        compact_by_u64_masks(&mut dirty, dyn_masks.as_deref().unwrap_or(&masks));
+        return (dirty, skipped);
+    }
+    let chunks = spans.len().div_ceil(REFRESH_BATCH_CHUNK);
+    let masks: std::sync::Arc<Vec<std::sync::atomic::AtomicU64>> =
+        std::sync::Arc::new((0..chunks).map(|_| std::sync::atomic::AtomicU64::new(0)).collect());
+    let skipped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shared = std::sync::Arc::new(spans);
+    {
+        let (shared, masks, skipped) = (shared.clone(), masks.clone(), skipped.clone());
+        crate::shadow::wide_each(chunks, move |c| {
+            let from = c * REFRESH_BATCH_CHUNK;
+            let to = (from + REFRESH_BATCH_CHUNK).min(shared.len());
+            let (mask, n_skipped) = unchanged_refresh_mask(&shared[from..to]);
+            masks[c].store(mask, Ordering::Relaxed);
+            if n_skipped > 0 {
+                skipped.fetch_add(n_skipped, Ordering::Relaxed);
+            }
+        });
+    }
+    let skipped = skipped.load(Ordering::Relaxed);
+    let mask_words: Vec<u64> = masks.iter().map(|m| m.load(Ordering::Relaxed)).collect();
+    let dirty = match std::sync::Arc::try_unwrap(shared) {
+        Ok(mut v) => {
+            compact_by_u64_masks(&mut v, &mask_words);
+            v
+        }
+        Err(arc) => arc
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| (mask_words[i / REFRESH_BATCH_CHUNK] & (1u64 << (i % REFRESH_BATCH_CHUNK))) == 0)
+            .map(|(_, item)| item.clone())
+            .collect(),
+    };
+    (dirty, skipped)
 }
 
 impl Batch {
@@ -9057,63 +9141,50 @@ impl Batch {
         let _flush = crate::timeline::span("refreshes of copies");
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
-        // Those known to copy nothing are said so here, unless they are very
-        // many: then beside the others.
-        const FEW: usize = 256;
-        let mut spans = spans;
-        let many = spans.len() > FEW;
-        if !many {
-            let mut skipped = 0usize;
-            let mut filtered = Vec::with_capacity(spans.len());
-            for chunk in spans.chunks(REFRESH_BATCH_CHUNK) {
-                let (mask, n_skipped) = unchanged_refresh_mask(chunk);
-                skipped += n_skipped;
-                for (i, item) in chunk.iter().enumerate() {
-                    if mask & (1u32 << i) == 0 {
-                        filtered.push(item.clone());
-                    }
-                }
-            }
-            spans = filtered;
-            #[cfg(feature = "diagnostics")]
+        let total_spans = spans.len();
+        let (mut spans, skipped) = filter_unchanged_refreshes(spans);
+        #[cfg(feature = "diagnostics")]
+        if skipped > 0 {
             FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = skipped;
         }
         let ahead = spans.len() > 1 && crate::watch::ask_ahead_needed();
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
+        if spans.len() >= 8 {
+            spans.sort_unstable_by(|a, b| (b.2 - b.1).cmp(&(a.2 - a.1)));
+        }
         #[cfg(feature = "diagnostics")]
-        FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each_chunked(
-            due.len(),
-            spans.len(),
-            if many { REFRESH_BATCH_CHUNK } else { 1 },
-            move |i| due[i].refresh(),
-            move |from, to| {
-                if many {
-                    let slice = &spans[from..to];
-                    let (mask, skipped) = unchanged_refresh_mask(slice);
-                    #[cfg(feature = "diagnostics")]
-                    if skipped > 0 {
-                        FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
-                    }
-                    #[cfg(not(feature = "diagnostics"))]
-                    let _ = skipped;
-                    for (i, (shadow, a, b)) in slice.iter().enumerate() {
-                        if mask & (1u32 << i) == 0 {
-                            Self::update(shadow, *a, *b);
-                        }
-                    }
-                } else {
+        {
+            let wide_items = if total_spans >= 128 && wide_refresh() {
+                total_spans
+            } else if !due.is_empty() || (wide_refresh() && spans.len() >= 4) {
+                spans.len()
+            } else {
+                0
+            };
+            FLUSHES[3].fetch_add(wide_items as u64, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (skipped, total_spans);
+        if !due.is_empty() || (wide_refresh() && spans.len() >= 4) {
+            crate::shadow::wide_each_chunked(
+                due.len(),
+                spans.len(),
+                1,
+                move |i| due[i].refresh(),
+                move |from, to| {
                     for (shadow, a, b) in &spans[from..to] {
                         Self::update(shadow, *a, *b);
                     }
-                }
-            },
-        );
+                },
+            );
+        } else {
+            for (shadow, a, b) in &spans {
+                Self::update(shadow, *a, *b);
+            }
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -9237,37 +9308,27 @@ impl Batch {
     }
 
     fn flush_all(&mut self) {
-        // Most of a flush's copies are as they were: they are told so here,
-        // from what the submission's asking found, before anything is asked
-        // and any thread woken. (Thousands of them, the heap's buffer views
-        // once a frame: on the threads, below.)
-        const FEW: usize = 256;
+        let started = std::time::Instant::now();
+        let before = PREPARING[0].load(Ordering::Relaxed);
         let light = crate::watch::light();
-        if light && self.refreshes.len() <= FEW {
-            let started = std::time::Instant::now();
-            let mut skipped = 0usize;
-            let mut filtered = Vec::with_capacity(self.refreshes.len());
-            for chunk in self.refreshes.chunks(REFRESH_BATCH_CHUNK) {
-                let (mask, n_skipped) = unchanged_refresh_mask(chunk);
-                skipped += n_skipped;
-                for (i, item) in chunk.iter().enumerate() {
-                    if mask & (1u32 << i) == 0 {
-                        filtered.push(item.clone());
-                    }
-                }
-            }
-            self.refreshes = filtered;
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let total = self.refreshes.len();
+        if light {
+            let (dirty, skipped) = filter_unchanged_refreshes(std::mem::take(&mut self.refreshes));
+            self.refreshes = dirty;
             #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
+            if skipped > 0 {
+                FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
+            }
             #[cfg(not(feature = "diagnostics"))]
             let _ = skipped;
+            if self.refreshes.is_empty() {
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                return;
+            }
         }
-        // One write-watch asking for the copies that lie close together,
-        // not one per copy (`ask_once` already covers the whole submission).
+        // One write-watch asking for the remaining dirty copies that lie close together.
         let ahead = self.refreshes.len() > 1 && crate::watch::ask_ahead_needed();
         if ahead {
-            let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
@@ -9275,57 +9336,26 @@ impl Batch {
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
-            let started = std::time::Instant::now();
-            let before = PREPARING[0].load(Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
-            if light {
-                let refreshes = std::mem::take(&mut self.refreshes);
-                let many = refreshes.len() > FEW;
-                crate::shadow::wide_each_chunked(
-                    0,
-                    refreshes.len(),
-                    if many { REFRESH_BATCH_CHUNK } else { 1 },
-                    |_| {},
-                    move |from, to| {
-                        let slice = &refreshes[from..to];
-                        if many {
-                            let (mask, skipped) = unchanged_refresh_mask(slice);
-                            #[cfg(feature = "diagnostics")]
-                            if skipped > 0 {
-                                FLUSHES[2].fetch_add(skipped as u64, Ordering::Relaxed);
-                            }
-                            #[cfg(not(feature = "diagnostics"))]
-                            let _ = skipped;
-                            for (i, (shadow, a, b)) in slice.iter().enumerate() {
-                                if mask & (1u32 << i) == 0 {
-                                    Self::update(shadow, *a, *b);
-                                }
-                            }
-                        } else {
-                            for (shadow, a, b) in slice {
-                                Self::update(shadow, *a, *b);
-                            }
-                        }
-                    },
-                );
-            } else {
-                let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                    .refreshes
-                    .drain(..)
-                    .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
-                    .collect();
-                crate::shadow::wide_run(jobs);
+            let mut refreshes = std::mem::take(&mut self.refreshes);
+            if refreshes.len() >= 8 {
+                refreshes.sort_unstable_by(|a, b| (b.2 - b.1).cmp(&(a.2 - a.1)));
             }
-            let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
-            PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            {
+                let wide_items = if light && total >= 128 { total } else { refreshes.len() };
+                FLUSHES[3].fetch_add(wide_items as u64, Ordering::Relaxed);
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = total;
+            crate::shadow::wide_each(refreshes.len(), move |i| {
+                let (shadow, a, b) = &refreshes[i];
+                Self::update(shadow, *a, *b);
+            });
         } else {
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = total;
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
             }
@@ -9333,6 +9363,8 @@ impl Batch {
         if ahead {
             crate::watch::ask_ahead_done();
         }
+        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
     }
 }
 
