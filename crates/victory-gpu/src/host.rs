@@ -1329,6 +1329,8 @@ pub(crate) struct HostList {
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
+    /// Lock-free flag set when any twin in this list has `writing = true`.
+    has_writing_twin: std::sync::atomic::AtomicBool,
     /// The list that runs those transitions just before this one, made
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
@@ -1372,6 +1374,8 @@ pub(crate) struct HostList {
     /// writes title memory (`defer_copy` / `defer`), so cached buffer SRV
     /// refreshes remain valid across unrelated texture state transitions.
     refresh_epoch: std::sync::atomic::AtomicU64,
+    /// Monotonic counter incremented on every [`HostList::reset`].
+    reset_id: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4694,6 +4698,7 @@ impl Host {
                 scratch: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
+                has_writing_twin: std::sync::atomic::AtomicBool::new(false),
                 prelude,
                 pipelines,
                 #[cfg(feature = "diagnostics")]
@@ -4708,6 +4713,7 @@ impl Host {
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 refresh_epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                reset_id: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -7067,6 +7073,8 @@ impl HostList {
         self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.has_writing_twin.store(false, Ordering::Relaxed);
+        self.reset_id.fetch_add(1, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.has_placed.store(false, Ordering::Relaxed);
         if let Some(slot) = &mut *self.inline_cbv.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -7119,6 +7127,11 @@ impl HostList {
     /// transitions only bump [`HostList::epoch`]).
     pub(crate) fn refresh_epoch(&self) -> u64 {
         self.refresh_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic counter incremented on every [`HostList::reset`].
+    pub(crate) fn reset_id(&self) -> u64 {
+        self.reset_id.load(Ordering::Relaxed)
     }
 
     /// Whether any deferred steps or texture state transitions have been
@@ -7242,7 +7255,10 @@ impl HostList {
             // Shaders write the twin when the draw or dispatch runs: what
             // the same one reads of the depth texture is prepared before
             // (`twins_written`).
-            (true, true) => u.writing = true,
+            (true, true) => {
+                u.writing = true;
+                self.has_writing_twin.store(true, Ordering::Release);
+            }
             (true, false) => u.behind[1] = Some(true),
             (false, _) => {}
         }
@@ -7378,6 +7394,9 @@ impl HostList {
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
+        if !self.has_writing_twin.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
         for u in twins.values_mut().filter(|u| u.writing) {
             u.writing = false;
@@ -8264,7 +8283,16 @@ impl std::hash::Hasher for AddressHash {
         self.0
     }
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
+        let mut chunks8 = bytes.chunks_exact(8);
+        for chunk in &mut chunks8 {
+            self.write_u64(u64::from_ne_bytes(chunk.try_into().unwrap()));
+        }
+        let rem = chunks8.remainder();
+        let mut chunks4 = rem.chunks_exact(4);
+        for chunk in &mut chunks4 {
+            self.write_u32(u32::from_ne_bytes(chunk.try_into().unwrap()));
+        }
+        for &b in chunks4.remainder() {
             self.write_usize(usize::from(b));
         }
     }
@@ -11893,6 +11921,34 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(super::shared_spare_limit(true, true, false), 16 << 20);
         assert_eq!(super::shared_spare_limit(true, true, true), 0);
         assert_eq!(super::shared_spare_limit(false, true, true), 0);
+    }
+
+    #[test]
+    fn address_hash_chunks_handle_all_lengths_and_distinguish_single_bit_flips() {
+        use std::hash::{Hash, Hasher};
+        let hash_bytes = |b: &[u8]| {
+            let mut h = super::AddressHash(0);
+            h.write(b);
+            h.finish()
+        };
+        let hash_words = |w: [u32; 3]| {
+            let mut h = super::AddressHash(0);
+            w.hash(&mut h);
+            h.finish()
+        };
+        for len in 0..=17 {
+            let mut a = vec![0xA5u8; len];
+            let base = hash_bytes(&a);
+            for pos in 0..len {
+                a[pos] ^= 1;
+                assert_ne!(hash_bytes(&a), base, "len={len} pos={pos}");
+                a[pos] ^= 1;
+            }
+        }
+        let w0 = hash_words([0x1234_5678, 0x9ABC_DEF0, 0x0F1E_2D3C]);
+        assert_ne!(w0, hash_words([0x1234_5679, 0x9ABC_DEF0, 0x0F1E_2D3C]));
+        assert_ne!(w0, hash_words([0x1234_5678, 0x9ABC_DEF1, 0x0F1E_2D3C]));
+        assert_ne!(w0, hash_words([0x1234_5678, 0x9ABC_DEF0, 0x0F1E_2D3D]));
     }
 }
 

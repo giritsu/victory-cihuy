@@ -570,6 +570,12 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Resolved root CBV/SRV GPU addresses cached across consecutive draws.
+    root_view_cache: std::collections::HashMap<(u64, bool), CachedRootView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Cached `(list_ptr, list_reset_id, view_heap, gpu)` for `heap_buffers`.
+    cached_heap_buffers: Option<(usize, u64, usize, u64)>,
+    /// Cached `(list_ptr, list_reset_id, view_heap, gpu)` for `heap_strides`.
+    cached_heap_strides: Option<(usize, u64, usize, u64)>,
     /// Reused descriptor-copy and retirement batch buffer across `tables()`.
     copy_batch: crate::descriptor::host::CopyBatch,
     /// Reusable per-table stride staging buffer flushed contiguously after `tables()`.
@@ -614,6 +620,9 @@ impl State {
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.root_view_cache.clear();
+        self.cached_heap_buffers = None;
+        self.cached_heap_strides = None;
         self.copy_batch.clear();
         self.table_strides.clear();
         self.last_indirect_args = None;
@@ -742,8 +751,28 @@ pub(crate) fn dropped_now() -> u64 {
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
-/// A root SRV's dynamic slot in a list, and the host copy it shows.
-type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
+/// A root SRV or UAV bound as a one-view dynamic table slot in a list,
+/// retaining its resolved GPU descriptor handle and per-list refresh/write
+/// epochs to avoid redundant descriptor queries and range declarations on hits.
+struct RootSlot {
+    gpu_handle: D3D12_GPU_DESCRIPTOR_HANDLE,
+    shadow: Option<std::sync::Arc<crate::shadow::Shadow>>,
+    len: u64,
+    refreshed_list: usize,
+    refreshed_epoch: u64,
+    written_list: usize,
+    written_epoch: u64,
+}
+
+/// Cached direct root CBV/SRV GPU address keyed by `(address, srv)`.
+struct CachedRootView {
+    list_ptr: usize,
+    buffers_epoch: u64,
+    refresh_epoch: u64,
+    gpu: u64,
+    len: u64,
+    shadow: Option<std::sync::Arc<crate::shadow::Shadow>>,
+}
 
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
@@ -978,35 +1007,15 @@ pub(crate) fn dispatched() -> u64 {
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
 
-/// The host address of a root view: its buffer's host copy, or for a
-/// constant buffer not 256-byte aligned there (the console needs 16) a
-/// copy in upload memory.
-/// shortcut: a root view has no size; constant buffers are taken as 64 KiB
-/// (cut at their buffer's end), other views as all that is left of their
-/// buffer. (They were taken as 1 MiB: 1,452 of the 2,021 mesh vertex
-/// streams of a cutscene frame reach further, and what lay past the first
-/// megabyte was never brought up to date - meshes without bodies, exploded
-/// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
-fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+/// Byte limit for root views (`VICTORY_ROOT_VIEW_MB`), if configured.
+fn root_view_limit() -> u64 {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
+    *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
-    });
-    let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { limit } else { 1 << 16 });
-    let gpu = shadow.gpu(address);
-    if srv || gpu % 256 == 0 {
-        shadow.refresh(list, address, len);
-        #[cfg(feature = "diagnostics")]
-        crate::book::root(gpu, len);
-        return Some(gpu);
-    }
-    list.fill_scratch(address as *const u8, len)
+    })
 }
 
 macro_rules! once {
@@ -1219,6 +1228,8 @@ impl State {
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
+        self.cached_heap_buffers = None;
+        self.cached_heap_strides = None;
         for &h in heaps {
             if !h.is_null() {
                 let samplers = crate::descriptor::heap(h).samplers();
@@ -1434,6 +1445,8 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        self.cached_heap_buffers = None;
+        self.cached_heap_strides = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -2054,7 +2067,7 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    let Some(mut gpu) = self.root_view_cached(list, address, srv) else {
                         continue;
                     };
                     if biased {
@@ -2198,13 +2211,34 @@ impl State {
             return false;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
-        let (index, shadow) = match self.root_uav_slots.get(&key) {
-            Some((index, shadow)) => (*index, address.zip(shadow.clone())),
+        let list_ptr = std::ptr::from_ref(list) as usize;
+        let cur_ref_epoch = list.refresh_epoch();
+        let gpu_handle = match self.root_uav_slots.get_mut(&key) {
+            Some(slot) => {
+                if let (Some(a), Some(s)) = (address, &slot.shadow) {
+                    if slot.refreshed_list != list_ptr || slot.refreshed_epoch != cur_ref_epoch {
+                        s.refresh(list, a, slot.len);
+                        slot.refreshed_list = list_ptr;
+                        slot.refreshed_epoch = cur_ref_epoch;
+                        slot.written_list = 0;
+                        slot.written_epoch = 0;
+                    }
+                    if writes && (slot.written_list != list_ptr || slot.written_epoch != cur_ref_epoch) {
+                        #[cfg(feature = "diagnostics")]
+                        crate::host::wide_write(a, slot.len, pipeline);
+                        s.gpu_writes(list, a, slot.len);
+                        slot.written_list = list_ptr;
+                        slot.written_epoch = cur_ref_epoch;
+                    }
+                }
+                slot.gpu_handle
+            }
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
                 let Some(index) = self.alloc_dynamic(heap, host, 1) else {
                     return false;
                 };
+                let mut len = 0;
                 if let Some((a, s)) = &shadow {
                     let base = s.buffer_gpu();
                     let offset = s.gpu(*a) - base;
@@ -2214,26 +2248,36 @@ impl State {
                     // not on 16 bytes got a null view at first: the
                     // builder's counters are at such addresses.)
                     let bias = offset & 15;
-                    host.raw_uav_at(index, &s.buffer, offset - bias, s.left(*a).min(limit) + bias);
-                }
-                if shadow.is_none() {
+                    len = s.left(*a).min(limit);
+                    host.raw_uav_at(index, &s.buffer, offset - bias, len + bias);
+                } else {
                     host.null_raw_uav_at(index);
                 }
-                self.root_uav_slots
-                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
-                (index, shadow)
+                if let Some((a, s)) = &shadow {
+                    ready(*a, s);
+                }
+                let gpu_handle = host.gpu_handle(index);
+                self.root_uav_slots.insert(
+                    key,
+                    RootSlot {
+                        gpu_handle,
+                        shadow: shadow.map(|(_, s)| s),
+                        len,
+                        refreshed_list: list_ptr,
+                        refreshed_epoch: cur_ref_epoch,
+                        written_list: if writes { list_ptr } else { 0 },
+                        written_epoch: if writes { cur_ref_epoch } else { 0 },
+                    },
+                );
+                gpu_handle
             }
         };
-        if let Some((a, s)) = &shadow {
-            ready(*a, s);
-        }
-        let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
             if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
+                list.list.SetComputeRootDescriptorTable(param, gpu_handle);
             } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+                list.list.SetGraphicsRootDescriptorTable(param, gpu_handle);
             }
         }
         true
@@ -2267,26 +2311,40 @@ impl State {
             std::ptr::from_ref(heap) as usize,
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
-        let (index, shadow) = match self.root_srv_slots.get(&key) {
-            Some((index, shadow)) => (*index, address.zip(shadow.clone())),
+        let list_ptr = std::ptr::from_ref(list) as usize;
+        let cur_ref_epoch = list.refresh_epoch();
+        // As for root descriptors (`root_view_cached`): all that is left of the
+        // buffer is brought up to date. The first 1 MiB only left what lay
+        // past it stale (most mesh vertex streams reach further).
+        let gpu_handle = match self.root_srv_slots.get_mut(&key) {
+            Some(slot) => {
+                if let (Some(a), Some(s)) = (address, &slot.shadow)
+                    && (slot.refreshed_list != list_ptr || slot.refreshed_epoch != cur_ref_epoch)
+                {
+                    s.refresh(list, a, slot.len);
+                    slot.refreshed_list = list_ptr;
+                    slot.refreshed_epoch = cur_ref_epoch;
+                }
+                slot.gpu_handle
+            }
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
                 let Some(index) = self.alloc_dynamic(heap, host, 1) else {
                     return false;
                 };
-                self.root_srv_slots
-                    .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
+                let mut len = 0;
                 match &shadow {
                     Some((a, s)) => {
                         let base = s.buffer_gpu();
                         let offset = s.gpu(*a) - base;
+                        len = s.left(*a);
                         if biased {
                             // From the 16 bytes below; the shader adds the
                             // rest (`victory_shader::emit::USER_VIEW_BIAS`).
                             let bias = offset & 15;
-                            host.raw_at(index, &s.buffer, offset - bias, s.left(*a) + bias);
+                            host.raw_at(index, &s.buffer, offset - bias, len + bias);
                         } else if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a));
+                            host.raw_at(index, &s.buffer, offset, len);
                         } else {
                             // Raw views start on 16 bytes; one from the
                             // aligned start would shift every read.
@@ -2296,28 +2354,86 @@ impl State {
                             );
                             host.null_raw_at(index);
                         }
+                        s.refresh(list, *a, len);
                     }
                     None => host.null_raw_at(index),
                 }
-                (index, shadow)
+                let gpu_handle = host.gpu_handle(index);
+                self.root_srv_slots.insert(
+                    key,
+                    RootSlot {
+                        gpu_handle,
+                        shadow: shadow.map(|(_, s)| s),
+                        len,
+                        refreshed_list: list_ptr,
+                        refreshed_epoch: cur_ref_epoch,
+                        written_list: 0,
+                        written_epoch: 0,
+                    },
+                );
+                gpu_handle
             }
         };
-        // As for root descriptors (`root_view`): all that is left of the
-        // buffer is brought up to date. The first 1 MiB only left what lay
-        // past it stale (most mesh vertex streams reach further).
-        if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a));
-        }
-        let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
         unsafe {
             if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
+                list.list.SetComputeRootDescriptorTable(param, gpu_handle);
             } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
+                list.list.SetGraphicsRootDescriptorTable(param, gpu_handle);
             }
         }
         true
+    }
+
+    /// The host address of a root view cached across consecutive draws on this list:
+    /// its buffer's host copy, or for a constant buffer not 256-byte aligned there
+    /// (the console needs 16) a copy in upload memory.
+    fn root_view_cached(&mut self, list: &HostList, address: u64, srv: bool) -> Option<u64> {
+        let list_ptr = std::ptr::from_ref(list) as usize;
+        let cur_buf_epoch = crate::shadow::buffers_epoch();
+        let cur_ref_epoch = list.refresh_epoch();
+        if let Some(entry) = self.root_view_cache.get_mut(&(address, srv))
+            && entry.buffers_epoch == cur_buf_epoch
+        {
+            if entry.list_ptr == list_ptr && entry.refresh_epoch == cur_ref_epoch {
+                return Some(entry.gpu);
+            }
+            if let Some(ref shadow) = entry.shadow {
+                shadow.refresh(list, address, entry.len);
+                entry.list_ptr = list_ptr;
+                entry.refresh_epoch = cur_ref_epoch;
+                return Some(entry.gpu);
+            }
+        }
+        let limit = root_view_limit();
+        let shadow = crate::shadow::find(address, 1)?;
+        let len = shadow
+            .left(address)
+            .min(if srv { limit } else { 1 << 16 });
+        let gpu = shadow.gpu(address);
+        let (ret_gpu, kept_shadow) = if srv || gpu % 256 == 0 {
+            shadow.refresh(list, address, len);
+            #[cfg(feature = "diagnostics")]
+            crate::book::root(gpu, len);
+            (gpu, Some(shadow))
+        } else {
+            (list.fill_scratch(address as *const u8, len)?, None)
+        };
+        if self.root_view_cache.len() >= 1024 {
+            self.root_view_cache.clear();
+        }
+        self.root_view_cache.insert(
+            (address, srv),
+            CachedRootView {
+                list_ptr,
+                buffers_epoch: cur_buf_epoch,
+                refresh_epoch: cur_ref_epoch,
+                gpu: ret_gpu,
+                len,
+                shadow: kept_shadow,
+            },
+        );
+        Some(ret_gpu)
     }
 
     /// For a shader that picks buffers from the view heap by an index it
@@ -2331,7 +2447,15 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
-    fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+    fn heap_buffers(&mut self, list: &HostList) -> Option<u64> {
+        let view_heap = self.heaps[0];
+        let cache_key = (std::ptr::from_ref(list) as usize, list.reset_id(), view_heap);
+        if view_heap != 0
+            && let Some((lp, rid, vh, gpu)) = self.cached_heap_buffers
+            && (lp, rid, vh) == cache_key
+        {
+            return Some(gpu);
+        }
         let heap = self
             .heaps
             .iter()
@@ -2343,6 +2467,9 @@ impl State {
         // Stride buffers have aligned GPU addresses. Tag the list key so it
         // is distinct from aligned guest resource pointers.
         if !list.first_use(gpu as usize | 1) {
+            if view_heap != 0 {
+                self.cached_heap_buffers = Some((cache_key.0, cache_key.1, view_heap, gpu));
+            }
             return Some(gpu);
         }
         // The list may outlive the title's heap object, which owns the table.
@@ -2358,6 +2485,9 @@ impl State {
         if host.buffer_frame.load(Ordering::Relaxed) == frame
             || host.buffer_frame.swap(frame, Ordering::Relaxed) == frame
         {
+            if view_heap != 0 {
+                self.cached_heap_buffers = Some((cache_key.0, cache_key.1, view_heap, gpu));
+            }
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -2387,13 +2517,24 @@ impl State {
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if view_heap != 0 {
+            self.cached_heap_buffers = Some((cache_key.0, cache_key.1, view_heap, gpu));
+        }
         Some(gpu)
     }
 
     /// The GPU address of the bound view heap's stride/kind table without
     /// running the bindless heap buffer/texture sweep (for shaders that only
     /// inspect descriptors already mirrored via their descriptor tables).
-    fn heap_strides(&self, list: &HostList) -> Option<u64> {
+    fn heap_strides(&mut self, list: &HostList) -> Option<u64> {
+        let view_heap = self.heaps[0];
+        let cache_key = (std::ptr::from_ref(list) as usize, list.reset_id(), view_heap);
+        if view_heap != 0
+            && let Some((lp, rid, vh, gpu)) = self.cached_heap_strides
+            && (lp, rid, vh) == cache_key
+        {
+            return Some(gpu);
+        }
         let heap = self
             .heaps
             .iter()
@@ -2407,6 +2548,9 @@ impl State {
             && let Some(buffer) = host.strides_buffer()
         {
             list.keep(buffer);
+        }
+        if view_heap != 0 {
+            self.cached_heap_strides = Some((cache_key.0, cache_key.1, view_heap, gpu));
         }
         Some(gpu)
     }
@@ -5825,6 +5969,51 @@ mod tests {
         assert!(!s.take_uav_dirty());
         s.reset(std::ptr::null());
         assert!(s.take_uav_dirty());
+    }
+
+    #[test]
+    fn root_and_heap_caches_clear_on_set_heaps_tables_done_and_reset() {
+        let mut s = super::State::default();
+        s.cached_heap_buffers = Some((1, 2, 3, 4));
+        s.cached_heap_strides = Some((1, 2, 3, 5));
+        s.root_view_cache.insert(
+            (0x1000, true),
+            super::CachedRootView {
+                list_ptr: 1,
+                buffers_epoch: 1,
+                refresh_epoch: 1,
+                gpu: 0x2000,
+                len: 64,
+                shadow: None,
+            },
+        );
+        s.set_heaps(&[]);
+        assert!(s.cached_heap_buffers.is_none());
+        assert!(s.cached_heap_strides.is_none());
+        assert_eq!(s.root_view_cache.len(), 1);
+
+        s.cached_heap_buffers = Some((1, 2, 3, 4));
+        s.cached_heap_strides = Some((1, 2, 3, 5));
+        s.tables_done();
+        assert!(s.cached_heap_buffers.is_none());
+        assert!(s.cached_heap_strides.is_none());
+        assert!(s.root_view_cache.is_empty());
+
+        s.cached_heap_buffers = Some((1, 2, 3, 4));
+        s.root_view_cache.insert(
+            (0x3000, false),
+            super::CachedRootView {
+                list_ptr: 1,
+                buffers_epoch: 1,
+                refresh_epoch: 1,
+                gpu: 0x4000,
+                len: 256,
+                shadow: None,
+            },
+        );
+        s.reset(std::ptr::null());
+        assert!(s.cached_heap_buffers.is_none());
+        assert!(s.root_view_cache.is_empty());
     }
 }
 

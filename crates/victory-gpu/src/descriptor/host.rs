@@ -8179,7 +8179,7 @@ struct ListViews {
 }
 
 impl ListViews {
-    const BUF_CAP: usize = 16384;
+    const BUF_CAP: usize = 32768;
     const BUF_SLOTS: u32 = (Self::BUF_CAP as u32) * 2;
     const TEX_BASE: u32 = Self::BUF_SLOTS;
     const TEX_SLOTS: u32 = 8192;
