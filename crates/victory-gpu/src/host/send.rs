@@ -216,7 +216,7 @@ pub(super) struct Own {
 }
 
 /// Runs whose pairs are one piece of work.
-const RUNS_AT_A_TIME: usize = 4096;
+const RUNS_AT_A_TIME: usize = 1024;
 
 /// Splits large moves (`> chunk_bytes`) and packs small moves into `~chunk_bytes` groups.
 fn build_copy_groups(
@@ -252,7 +252,7 @@ fn build_copy_groups(
 }
 
 /// Takes what `dirty` sends up out of the CPU sides.
-pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)]) -> Option<Own> {
     let began = std::time::Instant::now();
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
@@ -334,7 +334,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         }
     };
     let total_bytes = total_move_bytes + total_words * 8;
-    if total_jobs >= 2 && total_bytes >= (256 << 10) {
+    if total_jobs >= 2 && (total_bytes >= (64 << 10) || total_words >= 4096) {
         crate::land::each_under(total_jobs, &run_job);
     } else {
         (0..total_jobs).for_each(run_job);
@@ -357,7 +357,7 @@ impl Own {
         &self,
         host: &Host,
         list: &ID3D12GraphicsCommandList,
-        dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+        dirty: &[(std::sync::Arc<Shadow>, std::sync::Arc<Vec<(usize, usize)>>)],
         looked: impl Fn(&Shadow) -> bool,
     ) {
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

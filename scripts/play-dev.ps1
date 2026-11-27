@@ -1,19 +1,21 @@
 # Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p, Series X + Ray Tracing default).
-#   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-x|series-s]
-#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-NoRayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-BarrierTest groups|indirect|both] [-Warm] [-Safe]
+#   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-x|series-s] [-DisplayMode <WxH>]
+#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-NoRayTracing] [-RtMode gi|gi-lite|full] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-BarrierTest groups|indirect|both] [-Warm] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
-# Note: -Console series-x and -RayTracing (VICTORY_BVH_BUILDER=1) are enabled by default; pass -NoRayTracing for A/B comparison.
+# Note: -Console series-x and -RayTracing (VICTORY_BVH_BUILDER=1, -RtMode gi) are enabled by default; pass -NoRayTracing for A/B comparison.
 # Run from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified.
 param(
     [string]$GameDir = $env:VICTORY_GAME_DIR,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-x',
+    [string]$DisplayMode = '1920x1080',
     [switch]$Panel,
     [switch]$DebugLayer,
     [switch]$DredLight,
     [switch]$MemoryMap,
     [switch]$RayTracing,
     [switch]$NoRayTracing,
+    [ValidateSet('gi', 'gi-lite', 'full')][string]$RtMode = 'gi',
     [switch]$LevelsOnDemand,
     [switch]$InplaceProbe,
     [switch]$NoKeepShown,
@@ -78,7 +80,7 @@ $settings = @{
     VICTORY_AMBIENT              = '0.8'
     VICTORY_AMBIENT_AIR          = '1.5'
     VICTORY_CARD_BUFFERS_MIN_KB  = '256'
-    VICTORY_TEXTURE_STAGE_MS     = '12'
+    VICTORY_TEXTURE_STAGE_MS     = '5'
 }
 
 if ($Build -eq 'diag') {
@@ -105,11 +107,17 @@ if ($Safe) {
     $settings.VICTORY_WIDE_THREADS = '4'
     $settings.VICTORY_VIEW_THREADS = '4'
     $settings.VICTORY_UNDER_THREADS = '4'
+    $settings.VICTORY_LATE_WAIT_LISTS = '384'
 }
 
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
 if ($DebugLayer) { $settings.VICTORY_D3D12_DEBUG = '1' }
-if (-not $NoRayTracing -or $RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if ($DisplayMode) { $settings.VICTORY_DISPLAY_MODE = $DisplayMode }
+$rtOn = -not $NoRayTracing -or $RayTracing
+if ($rtOn) {
+    $settings.VICTORY_BVH_BUILDER = '1'
+    $settings.VICTORY_RT_MODE = $RtMode
+}
 if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
 if ($InplaceProbe) { $settings.VICTORY_INPLACE_PROBE = '1' }
 if ($NoKeepShown) { $settings.VICTORY_KEEP_SHOWN = '0' }
@@ -130,7 +138,9 @@ $logDir = Split-Path -Parent $LogFile
 if ($logDir) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 
 $Exe = (Resolve-Path $Exe).Path
-Write-Host "Running [$Build] ($Console, RT=$($settings.ContainsKey('VICTORY_BVH_BUILDER'))) -> log: $LogFile"
+$rtBanner = if ($settings.ContainsKey('VICTORY_BVH_BUILDER')) { $settings.VICTORY_RT_MODE } else { 'off' }
+$dispBanner = if ($settings.ContainsKey('VICTORY_DISPLAY_MODE')) { $settings.VICTORY_DISPLAY_MODE } else { 'console-default' }
+Write-Host "Running [$Build] ($Console, $dispBanner, RT=$rtBanner) -> log: $LogFile"
 Write-Host "Cache: $($env:VICTORY_CACHE_DIR)"
 
 $stream = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)

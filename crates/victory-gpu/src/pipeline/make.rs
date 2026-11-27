@@ -59,11 +59,123 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+fn bvh_builder_on() -> bool {
+    static BVH_BUILDER: OnceLock<bool> = OnceLock::new();
+    *BVH_BUILDER.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RtMode {
+    Full,
+    Gi,
+    GiLite,
+}
+
+impl RtMode {
+    fn parse(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("gi") => Self::Gi,
+            Some("gi-lite") | Some("gilite") | Some("lite") => Self::GiLite,
+            _ => Self::Full,
+        }
+    }
+
+    fn current() -> Self {
+        static MODE: OnceLock<RtMode> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            let raw = std::env::var("VICTORY_RT_MODE").ok();
+            let mode = Self::parse(raw.as_deref());
+            if bvh_builder_on() && mode != Self::Full {
+                tracing::info!(
+                    ?mode,
+                    "VICTORY_RT_MODE active: keeping RT GI while leaving out secondary RT passes"
+                );
+            }
+            mode
+        })
+    }
+}
+
+fn rt_mode_left_out(mode: RtMode, builder: bool, shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if !builder || mode == RtMode::Full {
+        return None;
+    }
+    if named(shaders, b"CS_RaytraceVBuffer") || named(shaders, b"CS_PPR_Raytrace") {
+        return Some("RT reflections left out (VICTORY_RT_MODE)");
+    }
+    if named(shaders, b"CS_RTShadowTrace")
+        || named(shaders, b"CS_RTDistantShadowTrace")
+        || named(shaders, b"CS_RaytraceShadows")
+    {
+        return Some("RT shadows left out (VICTORY_RT_MODE)");
+    }
+    if mode == RtMode::GiLite && named(shaders, b"CS_RaytracingResolve") {
+        return Some("RT resolve left out (VICTORY_RT_MODE=gi-lite)");
+    }
+    None
+}
+
+fn no_bvh_rt_left_out(builder: bool, shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    if builder {
+        return None;
+    }
+    const DEAD_NO_BVH: &[&[u8]] = &[
+        b"CS_RaytraceVBuffer",
+        b"CS_PPR_Raytrace",
+        b"CS_RTShadowTrace",
+        b"CS_RTDistantShadowTrace",
+        b"CS_RaytraceShadows",
+        b"CS_LaserLightShadowRaytracing",
+        b"CS_ScreenProbes_TraceRays",
+        b"CS_ScreenProbes_EvaluateRayRequests",
+        b"CS_ScreenProbes_GenerateRayBins",
+        b"CS_ScreenProbes_GenerateShaderBins",
+        b"CS_ScreenProbes_ResolveRays_Voxels",
+        b"CS_IrradianceCache_",
+        b"CS_Primary_GatherVBuffer",
+        b"CS_Primary_GenerateShaderBins",
+        b"CS_RayBudgeting_",
+        b"CS_GenerateRayCoords",
+        b"CS_GenerateRayBins",
+        b"CS_GenerateRayBinOffsets",
+        b"CS_ClassifyRayTiles",
+        b"CS_ClearRayBins",
+        b"CS_ClearRayCounts",
+        b"CS_RayMiss",
+        b"CS_ScreenProbe_RayMiss",
+        b"CS_FinalGather_",
+        b"CS_ScreenProbes_RadianceSpatialFilter",
+        b"CS_ScreenProbes_ResponsivenessSpatialFilter",
+        b"CS_ScreenProbes_PrefilterRadianceMips",
+        b"CS_ScreenProbes_ActivateProbes",
+        b"CS_ScreenProbes_Inject",
+        b"CS_CalcRTClassificationListCounts",
+        b"CS_WriteRTClassificationResults",
+        b"CS_ShadowTileBalanceRTCost",
+        b"CS_SortRayTiles",
+        b"CS_ResetRayTileArgs",
+        b"CS_DeferredFallback_BVH",
+        b"CS_DeferredFallback_Voxels",
+        b"CS_GenerateShadowMasks_Raytraced",
+        b"CS_TraceShadowRays_Checkerboard",
+        b"CS_TraceShadowRays_Full",
+        b"CS_TraceShadowRays_Half",
+        b"CS_TraceShadowRays_Quarter",
+        b"CS_TraceShadowRays_Eighth",
+        b"CS_RayPrePass_Opaque",
+        b"CS_RayPrePass_Alpha",
+        b"CS_RayPrePass_Water",
+    ];
+    DEAD_NO_BVH
+        .iter()
+        .any(|pat| named(shaders, pat))
+        .then_some("ray-tracing compute pass without BVH, left out")
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if bvh_builder_on() {
             return false;
         }
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
@@ -75,14 +187,22 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
+        if bvh_builder_on() {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
         std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
+    }
+    static SKIP_NO_BVH_RT: OnceLock<bool> = OnceLock::new();
+    if *SKIP_NO_BVH_RT.get_or_init(|| std::env::var_os("VICTORY_RT_PASSES").is_none_or(|v| v != "1"))
+        && let Some(reason) = no_bvh_rt_left_out(bvh_builder_on(), shaders)
+    {
+        return Some(reason);
+    }
+    if let Some(reason) = rt_mode_left_out(RtMode::current(), bvh_builder_on(), shaders) {
+        return Some(reason);
     }
     None
 }
@@ -723,5 +843,102 @@ mod tests {
         assert!(Pending::new(vec![rt], None).non_blocking);
         assert!(Pending::new(vec![activate], None).non_blocking);
         assert!(!Pending::new(vec![regular], None).non_blocking);
+    }
+
+    #[test]
+    fn rt_mode_filters_reflections_and_shadows_while_keeping_gi() {
+        assert_eq!(RtMode::parse(None), RtMode::Full);
+        assert_eq!(RtMode::parse(Some("full")), RtMode::Full);
+        assert_eq!(RtMode::parse(Some("gi")), RtMode::Gi);
+        assert_eq!(RtMode::parse(Some("GI")), RtMode::Gi);
+        assert_eq!(RtMode::parse(Some("gi-lite")), RtMode::GiLite);
+        assert_eq!(RtMode::parse(Some("lite")), RtMode::GiLite);
+
+        let refl_vbuf = [super::super::shader("compute", b"CS_RaytraceVBuffer_HQ")];
+        let refl_ppr = [super::super::shader("compute", b"CS_PPR_Raytrace")];
+        let shad_local = [super::super::shader("compute", b"CS_RTShadowTrace")];
+        let shad_distant = [super::super::shader("compute", b"CS_RTDistantShadowTrace")];
+        let shad_all = [super::super::shader("compute", b"CS_RaytraceShadows")];
+        let probes_bvh = [super::super::shader("compute", b"CS_ScreenProbes_TraceRays_BVH_ShaderBinning")];
+        let probes_temp = [super::super::shader("compute", b"CS_ScreenProbes_TemporalResolve")];
+        let irrad = [super::super::shader("compute", b"CS_IrradianceCache_Shade")];
+        let primary = [super::super::shader("compute", b"CS_Primary_GatherVBuffer")];
+        let resolve = [super::super::shader("compute", b"CS_RaytracingResolve")];
+        let combined_refl = [super::super::shader("compute", b"CS_CombinedReflections")];
+        let shadow_mask = [super::super::shader("compute", b"CS_GenerateShadowMasks_Raytraced")];
+
+        // With builder off or Full mode, secondary RT passes are never dropped by RtMode.
+        for s in [&refl_vbuf, &refl_ppr, &shad_local, &shad_distant, &shad_all, &resolve] {
+            assert!(rt_mode_left_out(RtMode::Gi, false, s).is_none());
+            assert!(rt_mode_left_out(RtMode::GiLite, false, s).is_none());
+            assert!(rt_mode_left_out(RtMode::Full, true, s).is_none());
+        }
+
+        // Gi skips RT reflections & shadows, but keeps ScreenProbes, IrradianceCache, Primary, Resolve, & composites.
+        for dropped in [&refl_vbuf, &refl_ppr, &shad_local, &shad_distant, &shad_all] {
+            assert!(rt_mode_left_out(RtMode::Gi, true, dropped).is_some());
+            assert!(rt_mode_left_out(RtMode::GiLite, true, dropped).is_some());
+        }
+        for kept_gi in [&probes_bvh, &probes_temp, &irrad, &primary, &resolve, &combined_refl, &shadow_mask] {
+            assert!(rt_mode_left_out(RtMode::Gi, true, kept_gi).is_none());
+        }
+
+        // GiLite additionally skips CS_RaytracingResolve while still keeping core GI passes.
+        assert!(rt_mode_left_out(RtMode::GiLite, true, &resolve).is_some());
+        for kept_lite in [&probes_bvh, &probes_temp, &irrad, &primary, &combined_refl, &shadow_mask] {
+            assert!(rt_mode_left_out(RtMode::GiLite, true, kept_lite).is_none());
+        }
+    }
+
+    #[test]
+    fn no_bvh_rt_filter_skips_dead_rt_passes_while_keeping_ambient_gi() {
+        let skipped = [
+            "CS_RaytraceVBuffer_HQ",
+            "CS_PPR_Raytrace",
+            "CS_RTShadowTrace",
+            "CS_RTDistantShadowTrace32_Tiled",
+            "CS_RaytraceShadows_Mixed",
+            "CS_ScreenProbes_TraceRays_RayBinning_BVH",
+            "CS_ScreenProbes_EvaluateRayRequests_RayBinning",
+            "CS_ScreenProbes_GenerateRayBins",
+            "CS_ScreenProbes_GenerateShaderBins",
+            "CS_ScreenProbes_ResolveRays_Voxels",
+            "CS_IrradianceCache_ShadowTrace_WithFar",
+            "CS_IrradianceCache_GatherVBuffer_WithFar",
+            "CS_IrradianceCache_GenerateSchedulerDispatchArgs",
+            "CS_IrradianceCache_IntegrateIrradianceSH",
+            "CS_Primary_GatherVBuffer_WithFar",
+            "CS_Primary_GenerateShaderBins",
+            "CS_RayBudgeting_Cull_RayBinning",
+            "CS_GenerateRayCoords",
+            "CS_ClearRayBins",
+            "CS_RayMiss",
+            "CS_FinalGather_1_1_1_0",
+            "CS_ScreenProbes_RadianceSpatialFilter",
+            "CS_ScreenProbes_PrefilterRadianceMips",
+            "CS_TraceShadowRays_Checkerboard",
+            "CS_RayPrePass_Opaque",
+            "CS_RayPrePass_Water_SSR",
+        ];
+        let kept_ambient_gi = [
+            "CS_ScreenProbes_TemporalResolve",
+            "CS_ScreenProbes_TemporalResolve_ReflectiveCaustics",
+            "CS_CacheScreenSpaceRadiance",
+            "CS_AccumulateLocalLightInscatteringVolume",
+            "CS_Primary_Shade",
+            "CS_TraceShadowRays_ScreenSpaceOnlyCheckerboard",
+            "CS_GenerateShadowMasks_Checkerboard_NoHair",
+            "CS_Gather_Classified_2",
+        ];
+        for name in skipped {
+            let s = [super::super::shader("compute", name.as_bytes())];
+            assert!(no_bvh_rt_left_out(false, &s).is_some(), "{name} should be skipped when BVH is off");
+            assert!(no_bvh_rt_left_out(true, &s).is_none(), "{name} must not be skipped when BVH is on");
+        }
+        for name in kept_ambient_gi {
+            let s = [super::super::shader("compute", name.as_bytes())];
+            assert!(no_bvh_rt_left_out(false, &s).is_none(), "{name} must stay alive for ambient/GI");
+            assert!(no_bvh_rt_left_out(true, &s).is_none(), "{name} must stay alive with BVH on");
+        }
     }
 }

@@ -45,6 +45,7 @@ pub(super) struct Spans {
     data: usize,
     lists: Vec<ID3D12CommandList>,
     kinds: Vec<SpanKind>,
+    labels: Vec<String>,
     ticks_per_ms: f64,
     next: usize,
     sums: Sums,
@@ -54,7 +55,7 @@ pub(super) struct Spans {
 unsafe impl Send for Spans {}
 
 /// What the stamps read so far add up to.
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 struct Sums {
     /// Submissions, ticks the card worked on them, ticks between them.
     count: u64,
@@ -65,8 +66,9 @@ struct Sums {
     card_steps: u64,
     title: u64,
     card_check: u64,
-    /// Ticks of the longest one, and the last one's end.
+    /// Ticks of the longest one, its submission summary, and the last one's end.
     longest: u64,
+    longest_label: String,
     last: u64,
 }
 
@@ -74,7 +76,7 @@ impl Sums {
     /// A submission that ran from `start` to `end` (card ticks), after those
     /// before it. The start's stamp may be of before the last one's end: the
     /// part before that end is the last one's.
-    fn add(&mut self, start: u64, end: u64) -> u64 {
+    fn add(&mut self, start: u64, end: u64, label: &str) -> u64 {
         if start == 0 || end < start {
             return 0;
         }
@@ -85,21 +87,25 @@ impl Sums {
         }
         self.count += 1;
         self.busy += took;
-        self.longest = self.longest.max(took);
+        if took > self.longest {
+            self.longest = took;
+            self.longest_label.clear();
+            self.longest_label.push_str(label);
+        }
         self.last = end.max(self.last);
         took
     }
 
-    fn record(&mut self, kind: SpanKind, stamps: [u64; TIMESTAMPS_PER_SPAN]) {
+    fn record(&mut self, kind: SpanKind, stamps: [u64; TIMESTAMPS_PER_SPAN], label: &str) {
         match kind {
             SpanKind::Empty => {}
             SpanKind::CardSync => {
-                let took = self.add(stamps[0], stamps[1]);
+                let took = self.add(stamps[0], stamps[1], label);
                 self.card_sync += took;
             }
             SpanKind::Submission { has_steps, has_check } => {
                 let [t0, t1, t2, t3] = stamps;
-                let total = self.add(t0, t3);
+                let total = self.add(t0, t3, label);
                 if total == 0 {
                     return;
                 }
@@ -141,10 +147,11 @@ fn on() -> bool {
 static SPANS_MADE: Mutex<Option<Option<Spans>>> = Mutex::new(None);
 
 impl Spans {
-    fn alloc_slot(&mut self, kind: SpanKind) -> usize {
+    fn alloc_slot(&mut self, kind: SpanKind, label: String) -> usize {
         let i = self.next;
         self.next = (i + 1) % SPANS;
         let prev_kind = std::mem::replace(&mut self.kinds[i], kind);
+        let prev_label = std::mem::replace(&mut self.labels[i], label);
         // The stamps of the submission that had these lists, that many
         // submissions ago: long done.
         // SAFETY: inside the mapping; written by the card at whole words.
@@ -157,7 +164,7 @@ impl Spans {
             }
             read
         };
-        self.sums.record(prev_kind, stamps);
+        self.sums.record(prev_kind, stamps, &prev_label);
         i
     }
 }
@@ -176,13 +183,13 @@ impl Host {
                     .ok()
             })
             .as_mut()?;
-        let i = spans.alloc_slot(SpanKind::CardSync);
+        let i = spans.alloc_slot(SpanKind::CardSync, "card_sync".to_owned());
         let base = TIMESTAMPS_PER_SPAN * i;
         Some([spans.lists[base].clone(), spans.lists[base + 1].clone()])
     }
 
     /// Timestamp lists around (and optionally between) `card_steps`, title work, and `card_check`.
-    pub(super) fn span_submission(&self, has_steps: bool, has_check: bool) -> Option<SubSpans> {
+    pub(super) fn span_submission(&self, has_steps: bool, has_check: bool, label: String) -> Option<SubSpans> {
         if !on() {
             return None;
         }
@@ -194,7 +201,7 @@ impl Host {
                     .ok()
             })
             .as_mut()?;
-        let i = spans.alloc_slot(SpanKind::Submission { has_steps, has_check });
+        let i = spans.alloc_slot(SpanKind::Submission { has_steps, has_check }, label);
         let base = TIMESTAMPS_PER_SPAN * i;
         Some(SubSpans {
             front: spans.lists[base].clone(),
@@ -242,6 +249,7 @@ impl Host {
                 data: data as usize,
                 lists,
                 kinds: vec![SpanKind::Empty; SPANS],
+                labels: vec![String::new(); SPANS],
                 ticks_per_ms: self.queue.GetTimestampFrequency()? as f64 / 1000.0,
                 next: 0,
                 sums: Sums::default(),
@@ -306,17 +314,32 @@ pub(super) fn line(frames: f64) {
     let last = spans.sums.last;
     let s = std::mem::replace(&mut spans.sums, Sums { last, ..Sums::default() });
     let ms = |ticks: u64| ticks as f64 / spans.ticks_per_ms / frames;
-    tracing::info!(
-        "the card's own stamps per frame: {:.1} submissions, working {:.1} ms (card_sync {:.1}, card_steps {:.1}, title {:.1}, card_check {:.1}), idle between them {:.1} ms, the longest {:.1} ms",
-        s.count as f64 / frames,
-        ms(s.busy),
-        ms(s.card_sync),
-        ms(s.card_steps),
-        ms(s.title),
-        ms(s.card_check),
-        ms(s.between),
-        s.longest as f64 / spans.ticks_per_ms
-    );
+    if s.longest_label.is_empty() {
+        tracing::info!(
+            "the card's own stamps per frame: {:.1} submissions, working {:.1} ms (card_sync {:.1}, card_steps {:.1}, title {:.1}, card_check {:.1}), idle between them {:.1} ms, the longest {:.1} ms",
+            s.count as f64 / frames,
+            ms(s.busy),
+            ms(s.card_sync),
+            ms(s.card_steps),
+            ms(s.title),
+            ms(s.card_check),
+            ms(s.between),
+            s.longest as f64 / spans.ticks_per_ms
+        );
+    } else {
+        tracing::info!(
+            "the card's own stamps per frame: {:.1} submissions, working {:.1} ms (card_sync {:.1}, card_steps {:.1}, title {:.1}, card_check {:.1}), idle between them {:.1} ms, the longest {:.1} ms [{}]",
+            s.count as f64 / frames,
+            ms(s.busy),
+            ms(s.card_sync),
+            ms(s.card_steps),
+            ms(s.title),
+            ms(s.card_check),
+            ms(s.between),
+            s.longest as f64 / spans.ticks_per_ms,
+            s.longest_label
+        );
+    }
 }
 
 #[cfg(test)]
@@ -326,32 +349,34 @@ mod tests {
     #[test]
     fn submissions_add_up_without_counting_anything_twice() {
         let mut s = Sums::default();
-        s.add(100, 150);
-        s.add(140, 200); // began before the last one ended
-        s.add(260, 270);
+        s.add(100, 150, "first");
+        s.add(140, 200, "second"); // began before the last one ended
+        s.add(260, 270, "third");
         assert_eq!((s.count, s.busy, s.between, s.longest, s.last), (3, 110, 60, 50, 270));
+        assert_eq!(s.longest_label, "first");
         // Never written, or nonsense: nothing.
-        s.add(0, 0);
-        s.add(300, 290);
+        s.add(0, 0, "bad");
+        s.add(300, 290, "bad");
         assert_eq!(s.count, 3);
         // Whole inside the last one.
-        s.add(265, 268);
+        s.add(265, 268, "inside");
         assert_eq!((s.count, s.busy, s.between), (4, 110, 60));
     }
 
     #[test]
     fn per_phase_stamps_account_for_card_sync_steps_title_and_check() {
         let mut s = Sums::default();
-        s.record(SpanKind::CardSync, [100, 120, 0, 0]);
-        s.record(SpanKind::Submission { has_steps: true, has_check: true }, [130, 145, 210, 230]);
-        s.record(SpanKind::Submission { has_steps: false, has_check: false }, [240, 0, 0, 290]);
-        s.record(SpanKind::Submission { has_steps: true, has_check: false }, [300, 310, 0, 340]);
-        s.record(SpanKind::Submission { has_steps: false, has_check: true }, [350, 0, 380, 395]);
+        s.record(SpanKind::CardSync, [100, 120, 0, 0], "card_sync");
+        s.record(SpanKind::Submission { has_steps: true, has_check: true }, [130, 145, 210, 230], "sub-longest");
+        s.record(SpanKind::Submission { has_steps: false, has_check: false }, [240, 0, 0, 290], "sub-mid");
+        s.record(SpanKind::Submission { has_steps: true, has_check: false }, [300, 310, 0, 340], "sub-steps");
+        s.record(SpanKind::Submission { has_steps: false, has_check: true }, [350, 0, 380, 395], "sub-check");
         assert_eq!(s.count, 5);
         assert_eq!(s.card_sync, 20);
         assert_eq!(s.card_steps, 15 + 10);
         assert_eq!(s.title, 65 + 50 + 30 + 30);
         assert_eq!(s.card_check, 20 + 15);
         assert_eq!(s.busy, s.card_sync + s.card_steps + s.title + s.card_check);
+        assert_eq!(s.longest_label, "sub-longest");
     }
 }

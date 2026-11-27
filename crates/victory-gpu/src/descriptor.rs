@@ -129,7 +129,25 @@ const SHADER_VISIBLE: u32 = 1;
 ///
 /// Held shared while a heap found here is used (by every thread that writes
 /// descriptors, and by [`sync_heaps`]), alone only where heaps come and go.
+#[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+/// Lock-free `[min_start, max_end)` bounding interval over [`SHADER_HEAPS`] so
+/// non-heap descriptor writes (`copy_simple` into staging heaps) skip `SHADER_HEAPS.read()`.
+#[cfg(windows)]
+static SHADER_HEAPS_MIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+#[cfg(windows)]
+static SHADER_HEAPS_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn update_shader_heap_bounds(heaps: &[(u64, u64, usize)]) {
+    use std::sync::atomic::Ordering::Release;
+    let (min_s, max_e) = heaps
+        .iter()
+        .fold((u64::MAX, 0u64), |(lo, hi), &(s, e, _)| (lo.min(s), hi.max(e)));
+    SHADER_HEAPS_MIN.store(min_s, Release);
+    SHADER_HEAPS_MAX.store(max_e, Release);
+}
 
 #[cfg(feature = "diagnostics")]
 static DESC_DIAG: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
@@ -177,8 +195,20 @@ pub(crate) fn take_title_diag() -> [u64; 10] {
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    mirror_words(handle, None);
+}
+
+#[cfg(windows)]
+fn mirror_words(handle: u64, pre_words: Option<[u32; 3]>) {
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
+    let lo = SHADER_HEAPS_MIN.load(std::sync::atomic::Ordering::Acquire);
+    let hi = SHADER_HEAPS_MAX.load(std::sync::atomic::Ordering::Acquire);
+    if handle < lo || handle >= hi {
+        #[cfg(feature = "diagnostics")]
+        record_desc_diag(4, began.elapsed().as_nanos() as u64);
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let Some(&(_, _, at)) = heaps
         .iter()
@@ -198,7 +228,14 @@ fn mirror(handle: u64) {
     };
     if let Some(host) = heap.host.get() {
         if let Some(host) = host {
-            host.mirror_sync(index, handle);
+            // SAFETY: `handle` is a live title descriptor slot inside `heap`.
+            let words = pre_words.unwrap_or_else(|| unsafe { (handle as *const [u32; 3]).read_unaligned() });
+            if !heap.samplers() && words[0] == VIEW_TAG && host.copied_tabled(index, crate::frame::current()) {
+                #[cfg(feature = "diagnostics")]
+                record_desc_diag(4, began.elapsed().as_nanos() as u64);
+                return;
+            }
+            host.mirror_sync_words(index, handle, words);
         }
     } else {
         let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -207,7 +244,14 @@ fn mirror(handle: u64) {
             Some(host) => {
                 drop(pending);
                 if let Some(host) = host {
-                    host.mirror_sync(index, handle);
+                    // SAFETY: `handle` is a live title descriptor slot inside `heap`.
+                    let words = pre_words.unwrap_or_else(|| unsafe { (handle as *const [u32; 3]).read_unaligned() });
+                    if !heap.samplers() && words[0] == VIEW_TAG && host.copied_tabled(index, crate::frame::current()) {
+                        #[cfg(feature = "diagnostics")]
+                        record_desc_diag(4, began.elapsed().as_nanos() as u64);
+                        return;
+                    }
+                    host.mirror_sync_words(index, handle, words);
                 }
             }
         }
@@ -231,6 +275,13 @@ fn mirror_range(dst: u64, count: u32, step: u64) {
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     let end = dst.saturating_add(u64::from(count).saturating_mul(step));
+    let lo = SHADER_HEAPS_MIN.load(std::sync::atomic::Ordering::Acquire);
+    let hi = SHADER_HEAPS_MAX.load(std::sync::atomic::Ordering::Acquire);
+    if end <= lo || dst >= hi {
+        #[cfg(feature = "diagnostics")]
+        record_desc_diag_n(4, u64::from(count), began.elapsed().as_nanos() as u64);
+        return;
+    }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let Some(&(h_start, h_end, at)) = heaps
         .iter()
@@ -248,11 +299,22 @@ fn mirror_range(dst: u64, count: u32, step: u64) {
             && let Some(first) = heap.index(dst)
             && first.saturating_add(count) <= heap.desc.count
         {
+            let mirror_host = |host: &host::HostHeap| {
+                let samplers = heap.samplers();
+                let frame = crate::frame::current();
+                for i in 0..count {
+                    let h = dst + u64::from(i) * step;
+                    // SAFETY: `h` lies within the live heap range checked above.
+                    let words = unsafe { (h as *const [u32; 3]).read_unaligned() };
+                    if !samplers && words[0] == VIEW_TAG && host.copied_tabled(first + i, frame) {
+                        continue;
+                    }
+                    host.mirror_sync_words(first + i, h, words);
+                }
+            };
             if let Some(host) = heap.host.get() {
                 if let Some(host) = host {
-                    for i in 0..count {
-                        host.mirror_sync(first + i, dst + u64::from(i) * step);
-                    }
+                    mirror_host(host);
                 }
             } else {
                 let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -261,9 +323,7 @@ fn mirror_range(dst: u64, count: u32, step: u64) {
                     Some(host) => {
                         drop(pending);
                         if let Some(host) = host {
-                            for i in 0..count {
-                                host.mirror_sync(first + i, dst + u64::from(i) * step);
-                            }
+                            mirror_host(host);
                         }
                     }
                 }
@@ -302,7 +362,7 @@ fn sync_aside() -> bool {
 }
 
 /// How long that thread waits for a submission before it makes a round of its
-/// own (`VICTORY_HEAP_SYNC_EARLY=<ms>`, 4 if not given; `0`: none). The title
+/// own (`VICTORY_HEAP_SYNC_EARLY=<ms>`, 8 if not given; `0`: none). The title
 /// copies its records while it records, and the first submission of a frame
 /// found all of them: 8 ms waited for (run cpu-2). A round made meanwhile
 /// leaves it those written since.
@@ -310,7 +370,7 @@ fn sync_aside() -> bool {
 fn sync_early() -> Option<std::time::Duration> {
     static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| {
-        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
+        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8u64);
         (ms > 0).then(|| std::time::Duration::from_millis(ms))
     })
 }
@@ -337,6 +397,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
             #[cfg(feature = "diagnostics")]
             crate::copystat::register_worker("heap-sync");
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            crate::cores::elevate_priority("victory-heap-sync");
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
             struct Over;
@@ -454,7 +515,7 @@ pub(crate) fn sync_heaps() {
         mirrored += before.len() as u64;
         kinds[4] += before.len() as u64;
         // Those of the changed pages, made together at the end.
-        let mut make: Vec<u32> = Vec::new();
+        let mut make: Vec<(u32, [u32; 3])> = Vec::new();
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
@@ -520,7 +581,7 @@ pub(crate) fn sync_heaps() {
                                 .and_then(|b| b.try_into().ok())
                                 .map_or(0, u32::from_le_bytes)
                         };
-                        let w0 = word(0);
+                        let (w0, w1, w2) = (word(0), word(1), word(2));
                         if !samplers && w0 == VIEW_TAG {
                             // A draw's own table: the draw makes what it
                             // reads of it (`draw.rs` `tables`).
@@ -530,7 +591,7 @@ pub(crate) fn sync_heaps() {
                             }
                         }
                         if w0 == VIEW_TAG {
-                            let key = u64::from(word(2)) << 32 | u64::from(word(1));
+                            let key = u64::from(w2) << 32 | u64::from(w1);
                             if host.quick_matches(index, key) {
                                 continue;
                             }
@@ -540,7 +601,7 @@ pub(crate) fn sync_heaps() {
                             // slot from this anyway, they wait for a draw
                             // or a pass: noted some frames on, unless a
                             // draw's table turns out to hold them.
-                            if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                            if matches!(w2 >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
                                 out.wait.push(index);
                                 continue;
                             }
@@ -552,12 +613,12 @@ pub(crate) fn sync_heaps() {
                             out.nothing += 1;
                             continue;
                         }
-                        out.make.push(index);
+                        out.make.push((index, [w0, w1, w2]));
                         out.kinds[if samplers {
                             3
                         } else if w0 != VIEW_TAG {
                             0
-                        } else if word(2) >> KIND_SHIFT == 0 {
+                        } else if w2 >> KIND_SHIFT == 0 {
                             1
                         } else {
                             2
@@ -594,8 +655,8 @@ pub(crate) fn sync_heaps() {
         spent[1] += since(began);
         let began = std::time::Instant::now();
         crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                host.mirror_sync(index, start + u64::from(index) * step);
+            for &(index, words) in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+                host.mirror_sync_words(index, start + u64::from(index) * step, words);
             }
         });
         spent[2] += since(began);
@@ -632,7 +693,7 @@ struct SyncPart {
     looked: u64,
     tabled: u64,
     nothing: u64,
-    make: Vec<u32>,
+    make: Vec<(u32, [u32; 3])>,
     wait: Vec<u32>,
     kinds: [u64; 5],
 }
@@ -833,6 +894,7 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        update_shader_heap_bounds(&heaps);
     }
 }
 
@@ -1050,7 +1112,7 @@ const SHAPES: usize = 1 << (62 - PLACED_ADDRESS_BITS);
 /// A view of placed memory without its address: whether it is unordered
 /// access, the resource description, and the view's words but the two that
 /// hold the address (10 and 11).
-type Shape = (bool, [u32; 14], [u32; 14]);
+pub(super) type Shape = (bool, [u32; 14], [u32; 14]);
 
 const SHAPE_CHUNK_SHIFT: usize = 12;
 const SHAPE_CHUNK_LEN: usize = 1 << SHAPE_CHUNK_SHIFT;
@@ -1164,16 +1226,54 @@ fn shape_index() -> &'static std::sync::RwLock<ShapeMap> {
     SHAPE_INDEX.get_or_init(|| std::sync::RwLock::new(ShapeMap::default()))
 }
 
+#[derive(Clone, Copy)]
+struct ShapeCacheSlot {
+    hash: u64,
+    idx: u32,
+    shape: Shape,
+}
+
+const SHAPE_TLS_CAP: usize = 256;
+
+#[inline]
+fn hash_shape(shape: &Shape) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = ShapeHash::default();
+    shape.hash(&mut h);
+    h.finish() | 1
+}
+
+thread_local! {
+    static SHAPE_TLS: std::cell::RefCell<Box<[ShapeCacheSlot; SHAPE_TLS_CAP]>> = std::cell::RefCell::new(
+        Box::new([ShapeCacheSlot { hash: 0, idx: 0, shape: (false, [0; 14], [0; 14]) }; SHAPE_TLS_CAP])
+    );
+}
+
 fn intern_shape(shape: Shape) -> Option<u32> {
-    if let Some(&at) = shape_index().read().unwrap_or_else(|e| e.into_inner()).get(&shape) {
+    let h = hash_shape(&shape);
+    let slot_idx = (h as usize) & (SHAPE_TLS_CAP - 1);
+    let cached = SHAPE_TLS.with(|cell| {
+        let entry = &cell.borrow()[slot_idx];
+        (entry.hash == h && entry.shape == shape).then_some(entry.idx)
+    });
+    if let Some(at) = cached {
         return Some(at);
     }
-    let mut map = shape_index().write().unwrap_or_else(|e| e.into_inner());
-    if let Some(&at) = map.get(&shape) {
-        return Some(at);
-    }
-    let at = SHAPES_TABLE.push_locked(shape)?;
-    map.insert(shape, at);
+    let at = if let Some(&at) = shape_index().read().unwrap_or_else(|e| e.into_inner()).get(&shape) {
+        at
+    } else {
+        let mut map = shape_index().write().unwrap_or_else(|e| e.into_inner());
+        if let Some(&at) = map.get(&shape) {
+            at
+        } else {
+            let at = SHAPES_TABLE.push_locked(shape)?;
+            map.insert(shape, at);
+            at
+        }
+    };
+    SHAPE_TLS.with(|cell| {
+        cell.borrow_mut()[slot_idx] = ShapeCacheSlot { hash: h, idx: at, shape };
+    });
     Some(at)
 }
 
@@ -1276,6 +1376,14 @@ fn placed_of(i: u32, generation: u32) -> Option<View> {
     (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
     desc[12..].copy_from_slice(&rest[10..]);
     Some(View::Placed(unordered, resource, desc))
+}
+
+/// Lock-free lookup of an inline placed view's [`Shape`] (`(unordered, resource, rest)`)
+/// without reconstructing the full `[u32; 16]` descriptor.
+#[cfg(windows)]
+pub(super) fn placed_shape(i: u32, generation: u32) -> Option<Shape> {
+    let payload = payload(i, generation);
+    SHAPES_TABLE.get((payload >> PLACED_ADDRESS_BITS) as usize)
 }
 
 impl Views {
@@ -1510,10 +1618,18 @@ fn record(handle: u64, view: View) {
         return;
     }
     let [i, generation] = words_for(view);
+    record_words(handle, [VIEW_TAG, i, generation]);
+}
+
+#[inline]
+fn record_words(handle: u64, words: [u32; 3]) {
+    if handle == 0 {
+        return;
+    }
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
-    unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+    unsafe { (handle as *mut [u32; 3]).write_unaligned(words) };
     #[cfg(windows)]
-    mirror(handle);
+    mirror_words(handle, Some(words));
 }
 
 /// The title released `resource`: the views naming it go stale.
@@ -1660,6 +1776,37 @@ pub(crate) extern "system" fn create_uav(
     record_desc_diag(2, began.elapsed().as_nanos() as u64);
 }
 
+fn create_placed(
+    unordered: bool,
+    resource: *const [u32; 14],
+    desc: *const [u32; 16],
+    handle: u64,
+) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    if handle != 0
+        && let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc))
+    {
+        if inline() {
+            let (shape, address) = shape_of(unordered, &resource, &desc);
+            if address >> PLACED_ADDRESS_BITS == 0
+                && let Some(shape) = intern_shape(shape)
+            {
+                NAMED_WHOLE[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let [w0, w1] = placed_words(shape, address);
+                record_words(handle, [VIEW_TAG, w0, w1]);
+                #[cfg(feature = "diagnostics")]
+                record_desc_diag(1, began.elapsed().as_nanos() as u64);
+                return;
+            }
+        }
+        normalize_placed(&mut resource, &mut desc);
+        record(handle, View::Placed(unordered, resource, desc));
+    }
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(1, began.elapsed().as_nanos() as u64);
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1669,14 +1816,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    #[cfg(feature = "diagnostics")]
-    let began = std::time::Instant::now();
-    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
-        normalize_placed(&mut resource, &mut desc);
-        record(handle, View::Placed(false, resource, desc));
-    }
-    #[cfg(feature = "diagnostics")]
-    record_desc_diag(1, began.elapsed().as_nanos() as u64);
+    create_placed(false, resource, desc, handle);
 }
 
 pub(crate) extern "system" fn create_placed_uav(
@@ -1685,14 +1825,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    #[cfg(feature = "diagnostics")]
-    let began = std::time::Instant::now();
-    if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
-        normalize_placed(&mut resource, &mut desc);
-        record(handle, View::Placed(true, resource, desc));
-    }
-    #[cfg(feature = "diagnostics")]
-    record_desc_diag(1, began.elapsed().as_nanos() as u64);
+    create_placed(true, resource, desc, handle);
 }
 
 /// Device method.
@@ -1870,6 +2003,7 @@ pub(crate) extern "system" fn create_heap(
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
+        update_shader_heap_bounds(&heaps);
     }
     #[cfg(not(windows))]
     let _ = visible;
@@ -2314,5 +2448,26 @@ mod tests {
             );
         }
         unsafe { drop(Box::from_raw(h.cast_mut().cast::<Heap>())) };
+    }
+
+    #[test]
+    fn shape_tls_cache_and_heap_bounds_stay_consistent() {
+        let r1 = [1u32, 0, 0, 0, 0x3333, 0, 1, 1, 0, 1, 0, 1, 0, 0];
+        let r2 = [1u32, 0, 0, 0, 0x4444, 0, 1, 1, 0, 1, 0, 1, 0, 0];
+        let mut d = [0u32; 16];
+        d[..10].copy_from_slice(&[12, 1, 0, 0, 64, 0, 0, 0, 0, 0]);
+        let (s1, _) = shape_of(false, &r1, &d);
+        let (s2, _) = shape_of(true, &r2, &d);
+        let i1 = intern_shape(s1).unwrap();
+        let i1_again = intern_shape(s1).unwrap();
+        let i2 = intern_shape(s2).unwrap();
+        assert_eq!(i1, i1_again);
+        assert_ne!(i1, i2);
+
+        update_shader_heap_bounds(&[(0x1000, 0x2000, 1), (0x4000, 0x6000, 2)]);
+        assert_eq!(SHADER_HEAPS_MIN.load(std::sync::atomic::Ordering::Acquire), 0x1000);
+        assert_eq!(SHADER_HEAPS_MAX.load(std::sync::atomic::Ordering::Acquire), 0x6000);
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        update_shader_heap_bounds(&heaps);
     }
 }

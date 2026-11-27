@@ -1184,6 +1184,11 @@ pub(crate) struct HostTexture {
     flags: u32,
     format: i32,
     mip_levels: u16,
+    /// Bumped in execution order (`HostList::prelude`) whenever a list writes this texture.
+    /// Starts at 1 so an aliased view (`alias_synced == 0`) copies once before first read.
+    pub(crate) write_epoch: std::sync::atomic::AtomicU64,
+    /// For an aliased view texture, the `source.write_epoch` last copied into it.
+    pub(crate) alias_synced: std::sync::atomic::AtomicU64,
 }
 
 /// What a host copy was filled with last: the first level of it and the
@@ -2365,6 +2370,8 @@ impl HostTexture {
             flags,
             format: desc.Format.0,
             mip_levels: desc.MipLevels,
+            write_epoch: std::sync::atomic::AtomicU64::new(1),
+            alias_synced: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2393,6 +2400,8 @@ impl HostTexture {
             flags,
             format: desc.Format.0,
             mip_levels: desc.MipLevels,
+            write_epoch: std::sync::atomic::AtomicU64::new(1),
+            alias_synced: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }

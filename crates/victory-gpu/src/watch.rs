@@ -1671,12 +1671,12 @@ thread_local! {
     static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
 }
 
-/// 256 address stripes of 512 KiB each (`8 * 64 KiB`), sharding [`GUARDS`]
+/// 1024 address stripes of 128 KiB each (`2 * 64 KiB`), sharding [`GUARDS`]
 /// so `guard()` (`VirtualProtect`) and game-thread `on_write` faults rarely
 /// touch the same shard.
-const GUARD_SHARDS: usize = 256;
+const GUARD_SHARDS: usize = 1024;
 const GUARD_WORDS: usize = GUARD_SHARDS / 64;
-const GUARD_STRIPE_SHIFT: u32 = 3; // 8 blocks = 512 KiB per stripe
+const GUARD_STRIPE_SHIFT: u32 = 1; // 2 blocks = 128 KiB per stripe
 
 #[inline]
 const fn guard_shard(block: usize) -> usize {

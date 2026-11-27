@@ -14,7 +14,7 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::{Clamp, uav_barrier};
+use super::{Clamp, uav_barrier_for};
 use crate::host::transition;
 
 /// The jobs of one pass.
@@ -266,6 +266,8 @@ pub(super) fn record(
     l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
+    budget_res: Option<&ID3D12Resource>,
+    need_global_uav: bool,
     sources: [u64; SOURCES],
     jobs: u64,
 ) {
@@ -274,13 +276,22 @@ pub(super) fn record(
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
     );
+    let mut first = [
+        transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        uav_barrier_for(None),
+    ];
+    let first_barriers = if need_global_uav {
+        &first[..]
+    } else if let Some(b) = budget_res {
+        first[1] = uav_barrier_for(Some(b));
+        &first[..]
+    } else {
+        &first[..1]
+    };
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        l.ResourceBarrier(first_barriers);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {
