@@ -66,7 +66,10 @@ impl Sums {
 
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SPANS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_CARD_SPANS") {
+        Some(v) => v != "0",
+        None => cfg!(feature = "diagnostics"),
+    })
 }
 
 static SPANS_MADE: Mutex<Option<Option<Spans>>> = Mutex::new(None);

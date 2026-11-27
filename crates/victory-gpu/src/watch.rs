@@ -230,6 +230,14 @@ pub(crate) fn lock_waits(frames: f64) -> String {
 }
 
 #[cfg(feature = "diagnostics")]
+static VEH_DIAG: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_veh_diag() -> [u64; 4] {
+    std::array::from_fn(|i| VEH_DIAG[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(feature = "diagnostics")]
 pub(crate) fn guard_wait_breakdown(frames: f64) -> String {
     const NAMES: [&str; 6] = ["guard", "unguard", "query", "land", "fault", "other"];
     let mut parts = Vec::with_capacity(NAMES.len());
@@ -3403,6 +3411,18 @@ pub(crate) fn install() {
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         #[cfg(feature = "diagnostics")]
+        struct VehTimer(std::time::Instant);
+        #[cfg(feature = "diagnostics")]
+        impl Drop for VehTimer {
+            fn drop(&mut self) {
+                use std::sync::atomic::Ordering::Relaxed;
+                VEH_DIAG[0].fetch_add(1, Relaxed);
+                VEH_DIAG[1].fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        let _veh = VehTimer(std::time::Instant::now());
+        #[cfg(feature = "diagnostics")]
         let _op = GuardOpScope::enter(4);
         let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
@@ -3462,9 +3482,13 @@ pub(crate) fn install() {
             if opened != 0 {
                 #[cfg(feature = "diagnostics")]
                 {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let fault_ns = began.elapsed().as_nanos() as u64;
+                    VEH_DIAG[2].fetch_add(1, Relaxed);
+                    VEH_DIAG[3].fetch_add(fault_ns, Relaxed);
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                     let ns = waited_ns as usize;
-                    let held = began.elapsed().as_nanos().saturating_sub(u128::from(waited_ns)) as u64;
+                    let held = fault_ns.saturating_sub(waited_ns);
                     crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);
                     crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
                 }

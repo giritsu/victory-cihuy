@@ -46,7 +46,9 @@ struct TableGroup {
 #[cfg(feature = "diagnostics")]
 static TABLE_DIAG: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(feature = "diagnostics")]
-static TABLE_SPLIT: [AtomicU64; 14] = [const { AtomicU64::new(0) }; 14];
+static TABLE_SPLIT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+#[cfg(feature = "diagnostics")]
+static BIND_SPLIT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(feature = "diagnostics")]
 static INDIRECT_SPLIT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
@@ -55,7 +57,7 @@ pub(crate) fn log_tables(frames: f64) {
     let calls = TABLE_DIAG[0].swap(0, Ordering::Relaxed);
     if calls != 0 {
         let vals: [u64; 7] = std::array::from_fn(|i| TABLE_DIAG[i + 1].swap(0, Ordering::Relaxed));
-        let sp: [u64; 14] = std::array::from_fn(|i| TABLE_SPLIT[i].swap(0, Ordering::Relaxed));
+        let sp: [u64; 16] = std::array::from_fn(|i| TABLE_SPLIT[i].swap(0, Ordering::Relaxed));
         let keep_ref_ns = crate::descriptor::host::take_keep_ref_ns();
         let lv = crate::descriptor::host::take_list_views_stats();
         tracing::info!(
@@ -70,7 +72,7 @@ pub(crate) fn log_tables(frames: f64) {
             vals[5] as f64 / frames,
         );
         tracing::info!(
-            "draw::tables split per frame (all threads): hash {:.1}ms, fresh_hit {:.1}ms ({:.0} hits, {:.0} fast-skip), dynamic {:.1}ms, inline_cbv {:.1}ms, listed_slot {:.1}ms (miss {:.1}ms, keep_ref {:.1}ms), readable {:.1}ms (fresh {:.0}, buf {:.0}, tex {:.0}, uav {:.0}, miss {:.0}), make_miss {:.1}ms, flush {:.1}ms",
+            "draw::tables split per frame (all threads): hash {:.1}ms, fresh_hit {:.1}ms ({:.0} hits, {:.0} fast-skip), dynamic {:.1}ms, inline_cbv {:.1}ms, listed_slot {:.1}ms (miss {:.1}ms, mirror {:.1}ms, stride_dyn {:.1}ms, keep_ref {:.1}ms), readable {:.1}ms (fresh {:.0}, buf {:.0}, tex {:.0}, uav {:.0}, miss {:.0}), make_miss {:.1}ms, flush {:.1}ms",
             sp[0] as f64 / 1e6 / frames,
             sp[1] as f64 / 1e6 / frames,
             sp[2] as f64 / frames,
@@ -79,6 +81,8 @@ pub(crate) fn log_tables(frames: f64) {
             sp[4] as f64 / 1e6 / frames,
             sp[5] as f64 / 1e6 / frames,
             lv[8] as f64 / 1e6 / frames,
+            sp[14] as f64 / 1e6 / frames,
+            sp[15] as f64 / 1e6 / frames,
             keep_ref_ns as f64 / 1e6 / frames,
             sp[6] as f64 / 1e6 / frames,
             sp[8] as f64 / frames,
@@ -99,6 +103,22 @@ pub(crate) fn log_tables(frames: f64) {
             lv[2] as f64 / frames,
             lv[3] as f64 / frames,
             lv[7] as f64 / frames,
+        );
+    }
+    let bcalls = BIND_SPLIT[0].swap(0, Ordering::Relaxed);
+    let preps = BIND_SPLIT[7].swap(0, Ordering::Relaxed);
+    if bcalls != 0 || preps != 0 {
+        let bs: [u64; 6] = std::array::from_fn(|i| BIND_SPLIT[i + 1].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "bind/prepare split per frame (all threads, {:.0} binds / {:.0} preps): header/pso {:.1}ms, tables {:.1}ms, user_data {:.1}ms, root_views {:.1}ms, vb_ib {:.1}ms, rt_state {:.1}ms",
+            bcalls as f64 / frames,
+            preps as f64 / frames,
+            bs[0] as f64 / 1e6 / frames,
+            bs[1] as f64 / 1e6 / frames,
+            bs[2] as f64 / 1e6 / frames,
+            bs[3] as f64 / 1e6 / frames,
+            bs[4] as f64 / 1e6 / frames,
+            bs[5] as f64 / 1e6 / frames,
         );
     }
     let icalls = INDIRECT_SPLIT[0].swap(0, Ordering::Relaxed);
@@ -1602,6 +1622,28 @@ impl State {
         if !self.bind(list, p, false) {
             return None;
         }
+        #[cfg(feature = "diagnostics")]
+        #[derive(Default)]
+        struct PrepDiag {
+            vb_ib_ns: u64,
+            rt_state_ns: u64,
+        }
+        #[cfg(feature = "diagnostics")]
+        impl Drop for PrepDiag {
+            fn drop(&mut self) {
+                BIND_SPLIT[7].fetch_add(1, Ordering::Relaxed);
+                if self.vb_ib_ns > 0 {
+                    BIND_SPLIT[5].fetch_add(self.vb_ib_ns, Ordering::Relaxed);
+                }
+                if self.rt_state_ns > 0 {
+                    BIND_SPLIT[6].fetch_add(self.rt_state_ns, Ordering::Relaxed);
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        let mut pd = PrepDiag::default();
+        #[cfg(feature = "diagnostics")]
+        let vb_began = std::time::Instant::now();
         let l = &list.list;
         // Vertex buffers the input layout reads.
         if p.slots != 0 {
@@ -1635,7 +1677,13 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let shadow = crate::shadow::find_any(v.address, u64::from(v.size))?;
+            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+                #[cfg(feature = "diagnostics")]
+                {
+                    pd.vb_ib_ns = vb_began.elapsed().as_nanos() as u64;
+                }
+                return None;
+            };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
@@ -1645,6 +1693,12 @@ impl State {
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            pd.vb_ib_ns = vb_began.elapsed().as_nanos() as u64;
+        }
+        #[cfg(feature = "diagnostics")]
+        let rt_began = std::time::Instant::now();
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
@@ -1669,6 +1723,10 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            pd.rt_state_ns = rt_began.elapsed().as_nanos() as u64;
+        }
         Some(p)
     }
 
@@ -1680,6 +1738,36 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        #[derive(Default)]
+        struct BindDiag {
+            header_ns: u64,
+            tables_ns: u64,
+            user_ns: u64,
+            root_ns: u64,
+        }
+        #[cfg(feature = "diagnostics")]
+        impl Drop for BindDiag {
+            fn drop(&mut self) {
+                BIND_SPLIT[0].fetch_add(1, Ordering::Relaxed);
+                if self.header_ns > 0 {
+                    BIND_SPLIT[1].fetch_add(self.header_ns, Ordering::Relaxed);
+                }
+                if self.tables_ns > 0 {
+                    BIND_SPLIT[2].fetch_add(self.tables_ns, Ordering::Relaxed);
+                }
+                if self.user_ns > 0 {
+                    BIND_SPLIT[3].fetch_add(self.user_ns, Ordering::Relaxed);
+                }
+                if self.root_ns > 0 {
+                    BIND_SPLIT[4].fetch_add(self.root_ns, Ordering::Relaxed);
+                }
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        let mut bd = BindDiag::default();
+        #[cfg(feature = "diagnostics")]
+        let hdr_began = std::time::Instant::now();
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1765,18 +1853,30 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            bd.header_ns = hdr_began.elapsed().as_nanos() as u64;
+        }
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
+            #[cfg(feature = "diagnostics")]
+            let t_began = std::time::Instant::now();
             let made = self.tables(list, &t.tables, compute);
+            #[cfg(feature = "diagnostics")]
+            {
+                bd.tables_ns += t_began.elapsed().as_nanos() as u64;
+            }
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
             }
+            #[cfg(feature = "diagnostics")]
+            let u_began = std::time::Instant::now();
             if stage.shader.ambient.is_some() {
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
@@ -1795,6 +1895,10 @@ impl State {
                     crate::memory::Use::Reads
                 };
                 let Some(ready) = self.memory_ready(list, &t, compute, use_) else {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        bd.user_ns += u_began.elapsed().as_nanos() as u64;
+                    }
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1841,6 +1945,12 @@ impl State {
                     }
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                bd.user_ns += u_began.elapsed().as_nanos() as u64;
+            }
+            #[cfg(feature = "diagnostics")]
+            let rv_began = std::time::Instant::now();
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
@@ -1899,6 +2009,10 @@ impl State {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                bd.root_ns += rv_began.elapsed().as_nanos() as u64;
+                            }
                             return false;
                         }
                         continue;
@@ -1907,6 +2021,10 @@ impl State {
                     let biased = srv && slot < 128 && (stage.biased_srvs & (1u128 << slot) != 0);
                     if tabled {
                         if !self.root_srv_table(list, Some(address), param, compute, biased) {
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                bd.root_ns += rv_began.elapsed().as_nanos() as u64;
+                            }
                             return false;
                         }
                         continue;
@@ -1958,13 +2076,27 @@ impl State {
                     }
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        bd.root_ns += rv_began.elapsed().as_nanos() as u64;
+                    }
                     return false;
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            {
+                bd.root_ns += rv_began.elapsed().as_nanos() as u64;
+            }
         }
+        #[cfg(feature = "diagnostics")]
+        let tw_began = std::time::Instant::now();
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        #[cfg(feature = "diagnostics")]
+        {
+            bd.root_ns += tw_began.elapsed().as_nanos() as u64;
+        }
         true
     }
 
@@ -3818,11 +3950,13 @@ impl State {
             mut d_r_tex,
             mut d_r_uav,
             mut d_r_miss,
+            mut d_mirror_ns,
+            mut d_stride_dyn_ns,
         ) = (
             std::time::Instant::now(),
             0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
             0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
-            0u64, 0u64, 0u64, 0u64, 0u64,
+            0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64,
         );
         for group in &plan.groups {
             let slot = group.slot;
@@ -4254,9 +4388,15 @@ impl State {
                             d_listed_hit += 1;
                         }
                         if let Some((title_slot, read)) = need_tex_tabled {
+                            #[cfg(feature = "diagnostics")]
+                            let mir_began = std::time::Instant::now();
                             host.texture_slot_tabled(title_slot, read);
                             if read {
                                 host.mirror_after(list, title_slot, handle);
+                            }
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                d_mirror_ns += mir_began.elapsed().as_nanos() as u64;
                             }
                         }
                         continue;
@@ -4364,10 +4504,13 @@ impl State {
                     }
                 }
             });
+            #[cfg(feature = "diagnostics")]
+            let sd_began = std::time::Instant::now();
             host.write_strides_slice(first, &self.table_strides[..n as usize]);
             host.note_dyn_range(first, n, table_had_twin);
             #[cfg(feature = "diagnostics")]
             {
+                d_stride_dyn_ns += sd_began.elapsed().as_nanos() as u64;
                 let sub = (d_inline_ns - inline_before) + (d_r_ns - r_before) + (d_miss_ns - miss_before);
                 d_listed_slot_ns += slots_began.elapsed().as_nanos().saturating_sub(u128::from(sub)) as u64;
             }
@@ -4416,6 +4559,8 @@ impl State {
             if d_r_uav > 0 { TABLE_SPLIT[11].fetch_add(d_r_uav, Ordering::Relaxed); }
             if d_r_miss > 0 { TABLE_SPLIT[12].fetch_add(d_r_miss, Ordering::Relaxed); }
             if d_fresh_skip > 0 { TABLE_SPLIT[13].fetch_add(d_fresh_skip, Ordering::Relaxed); }
+            if d_mirror_ns > 0 { TABLE_SPLIT[14].fetch_add(d_mirror_ns, Ordering::Relaxed); }
+            if d_stride_dyn_ns > 0 { TABLE_SPLIT[15].fetch_add(d_stride_dyn_ns, Ordering::Relaxed); }
         }
         made
     }

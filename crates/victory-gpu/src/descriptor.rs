@@ -131,22 +131,63 @@ const SHADER_VISIBLE: u32 = 1;
 /// descriptors, and by [`sync_heaps`]), alone only where heaps come and go.
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
+#[cfg(feature = "diagnostics")]
+static DESC_DIAG: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static DESC_DIAG_LOCAL: std::cell::Cell<([u64; 10], u32)> = const { std::cell::Cell::new(([0; 10], 0)) };
+}
+
+#[cfg(feature = "diagnostics")]
+#[inline]
+fn record_desc_diag(bucket: usize, ns: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    DESC_DIAG_LOCAL.with(|cell| {
+        let (mut vals, mut n) = cell.get();
+        vals[bucket * 2] += 1;
+        vals[bucket * 2 + 1] += ns;
+        n += 1;
+        if n >= 64 {
+            for (dst, &val) in DESC_DIAG.iter().zip(&vals) {
+                if val != 0 {
+                    dst.fetch_add(val, Relaxed);
+                }
+            }
+            vals = [0; 10];
+            n = 0;
+        }
+        cell.set((vals, n));
+    });
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_title_diag() -> [u64; 10] {
+    std::array::from_fn(|i| DESC_DIAG[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let Some(&(_, _, at)) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))
     else {
+        #[cfg(feature = "diagnostics")]
+        record_desc_diag(4, began.elapsed().as_nanos() as u64);
         return;
     };
     // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
     // the `SHADER_HEAPS` lock we hold here.
     let heap = unsafe { &*(at as *const Heap) };
     let Some(index) = heap.index(handle) else {
+        #[cfg(feature = "diagnostics")]
+        record_desc_diag(4, began.elapsed().as_nanos() as u64);
         return;
     };
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -159,6 +200,8 @@ fn mirror(handle: u64) {
             }
         }
     }
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(4, began.elapsed().as_nanos() as u64);
 }
 
 /// Whether [`sync_heaps`] is done (`VICTORY_HEAP_SYNC=0`: not).
@@ -1502,10 +1545,14 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     if let Some([lo, hi, size, _]) = words(desc) {
         let address = u64::from(lo) | u64::from(hi) << 32;
         record(handle, View::Constant(address, size));
     }
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(0, began.elapsed().as_nanos() as u64);
 }
 
 /// Device method.
@@ -1515,7 +1562,11 @@ pub(crate) extern "system" fn create_srv(
     desc: *const [u32; 10],
     handle: u64,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     record(handle, View::Shader(resource as usize, words(desc)));
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(2, began.elapsed().as_nanos() as u64);
 }
 
 /// Device method.
@@ -1526,8 +1577,12 @@ pub(crate) extern "system" fn create_uav(
     desc: *const [u32; 10],
     handle: u64,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     let view = View::Unordered(resource as usize, counter as usize, words(desc));
     record(handle, view);
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(2, began.elapsed().as_nanos() as u64);
 }
 
 /// Device methods 0x230 and 0x238: shader resource and unordered access
@@ -1539,10 +1594,14 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
         normalize_placed(&mut resource, &mut desc);
         record(handle, View::Placed(false, resource, desc));
     }
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(1, began.elapsed().as_nanos() as u64);
 }
 
 pub(crate) extern "system" fn create_placed_uav(
@@ -1551,29 +1610,45 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     if let (Some(mut resource), Some(mut desc)) = (words(resource), words(desc)) {
         normalize_placed(&mut resource, &mut desc);
         record(handle, View::Placed(true, resource, desc));
     }
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(1, began.elapsed().as_nanos() as u64);
 }
 
 /// Device method.
 pub(crate) extern "system" fn create_sampler(_: This, desc: *const [u32; 13], handle: u64) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     if let Some(desc) = words(desc) {
         record(handle, View::Sampler(desc));
     }
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(2, began.elapsed().as_nanos() as u64);
 }
 
 /// Device method 0x1e8.
 pub(crate) extern "system" fn create_sampler_x(_: This, desc: *const [u32; 27], handle: u64) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     if let Some(desc) = words(desc) {
         record(handle, View::ConsoleSampler(desc));
     }
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(2, began.elapsed().as_nanos() as u64);
 }
 
 /// Device method: `count` descriptors of `kind` from `src` to `dst`.
 pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u64, kind: u32) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     let Some(step) = increment(kind).map(u64::from) else {
+        #[cfg(feature = "diagnostics")]
+        record_desc_diag(3, began.elapsed().as_nanos() as u64);
         return;
     };
     let len = u64::from(count) * step;
@@ -1593,6 +1668,8 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             mirror(dst + i * step);
         }
     }
+    #[cfg(feature = "diagnostics")]
+    record_desc_diag(3, began.elapsed().as_nanos() as u64);
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered

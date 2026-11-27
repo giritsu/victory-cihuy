@@ -475,6 +475,11 @@ pub(crate) fn send_own() -> bool {
     send::own()
 }
 
+#[cfg(feature = "diagnostics")]
+static SWEEP_DIAG: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+#[cfg(feature = "diagnostics")]
+static MAKE_WAITING_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Once a second, before a submission starts: lets go of what nothing
 /// names any more (copies of windows of title memory, staging buffers,
 /// host copies of textures the title fills).
@@ -498,11 +503,25 @@ fn sweep() {
         return;
     }
     #[cfg(feature = "diagnostics")]
+    SWEEP_DIAG[7].fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    let t0 = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
     crate::book::check();
+    #[cfg(feature = "diagnostics")]
+    SWEEP_DIAG[6].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    let t1 = std::time::Instant::now();
     let finished = FINISHED.load(Ordering::Acquire);
     if finished > 0 {
         bury(finished);
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        SWEEP_DIAG[1].fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    let t2 = std::time::Instant::now();
     let memory = host().and_then(|h| h.video_memory());
     crate::residency::refresh(memory);
     if crate::residency::pressured() {
@@ -519,9 +538,29 @@ fn sweep() {
     }
     crate::pool::room(memory);
     crate::pipeline::trim_library();
+    #[cfg(feature = "diagnostics")]
+    {
+        SWEEP_DIAG[2].fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    let t3 = std::time::Instant::now();
     crate::shadow::let_go_idle();
+    #[cfg(feature = "diagnostics")]
+    {
+        SWEEP_DIAG[3].fetch_add(t3.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    let t4 = std::time::Instant::now();
     crate::texture::let_go_idle();
+    #[cfg(feature = "diagnostics")]
+    {
+        SWEEP_DIAG[4].fetch_add(t4.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    #[cfg(feature = "diagnostics")]
+    let t5 = std::time::Instant::now();
     crate::resource::let_go_idle();
+    #[cfg(feature = "diagnostics")]
+    SWEEP_DIAG[5].fetch_add(t5.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -5982,16 +6021,28 @@ impl Host {
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
             if upcheck::on() {
+                #[cfg(feature = "diagnostics")]
+                let tc = std::time::Instant::now();
                 upcheck::at_rest(self);
+                #[cfg(feature = "diagnostics")]
+                SWEEP_DIAG[6].fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
+            #[cfg(feature = "diagnostics")]
+            let ts = std::time::Instant::now();
             self.settle(&mut submitted, WHY_SYNC);
+            #[cfg(feature = "diagnostics")]
+            SWEEP_DIAG[0].fetch_add(ts.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if upcheck::on() {
+                #[cfg(feature = "diagnostics")]
+                let tc = std::time::Instant::now();
                 upcheck::at_rest(self);
+                #[cfg(feature = "diagnostics")]
+                SWEEP_DIAG[6].fetch_add(tc.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
@@ -6133,7 +6184,11 @@ impl Host {
         drop(heaps_synced);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
+        #[cfg(feature = "diagnostics")]
+        let mw_began = std::time::Instant::now();
         crate::descriptor::make_waiting();
+        #[cfg(feature = "diagnostics")]
+        MAKE_WAITING_NS.fetch_add(mw_began.elapsed().as_nanos() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -8032,6 +8087,7 @@ impl Split {
 #[cfg(feature = "diagnostics")]
 fn split_line(frames: f64) {
     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    let make_waiting_ms = MAKE_WAITING_NS.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
@@ -8043,7 +8099,7 @@ fn split_line(frames: f64) {
          several threads, {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
          card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {}); ahead of these {:.1} waiting for the submission lock, {:.1} \
          planning steps done on the card, {:.1} waiting for flights, {:.1} the heaps' records and what is swept; at the end {:.1} waiting \
-         for the heaps' records; asked early by a thread of its own {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",
+         for the heaps' records (make_waiting {:.1}); asked early by a thread of its own {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",
         ms[0],
         ms[8],
         ms[1],
@@ -8065,6 +8121,7 @@ fn split_line(frames: f64) {
         ms[13],
         ms[14],
         ms[15],
+        make_waiting_ms,
         e[0],
         e[1] / 1e3,
     );
@@ -8129,6 +8186,42 @@ fn split_line(frames: f64) {
         h[1],
         h[2],
         aside::WAITED.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames,
+    );
+    let sw: [u64; 8] = std::array::from_fn(|i| SWEEP_DIAG[i].swap(0, Ordering::Relaxed));
+    if sw[7] > 0 || sw[..7].iter().any(|&v| v > 0) {
+        tracing::info!(
+            "sweep breakdown per frame ({:.2} calls): settle {:.1}ms, bury {:.1}ms, trim/mem {:.1}ms, shadow_idle {:.1}ms, tex_idle {:.1}ms, res_idle {:.1}ms, check {:.1}ms",
+            sw[7] as f64 / frames,
+            sw[0] as f64 / 1e6 / frames,
+            sw[1] as f64 / 1e6 / frames,
+            sw[2] as f64 / 1e6 / frames,
+            sw[3] as f64 / 1e6 / frames,
+            sw[4] as f64 / 1e6 / frames,
+            sw[5] as f64 / 1e6 / frames,
+            sw[6] as f64 / 1e6 / frames,
+        );
+    }
+    let dd = crate::descriptor::take_title_diag();
+    let fd = crate::list::thin::take_front_diag();
+    let vd = crate::watch::take_veh_diag();
+    tracing::info!(
+        "title hooks per frame (all threads): cbv {:.1}ms ({:.0}), placed {:.1}ms ({:.0}), srv/uav {:.1}ms ({:.0}), copy_desc {:.1}ms ({:.0}), mirror {:.1}ms ({:.0}), thin_front {:.1}ms ({:.0} calls, handover {:.1}ms), veh_fault {:.1}ms ({:.0} calls, open {:.1}ms)",
+        dd[1] as f64 / 1e6 / frames,
+        dd[0] as f64 / frames,
+        dd[3] as f64 / 1e6 / frames,
+        dd[2] as f64 / frames,
+        dd[5] as f64 / 1e6 / frames,
+        dd[4] as f64 / frames,
+        dd[7] as f64 / 1e6 / frames,
+        dd[6] as f64 / frames,
+        dd[9] as f64 / 1e6 / frames,
+        dd[8] as f64 / frames,
+        fd[1] as f64 / 1e6 / frames,
+        fd[0] as f64 / frames,
+        fd[3] as f64 / 1e6 / frames,
+        vd[1] as f64 / 1e6 / frames,
+        vd[0] as f64 / frames,
+        vd[3] as f64 / 1e6 / frames,
     );
 }
 

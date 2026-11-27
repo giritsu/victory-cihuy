@@ -67,6 +67,22 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    #[cfg(feature = "diagnostics")]
+    diag_calls: u64,
+    #[cfg(feature = "diagnostics")]
+    diag_ns: u64,
+    #[cfg(feature = "diagnostics")]
+    diag_handover_calls: u64,
+    #[cfg(feature = "diagnostics")]
+    diag_handover_ns: u64,
+}
+
+#[cfg(feature = "diagnostics")]
+static FRONT_DIAG: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_front_diag() -> [u64; 4] {
+    std::array::from_fn(|i| FRONT_DIAG[i].swap(0, Relaxed))
 }
 
 impl Drop for Front {
@@ -76,9 +92,27 @@ impl Drop for Front {
 }
 
 impl Front {
+    #[cfg(feature = "diagnostics")]
+    fn flush_diag(&mut self) {
+        if self.diag_calls != 0 {
+            FRONT_DIAG[0].fetch_add(std::mem::take(&mut self.diag_calls), Relaxed);
+        }
+        if self.diag_ns != 0 {
+            FRONT_DIAG[1].fetch_add(std::mem::take(&mut self.diag_ns), Relaxed);
+        }
+        if self.diag_handover_calls != 0 {
+            FRONT_DIAG[2].fetch_add(std::mem::take(&mut self.diag_handover_calls), Relaxed);
+        }
+        if self.diag_handover_ns != 0 {
+            FRONT_DIAG[3].fetch_add(std::mem::take(&mut self.diag_handover_ns), Relaxed);
+        }
+    }
+
     /// Lets go of the recording there is: one never submitted is not run any
     /// further.
     fn leave(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        self.flush_diag();
         self.pending = None;
         if let Some(recording) = self.recording.take()
             && !self.submitted
@@ -90,12 +124,19 @@ impl Front {
 
     /// Begins a recording, with `pipeline` bound.
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         self.leave();
         self.pending = Some((kind, pipeline as usize));
         self.closed = false;
         self.submitted = false;
         if !pipeline.is_null() {
             crate::pipeline::bound(pipeline);
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            self.diag_calls += 1;
+            self.diag_ns += began.elapsed().as_nanos() as u64;
         }
     }
 
@@ -117,19 +158,39 @@ impl Front {
 
     #[inline]
     fn put(&mut self, op: u64, args: &[u64]) {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         if !self.ensure_recording() {
+            #[cfg(feature = "diagnostics")]
+            {
+                self.diag_calls += 1;
+                self.diag_ns += began.elapsed().as_nanos() as u64;
+            }
             return;
         }
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
-        if self.words.len() >= CHUNK {
+        let handed = self.words.len() >= CHUNK;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.diag_calls += 1;
+            self.diag_ns += began.elapsed().as_nanos() as u64;
+        }
+        if handed {
             self.hand_over();
         }
     }
 
     /// [`Self::put`] of some words and then the bytes of some things.
     fn put_with(&mut self, op: u64, args: &[u64], blobs: &[&[u8]]) {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         if !self.ensure_recording() {
+            #[cfg(feature = "diagnostics")]
+            {
+                self.diag_calls += 1;
+                self.diag_ns += began.elapsed().as_nanos() as u64;
+            }
             return;
         }
         let at = self.words.len();
@@ -145,12 +206,20 @@ impl Front {
         }
         let len = (self.words.len() - at - 1) as u64;
         self.words[at] = op | len << 16;
-        if self.words.len() >= CHUNK {
+        let handed = self.words.len() >= CHUNK;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.diag_calls += 1;
+            self.diag_ns += began.elapsed().as_nanos() as u64;
+        }
+        if handed {
             self.hand_over();
         }
     }
 
     fn hand_over(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         let Some(recording) = &self.recording else { return };
         if self.words.is_empty() {
             return;
@@ -167,9 +236,19 @@ impl Front {
             held(&READY).push_back(recording.clone());
             WORK.notify_one();
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            let ns = began.elapsed().as_nanos() as u64;
+            self.diag_ns += ns;
+            self.diag_handover_calls += 1;
+            self.diag_handover_ns += ns;
+            self.flush_diag();
+        }
     }
 
     fn close(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
         if self.closed {
             return;
         }
@@ -180,6 +259,12 @@ impl Front {
         } else {
             self.pending = None;
             self.closed = true;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            self.diag_calls += 1;
+            self.diag_ns += began.elapsed().as_nanos() as u64;
+            self.flush_diag();
         }
     }
 }
