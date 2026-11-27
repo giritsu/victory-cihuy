@@ -1,5 +1,5 @@
 # Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p, Series X + Ray Tracing default).
-#   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-x|series-s] [-DisplayMode <WxH>]
+#   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-x|series-s] [-DisplayMode 720p|1080p|1440p|4k|<WxH>]
 #                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-NoRayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-BarrierTest groups|indirect|both] [-Warm] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
 # Note: -Console series-x and -RayTracing (VICTORY_BVH_BUILDER=1) are enabled by default; pass -NoRayTracing for A/B comparison.
@@ -111,8 +111,17 @@ if ($Safe) {
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
 if ($DebugLayer) { $settings.VICTORY_D3D12_DEBUG = '1' }
 if ($DisplayMode) {
-    $settings.VICTORY_DISPLAY_MODE = $DisplayMode
-    $settings.VICTORY_OUTPUT = $DisplayMode
+    $resolvedMode = switch ($DisplayMode.Trim().ToLowerInvariant()) {
+        '720p'  { '1280x720' }
+        '936p'  { '1664x936' }
+        '1080p' { '1920x1080' }
+        '1440p' { '2560x1440' }
+        '4k'    { '3840x2160' }
+        '2160p' { '3840x2160' }
+        default { $DisplayMode.Trim() }
+    }
+    $settings.VICTORY_DISPLAY_MODE = $resolvedMode
+    $settings.VICTORY_OUTPUT = $resolvedMode
 }
 if (-not $NoRayTracing -or $RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
