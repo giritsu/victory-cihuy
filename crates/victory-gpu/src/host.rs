@@ -2548,13 +2548,17 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
     parts[thread] = h;
     GroupMemoryBarrierWithGroupSync();
+    [unroll]
+    for (uint stride = 32u; stride > 0u; stride >>= 1u) {
+        if (thread < stride) {
+            uint4 o = parts[thread + stride];
+            uint4 x = (parts[thread] ^ o) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+            parts[thread] = x.yzwx ^ (x >> 15);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
     if (thread != 0u) return;
     h = parts[0];
-    [loop]
-    for (uint i = 1u; i < 64u; ++i) {
-        h = (h ^ parts[i]) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
-    }
     if (compare != 0u) {
         // The flag, and above it 31 bits of the hash (`torn`).
         uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
@@ -3059,6 +3063,7 @@ fn landable(line: &[Option<u64>], completed: u64) -> usize {
 /// 64 KiB piece; the compare hashes the whole piece for each and stores
 /// the hash, so the second of them may find it stored already and not
 /// flag it.
+#[cfg(test)]
 fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     let mut pieces: Vec<(usize, u32)> = flags.iter().filter(|f| f.2).map(|f| (f.0, f.1)).collect();
     pieces.sort_unstable();
@@ -5271,28 +5276,34 @@ impl Host {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
+            let mut flagged_set: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
+            let mut flagged_copies: std::collections::HashSet<usize> = std::collections::HashSet::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
-                let flags: Vec<(usize, u32, bool)> = plan
-                    .ranges
-                    .iter()
-                    .filter(|r| !r.picked)
-                    .flat_map(|r| {
-                        (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
-                            let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), r.span.first + p), flagged));
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, wanted)
-                        })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
+                flagged_set.clear();
+                flagged_copies.clear();
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    let id = r.shadow.id();
+                    for p in 0..r.span.pieces {
+                        let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| torn::flagged(d));
+                        if suspects.map_or(flagged, |s| s.wanted((id, r.span.first + p), flagged)) {
+                            flagged_set.insert((copy, r.span.first + p));
+                            flagged_copies.insert(copy);
+                        }
+                    }
+                }
+                for r in plan.ranges.iter().filter(|r| !r.picked) {
+                    let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
+                    if !flagged_copies.contains(&copy) {
+                        continue;
+                    }
                     for p in 0..r.span.pieces {
-                        if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
+                        if !flagged_set.contains(&(copy, r.span.first + p)) {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
@@ -5313,7 +5324,6 @@ impl Host {
                             total += (hi - lo) as u64;
                         }
                     }
-                    crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
             }
         }

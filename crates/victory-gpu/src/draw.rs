@@ -2113,7 +2113,8 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                let builder = crate::pipeline::is_builder(self.pipeline as This);
+                if !self.root_uav(list, address, param, compute, writes, builder) {
                     #[cfg(feature = "diagnostics")]
                     {
                         bd.root_ns += rv_began.elapsed().as_nanos() as u64;
@@ -2138,6 +2139,15 @@ impl State {
         true
     }
 
+    fn bvh_scratch_back() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SCRATCH_BACK").is_some_and(|v| v == "1"))
+    }
+
+    fn should_root_uav_write(writes: bool, builder: bool, copy_len: u64, force_scratch_back: bool) -> bool {
+        writes && (!builder || force_scratch_back || copy_len <= crate::memory::BACK)
+    }
+
     /// Binds a root UAV: a raw unordered access view of the title buffer's
     /// host copy from `address` on, as a one-view table (a null view
     /// without an address, without a host copy shaders can write, or at an
@@ -2156,6 +2166,7 @@ impl State {
         param: u32,
         compute: bool,
         writes: bool,
+        builder: bool,
     ) -> bool {
         static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let limit = *LIMIT.get_or_init(|| {
@@ -2172,12 +2183,16 @@ impl State {
             }
             Some(s)
         };
+        let force_scratch = Self::bvh_scratch_back();
+        let do_write = |s: &crate::shadow::Shadow| {
+            Self::should_root_uav_write(writes, builder, s.span().1, force_scratch)
+        };
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
-            if writes {
+            if do_write(s) {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
@@ -2223,7 +2238,7 @@ impl State {
                         slot.written_list = 0;
                         slot.written_epoch = 0;
                     }
-                    if writes && (slot.written_list != list_ptr || slot.written_epoch != cur_ref_epoch) {
+                    if do_write(s) && (slot.written_list != list_ptr || slot.written_epoch != cur_ref_epoch) {
                         #[cfg(feature = "diagnostics")]
                         crate::host::wide_write(a, slot.len, pipeline);
                         s.gpu_writes(list, a, slot.len);
@@ -2256,6 +2271,7 @@ impl State {
                 if let Some((a, s)) = &shadow {
                     ready(*a, s);
                 }
+                let wrote = shadow.as_ref().is_some_and(|(_, s)| do_write(s));
                 let gpu_handle = host.gpu_handle(index);
                 self.root_uav_slots.insert(
                     key,
@@ -2265,8 +2281,8 @@ impl State {
                         len,
                         refreshed_list: list_ptr,
                         refreshed_epoch: cur_ref_epoch,
-                        written_list: if writes { list_ptr } else { 0 },
-                        written_epoch: if writes { cur_ref_epoch } else { 0 },
+                        written_list: if wrote { list_ptr } else { 0 },
+                        written_epoch: if wrote { cur_ref_epoch } else { 0 },
                     },
                 );
                 gpu_handle
@@ -6014,6 +6030,17 @@ mod tests {
         s.reset(std::ptr::null());
         assert!(s.cached_heap_buffers.is_none());
         assert!(s.root_view_cache.is_empty());
+    }
+
+    #[test]
+    fn builder_scratch_root_uavs_skip_gpu_writes_above_back_limit() {
+        use super::State;
+        assert!(State::should_root_uav_write(true, false, 64 << 20, false));
+        assert!(!State::should_root_uav_write(false, false, 65_536, false));
+        assert!(State::should_root_uav_write(true, true, 65_536, false));
+        assert!(State::should_root_uav_write(true, true, crate::memory::BACK, false));
+        assert!(!State::should_root_uav_write(true, true, 64 << 20, false));
+        assert!(State::should_root_uav_write(true, true, 64 << 20, true));
     }
 }
 
