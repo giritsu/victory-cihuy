@@ -110,7 +110,10 @@ if ($Safe) {
 
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
 if ($DebugLayer) { $settings.VICTORY_D3D12_DEBUG = '1' }
-if ($DisplayMode) { $settings.VICTORY_DISPLAY_MODE = $DisplayMode }
+if ($DisplayMode) {
+    $settings.VICTORY_DISPLAY_MODE = $DisplayMode
+    $settings.VICTORY_OUTPUT = $DisplayMode
+}
 if (-not $NoRayTracing -or $RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
 if ($InplaceProbe) { $settings.VICTORY_INPLACE_PROBE = '1' }
