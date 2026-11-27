@@ -1,68 +1,85 @@
-# VIctory on an RX 7900 XTX
-
-## Run the codec_d Windows build
-
-Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
-
-```powershell
-$env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
-.\Play-VIctory.cmd pareto-residency
-```
-
-The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
-
-To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
+# VIctory on an RX 7600 XT (16 GB RAM / Ryzen 5 5600)
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+This branch focuses on fast, crash-free execution on **AMD RDNA 3 (Radeon RX 7600 XT 16 GB)**
+and **16 GB system RAM** under Windows' WDDM 50% Shared GPU Memory limit (`~7.5 GiB`) without giving up visual quality.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## Target PC Specifications (2026-11-28)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
+- **OS:** Windows 11 x64 (Build 26300; inbox `D3D12Core.dll` `10.0.26100.9278` satisfies Agility SDK `>= 614` natively; `apps/victory` also keeps `D3D12SDKVersion=614` + `D3D12SDKPath=".\\D3D12\\"` exports for Windows 10 compatibility).
+- **CPU:** AMD Ryzen 5 5600 (6 Cores / 12 Threads, Zen 3, AVX2).
+- **RAM & Pagefile:** 16 GB physical RAM (`15.93 GB` usable) + 48–64 GB custom pagefile (`~64 GB` commit limit; Windows WDDM hard-caps Shared GPU Memory `NON_LOCAL` at 50% of physical RAM, `~7,490 MiB`).
+- **GPU & Driver:** AMD Radeon RX 7600 XT 16 GB VRAM (RDNA 3; native Wave32/Wave64, `views=2097152`, `raw_twins=true`, `mapped_card_memory=true` on Windows 11), AMD Software: Adrenalin Edition `26.11.2` (`32.0.32029.2010`).
+- **Toolchain & Shader Cache:** Pinned Rust `1.98.1-x86_64-pc-windows-msvc`, Visual Studio C++ build tools + Windows SDK `10.0.26100.0`, external pre-compiled shader cache in `%LOCALAPPDATA%\VIctory\cache-pareto` (~25.7k translated shaders).
 
-| | |
+## Where It Stands (2026-11-28 — Verified Baseline, Pass 34 / `d98e4c7`)
+
+Tested on the target PC above (`Windows 11 Build 26300`, `Adrenalin 26.11.2`, Xbox Series X profile, `diag` build, 4K `3840x2160` NoRT):
+
+| Metric | Measured Result |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
+| Menus, videos, loading screens | `30 fps` |
+| World steady (`diag`, 4K NoRT, `5.6k–11.0k` draws/frame) | **`9.4–13.0 fps`** (`77–107 ms/frame`), GPU `70.2–72.9 ms` (`title 61.2–64.0 ms`), `VICTORY_THIN 278–316 ms`, submit `53.7–54.1 ms` |
+| Visual & pipeline health | **`0` blackscreen**, **`0` errors**, **`0.0 null`** raw buffer twins (`24k–30k`/frame), `1,874` pre-warmed pipelines loaded |
+| Memory footprint | VRAM `9.9–10.7 / 15.56 GB`, Shared GPU (`NON_LOCAL`) `3.3–3.7 / 7.49 GB` |
+| Longest crash-free session (Pass 6) | **46 minutes** full main mission, `0` crashes |
 
-It started at 280 ms a frame in the same scenes two days earlier.
+Known limitations:
 
-What is known to be wrong:
+- Rooms with little direct light are dark without `-RayTracing`.
+- Textures of newly streamed objects can appear a frame late while streaming.
+- The first run after a GPU driver or build update stutters while compiling pipelines (`victory warm --used` or `-Warm` pre-warms them ahead).
+- Capturing single frames in the world can trigger the title's own GPU watchdog timeout.
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+## How to Build & Run
 
-## Local PC Profile & Progress (2026-11-26)
+Prerequisites: Windows 10/11 x64, an AVX2 CPU, a Direct3D 12 GPU with Shader Model 6.6 and mesh shader support, the pinned Rust toolchain (`1.98.1`), MSVC C++ build tools with a Windows SDK, your own complete Xbox Series dump, and a **48–64 GB custom pagefile** on 16 GB RAM hosts so Windows commit headroom stays safe.
 
-Target workstation profile added in this checkout:
+1. Configure `victory.toml` from `victory.example.toml` with all paths outside this repository (`game_dir`, `cache_dir`, `data_dir`). Set `VICTORY_CACHE_DIR` if reusing an external shader cache.
+2. Build from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified:
 
-- **OS & Display:** Windows 10 Pro (22H2, Build 19045), 1920x1080, Xbox Series S console profile (`--console series-s`).
-- **CPU:** AMD Ryzen 5 5600 (6 Cores / 12 Threads, Zen 3 with AVX2).
-- **RAM / Pagefile:** 16 GB physical RAM + 32 GB system pagefile (**note:** Windows WDDM hard-caps Shared GPU Memory `NON_LOCAL` at 50% of physical RAM, ~7,490 MiB).
-- **GPU:** AMD Radeon RX 7600 XT 16 GB VRAM (RDNA 3; native Wave32/Wave64, `views=2097152`, `raw_twins=true`, `mapped_card_memory=false` when BIOS ReBAR/SAM is disabled).
-- **Windows 10 DirectX 12 Agility SDK:** `apps/victory` exports `D3D12SDKVersion=614` and `D3D12SDKPath=".\\D3D12\\"`; copy `D3D12Core.dll` and `d3d12SDKLayers.dll` (`1.614.x`) into `target\diag\D3D12\` and `target\release\D3D12\` on Windows 10 hosts so SM 6.6 `0xC00` root signatures initialize cleanly.
+```powershell
+# Diagnostics build (panel & full frame telemetry):
+cargo build --locked --profile diag -p victory --features diagnostics
+
+# Faster release build:
+cargo build --release --locked -p victory
+```
+
+3. *(First run / after driver update)* Pre-translate shaders and pre-warm known pipelines (both can be stopped and resumed later):
+
+```powershell
+.\target\diag\victory.exe shaders <path-to-shader-archives>
+.\target\diag\victory.exe warm --used
+```
+
+4. Launch with `scripts\play-dev.ps1`:
+
+```powershell
+# Diagnostics build, Series X, NoRT, with F3 telemetry panel (+ -Warm once per driver update):
+.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build diag -Console series-x -NoRayTracing -Warm -Panel
+
+# Release build, Series X, NoRT:
+.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build release -Console series-x -NoRayTracing -Panel
+
+# With Ray Tracing (-RayTracing is default unless -NoRayTracing is passed) or safe mode (-Safe):
+.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build release -Console series-x -RayTracing -Panel
+.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build diag -Console series-x -Safe
+```
+
+Commands, debugging switches, and upstream documentation live in [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is also documented in a comment where it is read.
+
+## Optimization Progress Summary (Pass 1–34)
 
 | Milestone | Status | Measured Result / Notes |
 |---|---|---|
 | Win10 Agility SDK 1.614.1 (`apps/victory`) | Done | Fixed Win10 `0x80070057` (`c00/c01`) and startup `0xc0000005`; 29/29 upscaler compute pipelines created. |
-| Shader cache (`cache-pareto`) | Ready | 25,782 shaders pre-compiled (`victory shaders`) into `%LOCALAPPDATA%\VIctory\cache-pareto`. |
+| Shader cache (`cache-pareto`) | Ready | ~25.7k shaders pre-compiled (`victory shaders`) into `%LOCALAPPDATA%\VIctory\cache-pareto`. |
 | Pass 1: 16 GB RAM & 6C/12T scaling | Done | Added WDDM `NON_LOCAL` pressure tracking, compact `STAGING_SPARES`, `bury_lag=6`, 32 MiB spare scratch cap, and 6C/12T worker counts (`thin=4`, `under=4`, `pipeline=4`, `dstorage=6`). |
 | Pass 2: Staging bloat & 16 MiB staging pool | Done | Disabled `VICTORY_LEVELS_ON_DEMAND` default (`held_only()` active), added 16 MiB staging blocks, 100 ms `NON_LOCAL` sampling, and fast idle eviction. Runtime rose from ~1 min to **~7 min**; live texture staging dropped **2,104 MB -> 54 MB**; spurious texture re-uploads dropped **4,001+ -> 142**. |
 | Pass 3: `thin::BACKS` cap & 4 MiB loose windows | Done | Bounded `thin::BACKS` (`64/32/16`) and restored `4 MiB` loose windows. Live `diag` test reached **8m22s (frame 4,757)** at **8.5–10.7 FPS**, holding Shared GPU steady around **6.1–6.4 GB** for 6 minutes with 0 `no upload buffer` stalls until a late area-load spike. |
@@ -80,7 +97,7 @@ Target workstation profile added in this checkout:
 | Pass 15: Sharded `RETIRED_SHARDS` + batch retire, `CopyDescriptors` batching, `(frame, epoch)` `ListViews` w/ inline CBV bypass, cached COM metadata (`Shadow`/`HostTexture`/`Chunk`/`HostHeap`), precomputed `HostPipeline` flags, zero-alloc `set_targets`/`prepare_for`, `title_fills` filter & `mirror_sync` | Verified (`Series X`) | **0 error (`130s` `release` / `88s` `diag`, `avg 9,278`–`10,030` draws):** `VICTORY_THIN` **`338.2 ms` med** (`-15–25%`), `sync_heaps` **`38.0 ms`** (`making 14.7 ms`), `heap_views textures` **`24.2 ms`**, `release 9k+` **`9.4 -> 10.2 FPS` med** (`p90 11.2`), Shared GPU **`3,920–3,936 MiB`**, `0.0 null` raw twins, `0` evictions. Isolated `GUARDS` `95.2 ms`, `ListViews` over-invalidation (`31.6k` raw twins), `lists reset` `18.7 ms`, & `flush_all` `26.3 ms`. |
 | Pass 16: `GUARDS` `RwLock` + read-only `guard()` fast-path + region-batched `protect_here`/coalesced `unguard`; split `BUFFER_VIEWS_EPOCH`/`TEXTURE_VIEWS_EPOCH` `ListViews` + drop false `buffers()` invalidation; batched `release_dynamic_batch`; `Deferred::clear` + parallel `recycle_many`; `AHEAD_ACTIVE` + `JournalRead::ranged_nothing_new` `CHUNK=16` in `flush_all` | Verified (`Series X`) | **0 error (`155s` `release` / `146s` `diag`, up to `13.5k` draws):** `1k–4k` **`23.3–24.6 FPS`**, `4k–7k` `release` **`9.9 -> 11.2 FPS` (+13%)**, `7k–9k` `diag` **`8.5 -> 10.0 FPS` (+17.6%)**, `maxFrame` **`3,349 -> 514 ms`**, Shared GPU **`3,660 MiB`**, `0.0 null` raw twins; `guards` `-27%/call`, `flush_all` `-14.4%`, `sync_heaps making` `-17%`. Isolated `let_go_idle` **`607.2 ms`**, `30.2 s` residency stalls, and `GUARDS` write-lock holds. |
 | Pass 17: Budgeted `let_go_idle` (`512/3ms`, urgent `2048/8ms`) + `select_nth_unstable` + `host_written_snapshot` + single batch `retire`; private non-descriptor-heap buffers, `SPARE_SHARED`/`upload_cpu` + reusable `place_between` + `idle_most`/`idle_trim_keep`; chunked `PROTECT_CHUNK=64` `guard()` + batched `cover_run` | Verified (`Series X`) | **0 error (`83s` `release` & `diag`):** Eliminated `607.2 ms` sweep freeze (`0.28 ms`), cut `mapped()` waits `-83.1%`, `MakeResident` `-62.4%`, `host lists made` `-81.2%`, and `GUARDS` wait `-21.8%`; pushed `release ALL` `9.0 -> 9.8 FPS` (`p10 +25%`, `maxFrame 514 -> 236.9 ms`) and `9k+ diag` **`8.0 -> 9.4 FPS`** (`+17.5%`, `maxFrame 446.5 -> 152.8 ms`). |
-| Pass 18: 64-way `GUARDS` sharding (`4 MiB` stripes, sorted `ShardLocks`), lock-free `Pool::each`, 128B AVX2 fast-skip in `victory_safe_merge` & `changed_records`, single-pass unguarded `land::piece`, single `Notes::flush()` + `Shadow::landed_many` + `remapped_batch`, and `sync_heaps` scratch/`quick_matches` | Verified (`Series X`) | **0 error / 0 crash:** `release` (`avg 9,147` draws) `7k–9k` **`11.4 FPS` (+17.5%)**, `1k–4k` `15.9` (`max 17.0`), `4k–7k` `11.9`, `9k+` `9.0` (`cpu 59.8 ms`), `ALL` med `9.9` (`p10 7.4`, `p90 12.4`); `diag` (`129.9s`) `GUARDS` lock wait **`-71.5%`** (`61.5 -> 17.50 ms`), `JOURNAL` note wait `-68.7%`, `land` notes `-78.6%`, `sync_heaps` read/compare `-58%` to `-71%` (`4.28 ms`), user CPU/frame `-20.6%` (`768 -> 610 ms`). |
+| Pass 18: 64-way `GUARDS` sharding (`4 MiB` stripes, sorted `ShardLocks`), lock-free `Pool::each`, 128B AVX2 fast-skip in `victory_safe_merge` & `changed_records`, single-pass unguarded `land::piece`, single `Notes::flush()` per landing + `Shadow::landed_many` + `remapped_batch`, and `sync_heaps` scratch/`quick_matches` | Verified (`Series X`) | **0 error / 0 crash:** `release` (`avg 9,147` draws) `7k–9k` **`11.4 FPS` (+17.5%)**, `1k–4k` `15.9` (`max 17.0`), `4k–7k` `11.9`, `9k+` `9.0` (`cpu 59.8 ms`), `ALL` med `9.9` (`p10 7.4`, `p90 12.4`); `diag` (`129.9s`) `GUARDS` lock wait **`-71.5%`** (`61.5 -> 17.50 ms`), `JOURNAL` note wait `-68.7%`, `land` notes `-78.6%`, `sync_heaps` read/compare `-58%` to `-71%` (`4.28 ms`), user CPU/frame `-20.6%` (`768 -> 610 ms`). |
 | Pass 19: HLE `SetThreadGroupAffinity`/`SetThreadAffinityMask` unpinning, 64-way `64 KiB` `Shadow::merging`, `land::JOB=128 KiB` + `victory-reset` + LPT `relay_card_back`, in-place dynamic CBV/raw twin + batched retire, `ranged_check` + `REFRESH_BATCH_CHUNK=32`, and parallel disjoint `texback::land` | Verified (`Series X`) | **0 error / 0 crash / 0.00 null / 0 evictions:** `Shadow::merging` wait **`24.82 -> 2.66 ms` med** (`0.04–0.74 ms` steady), `read-backs` **`9.87–10.04 -> 6.79 ms`**, `card_steps` **`13.3–17.6 -> 9.85 ms`**; exposed CPU oversubscription (`user 610 -> 860 ms`, `kernel -> 109.5 ms`), `refreshes` (`29.6 ms`), & sync `bury(last)` (`8.1–41.8 ms`) in `victory-relay`. |
 | Pass 20: Pass-through default affinity (`VICTORY_TITLE_AFFINITY=1\|unpin` opt-in), zero-double-lock `RangedCheck` (`MustUpdate`/`Exact`) + `REFRESH_BATCH_CHUNK=16`, async `bury()` offload to `victory-late-wait`, and trimmed `victory-reset` (`n/6` clamped `2..3`) | Verified (`Series X` & `Series S`) | **0 error / 0 crash / 0 pressure / 0.00 null / 0 evictions:** Series X `release` `ALL` **`10.1` med** (`p10 7.6`, `p90 13.3`, `max 18.4 FPS`), `7k–9k` `10.3`, `9k+` `8.9` (`maxMs 293.6 ms`); Series S `release` `ALL` **`11.4`**, `9k+` **`10.9 FPS`** (`maxMs 113.9 ms`); `diag` `bury` **`8.09 -> 0.04 ms`**, GPU busy **`70% -> 83%`**, `refreshes` **`29.6 -> 24.0 ms`**. |
 | Pass 21: 256-way per-stripe `Shadow::merging` locking inside `merge_under_writes` + 6 `diagnostics` telemetry breakdowns (`under_writes`, `VICTORY_THIN` ops, `draw::tables`, `refreshes`/`card_before`/`card_steps`, `GUARDS` op waits, & `worker CPU` via `GetThreadTimes`) | Verified (`Series X diag`) | **0 error / 0 crash / 0 pressure / 0.00 null (`n=62`, avg `8,073` draws):** `ALL` **`8.9 -> 9.9 FPS` med** (`p10 8.0`, `p90 10.8`), `4k–7k` `10.8`, `7k–9k` `9.9` (`cpu 66.0 ms`), `9k+` `8.9`, `Shadow::merging` wait **`15.23 -> 0.58 ms` med** (`1.01 shards/lock`), GPU busy **`83% -> 86%`**. Exposed `VICTORY_THIN` `indirect` (`185.1 ms`), `draw::tables` (`146.0 ms`), `dirty_runs` (`15.9 ms`), & `GUARDS` (`27.2 ms`). |
@@ -96,55 +113,17 @@ Target workstation profile added in this checkout:
 | Pass 31: Word-chunked `AddressHash::write` (8B/4B), `ListViews::BUF_CAP=32768`, lock-free `twins_written` / `reset_id`, & cached `root_view_cached` / `heap_buffers` / `heap_strides` / `RootSlot` | Verified (`Series X`) | **0 error / 0 crash / 0.00 null (`diag` `n=62`, `release` `n=69`):** `diag` `ALL` `10.50 FPS`, `4k–7k 12.30 FPS`, `9k+ p90 10.50 FPS`, `list_views evict 5,913`, `inline_cbv 9.50 ms`, `refresh copied 65.0 MB`, `pure root_views 10.70 ms`; `release` `9k+ 8.60 FPS` med (`p10 6.80`, `+31%`, `max 12.20 FPS`), `0` pressure. |
 | Pass 32: Safe Ray Tracing activation (`MEMORY_CARD_BYTES` isolation, `2 GiB` / `92%` VRAM compact RT cap, Shared GPU fallback guard) & default `play-dev.ps1` to `series-x` + `VICTORY_BVH_BUILDER=1` | Verified (`Series X diag` + RT) | **0 error / 0 crash / 0 pressure / 0.00 null (`n=69`):** VRAM **`10.32 / 15.55 GB`**, Shared **`2.80 / 7.49 GB`**, `53/53` BVH builder pipelines active, RT arenas `684 MB`; isolated `501 ms/frame` pipeline-wait stall on cold `CS_RaytracingResolve` shaders (`2.80 FPS`, GPU `69%` idle vs `93–130 ms` GPU work). |
 | Pass 33: Non-blocking RT/slow pipeline wait (`Pending::non_blocking` + `VICTORY_PIPELINE_WAIT_SLOW=1`), `REQUESTED` worker priority boost, & coalesced `memory::bring_up` + 64B-chunked `memory::merge` | Verified (`Series X` + RT) | **0 error / 0 crash / 0.00 null (`diag` `n=225`, `release` `n=72`, `-Warm`):** `waiting for pipelines` **`501.1 -> 0.00 ms`**, `dropped 0`, `GPU busy 85%`, `diag 4k–7k` **`6.50 FPS` (`+124%`)**; **`release` `ALL 5.90 FPS` med** (`avg 5.87`, `9k+ 5.40`, `max 12.70`, `cpu 84.1 / gpu 72.7 / back 49.4 ms`). |
-| Pass 34: Skip builder scratch `gpu_writes` (`> 256 KiB`), static RT arena/directory refresh skip, zero-upgrade `card_dirty()`, HashSet `relay_card_back`, & parallel tree-reduced `CARD_COMPARE`/`torn::finish` | Built (`diag` & `release`) | Cuts RT `card_check` scratch overhead, redundant `memory.rs` full-arena refreshes, `card_dirty()` atomic churn, `relay_card_back` sorting/search, and serial GPU compare reduction; ready for live Series X RT test. |
-
-To run locally from a normal (non-Administrator) PowerShell window with your own dump path and external cache:
-
-```powershell
-cargo build --locked --profile diag -p victory --features diagnostics
-.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Panel
-
-# Faster release profile once verified:
-cargo build --release --locked -p victory
-.\scripts\play-dev.ps1 -GameDir '<path-to-game-dump>' -Build release -Panel
-```
+| Pass 34: Skip builder scratch `gpu_writes` (`> 256 KiB`), static RT arena/directory refresh skip, zero-upgrade `card_dirty()`, HashSet `relay_card_back`, & parallel tree-reduced `CARD_COMPARE`/`torn::finish` | Verified (`Win11` + `Adrenalin 26.11.2`, `Series X diag NoRT`) | **0 blackscreen / 0 error / `0.0 null` raw twins** (`24k–30k`/frame, `1,874` pipelines loaded): `9.4–13.0 FPS` steady at 4K (`5.6k–11.0k` draws/frame), VRAM `9.9–10.7 / 15.56 GB`, Shared GPU `3.3–3.7 / 7.49 GB`. Baseline for clean incremental re-optimization (`wadaw-pass46-backup` archives bundled Pass 35–46). |
 
 Detailed chronological measurements, progress percentages, input mapping, and hardware findings are recorded in [docs/progress.md](docs/progress.md), [docs/bug-journal.md](docs/bug-journal.md), and [docs/findings.md](docs/findings.md).
 
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
-
-```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
-```
-
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-
-Before the first run, ahead of time (both can be stopped and go on later):
-
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
-
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
+## What Is Different Here
 
 In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
 
+- **16 GB RAM & WDDM `NON_LOCAL` residency + 6C/12T scaling**: caps WDDM shared GPU growth (`CardStaging::Ram`, VRAM loose-window offload, `HostList` pooling, `16/8 MiB` compact staging) and sizes worker pools for Ryzen 5 5600 (`6C/12T`).
 - **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
+  (`VICTORY_THIN`): translated across worker threads in parallel.
 - **Submissions are prepared by a thread of ours and joined**
   (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
   threads spread: refreshes, compares (AVX2), descriptor records, landings.
@@ -169,6 +148,8 @@ commits taken from elsewhere name the commit and its author.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
+  the AMD RDNA 3 optimization fork this branch builds on.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
   this one started from, and the people whose pull requests it carries.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
@@ -182,7 +163,7 @@ commits taken from elsewhere name the commit and its author.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
 - **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
   title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- Upstream fork changes were made with [Claude Code](https://claude.com/claude-code).
 
 ## License
 
