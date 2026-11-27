@@ -496,15 +496,6 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
     live.iter().map(|s| (s.id(), s.buffer.clone())).collect()
 }
 
-/// Cached readiness state for a direct (non-fresh) descriptor table slot in [`State::direct_ready`].
-#[derive(Clone, Copy)]
-struct DirectReady {
-    is_tex: bool,
-    epoch: u64,
-    tested: usize,
-    depth_hit: bool,
-}
-
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -567,8 +558,6 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// Non-fresh direct table slots already mirrored & brought up to date in this list: `(handle, record_key)` → readiness state.
-    direct_ready: std::collections::HashMap<(u64, u64), DirectReady, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -616,16 +605,18 @@ impl State {
     /// shortcut: a list the title runs a second time without a reset then
     /// reads slots others may have taken (logged once).
     pub(crate) fn tables_done(&mut self) {
-        let ranges = self.take_tables();
-        crate::descriptor::release_dynamic_batch(&ranges);
-    }
-
-    /// Detaches and returns this list's dynamic descriptor ranges while clearing
-    /// per-recording state so in-place callers can release dynamic slots.
-    pub(crate) fn take_tables(&mut self) -> Vec<(usize, u32, u32)> {
-        let ranges = self.take_dynamic_ranges();
+        if self.tables_gone && self.dynamic.is_empty() {
+            self.last_indirect_args = None;
+            return;
+        }
+        if self.tables_gone {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
+        }
+        crate::descriptor::release_dynamic_batch(&self.dynamic);
+        self.dynamic.clear();
+        self.dyn_slab = (0, 0, 0);
         self.fresh_tables.clear();
-        self.direct_ready.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -635,25 +626,7 @@ impl State {
         self.copy_batch.clear();
         self.table_strides.clear();
         self.last_indirect_args = None;
-        ranges
-    }
-
-    /// Detaches only this list's dynamic descriptor ranges without clearing
-    /// per-recording caches, for `Detached` lists that are never re-recorded
-    /// and drop off-thread during recycling.
-    pub(crate) fn take_dynamic_ranges(&mut self) -> Vec<(usize, u32, u32)> {
-        if self.tables_gone && self.dynamic.is_empty() {
-            self.last_indirect_args = None;
-            return Vec::new();
-        }
-        if self.tables_gone {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
-        }
-        let ranges = std::mem::take(&mut self.dynamic);
-        self.dyn_slab = (0, 0, 0);
         self.tables_gone = true;
-        ranges
     }
 
     /// Allocates `n` contiguous dynamic slots from this list's active slab or
@@ -680,21 +653,11 @@ impl State {
         {
             (base, n)
         } else {
-            crate::host::drain_pending_tables();
+            crate::host::settle_for_fence();
             if let Some(base) = host.dynamic(want) {
                 (base, want)
-            } else if want > n
-                && let Some(base) = host.dynamic(n)
-            {
-                (base, n)
             } else {
-                crate::host::settle_for_fence();
-                crate::host::drain_pending_tables();
-                if let Some(base) = host.dynamic(want) {
-                    (base, want)
-                } else {
-                    (host.dynamic(n)?, n)
-                }
+                (host.dynamic(n)?, n)
             }
         };
         self.dynamic.push((heap_ptr, base, got));
@@ -828,11 +791,11 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_SPLIT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// Passes after which every buffer slot of the heap was looked at again.
-const HEAP_ROUND: u64 = 32;
+const HEAP_ROUND: u64 = 16;
 
 /// Whether the slots looked at again for no write are a part of them at
-/// every pass, each slot at every thirty-second (`VICTORY_HEAP_SPREAD=0`: all of
-/// them at every thirty-second pass, as before).
+/// every pass, each slot at every sixteenth (`VICTORY_HEAP_SPREAD=0`: all of
+/// them at every sixteenth pass, as before).
 ///
 /// All at once was some 115 ms on a thread that records the frame, every
 /// sixteenth frame (72,000 slots; run record-1: 11 ms a pass in the lines
@@ -1170,31 +1133,17 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover (1-entry MRU + single Arc clone per copy).
-    let mut by_copy: crate::host::ByCopy<usize> = crate::host::ByCopy::with_capacity_and_hasher(4096, Default::default());
-    let mut found: Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Vec::with_capacity(4096);
+    // Per host copy, the span its picked views cover.
+    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
     let mut views = 0u32;
-    let (mut last_key, mut last_idx) = (0usize, usize::MAX);
     for (shadow, from, to) in ranges.ranges() {
         views += 1;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let idx = if key == last_key && last_idx < found.len() {
-            last_idx
-        } else {
-            let idx = *by_copy.entry(key).or_insert_with(|| {
-                found.push((shadow.clone(), *from, *to));
-                found.len() - 1
-            });
-            last_key = key;
-            last_idx = idx;
-            idx
-        };
-        let span = &mut found[idx];
+        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
         span.1 = span.1.min(*from);
         span.2 = span.2.max(*to);
     }
-    let bytes: u64 = found.iter().map(|s| s.2 - s.1).sum();
-    let copies_count = found.len();
+    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
@@ -1206,31 +1155,22 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    if every <= 1 {
-        if !unwatched.is_empty() {
-            unwatched.clear();
-        }
-        for (shadow, from, to) in &mut found {
-            *to = (*to).min(*from + shadow.left(*from));
-        }
-    } else {
-        let mut next_unwatched = std::collections::HashMap::new();
-        found.retain_mut(|(shadow, from, to)| {
-            if shadow.unwatched() {
-                let id = shadow.id();
-                if let Some(&(last, low, high)) = unwatched.get(&id)
-                    && frame >= last && frame - last < every && low <= *from && *to <= high
-                {
-                    next_unwatched.insert(id, (last, low, high));
-                    return false;
-                }
-                next_unwatched.insert(id, (frame, *from, *to));
+    let mut found = Vec::with_capacity(spans.len());
+    let mut next_unwatched = std::collections::HashMap::new();
+    for (shadow, from, to) in spans.values() {
+        if every > 1 && shadow.unwatched() {
+            let id = shadow.id();
+            if let Some(&(last, low, high)) = unwatched.get(&id)
+                && frame >= last && frame - last < every && low <= *from && *to <= high
+            {
+                next_unwatched.insert(id, (last, low, high));
+                continue;
             }
-            *to = (*to).min(*from + shadow.left(*from));
-            true
-        });
-        *unwatched = next_unwatched;
+            next_unwatched.insert(id, (frame, *from, *to));
+        }
+        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
+    *unwatched = next_unwatched;
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
@@ -1247,7 +1187,7 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = copies_count,
+            copies = spans.len(),
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
@@ -1507,7 +1447,6 @@ impl State {
         self.host_heaps_set = false;
         self.cached_heap_buffers = None;
         self.cached_heap_strides = None;
-        self.direct_ready.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -2151,7 +2090,6 @@ impl State {
                     }
                 }
             }
-            let builder = !stage.root_uavs.is_empty() && crate::pipeline::is_builder(self.pipeline as This);
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
@@ -2175,6 +2113,7 @@ impl State {
                         None
                     }
                 };
+                let builder = crate::pipeline::is_builder(self.pipeline as This);
                 if !self.root_uav(list, address, param, compute, writes, builder) {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -4116,7 +4055,7 @@ impl State {
         }
     }
 
-    fn table_entry(&mut self, list: &HostList, u: &UsedResource, compute: bool) {
+    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
         };
@@ -4127,71 +4066,13 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        let words = crate::descriptor::record_at(handle);
-        let can_cache = u.kind == ResourceType::Srv || (u.kind == ResourceType::Uav && !STORES.get());
-        if let Some(words) = words {
-            let key = u64::from(words[2]) << 32 | u64::from(words[1]);
-            if host.quick_matches(index, key) {
-                if heap.samplers() || u.kind == ResourceType::Sampler {
-                    return;
-                }
-                if can_cache && let Some(&cached) = self.direct_ready.get(&(handle, key)) {
-                    if !cached.is_tex {
-                        if cached.epoch == list.refresh_epoch() {
-                            return;
-                        }
-                    } else {
-                        let tested = TESTED_DEPTH.get();
-                        if cached.epoch == list.epoch() && cached.tested == tested.0 {
-                            if cached.depth_hit {
-                                TESTED_DEPTH.set((tested.0, true));
-                            }
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        let Some(view) = host.mirror(index, handle, true) else {
-            return;
-        };
-        let is_tex = crate::descriptor::host::is_texture_view(&view);
-        let depth_before = if is_tex {
-            let before = TESTED_DEPTH.get();
-            TESTED_DEPTH.set((before.0, false));
-            let _ = crate::residency::take_staging_deferred();
-            before
-        } else {
-            (0, false)
-        };
-        readable(list, u.kind, &view);
-        // Up to date by this draw: not the texture pass's to make.
-        if is_tex {
-            host.texture_slot_tabled(index, true);
-        } else {
-            host.slot_tabled(index);
-        }
-        let (depth, deferred) = if is_tex {
-            let d = TESTED_DEPTH.get().1;
-            TESTED_DEPTH.set((depth_before.0, depth_before.1 || d));
-            (d, crate::residency::take_staging_deferred())
-        } else {
-            (false, false)
-        };
-        if can_cache
-            && let Some(words) = words
-        {
-            let key = u64::from(words[2]) << 32 | u64::from(words[1]);
-            if host.quick_matches(index, key) && (!is_tex || !deferred) {
-                self.direct_ready.insert(
-                    (handle, key),
-                    DirectReady {
-                        is_tex,
-                        epoch: if is_tex { list.epoch() } else { list.refresh_epoch() },
-                        tested: if is_tex { depth_before.0 } else { 0 },
-                        depth_hit: is_tex && depth,
-                    },
-                );
+        if let Some(view) = host.mirror(index, handle, true) {
+            readable(list, u.kind, &view);
+            // Up to date by this draw: not the texture pass's to make.
+            if crate::descriptor::host::is_texture_view(&view) {
+                host.texture_slot_tabled(index, true);
+            } else {
+                host.slot_tabled(index);
             }
         }
     }
@@ -4567,21 +4448,7 @@ impl State {
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             host.with_table_views(frame, n, |tv| {
-                let mut grp_pos = 0usize;
-                let mut sel_pos = 0usize;
                 for k in 0..n {
-                    while grp_pos < group.by_descriptor.len() && group.by_descriptor[grp_pos].0 < k {
-                        grp_pos += 1;
-                    }
-                    let used_k = if grp_pos < group.by_descriptor.len() && group.by_descriptor[grp_pos].0 == k {
-                        Some(&group.entries[group.by_descriptor[grp_pos].1])
-                    } else {
-                        None
-                    };
-                    while sel_pos < selected.len() && selected[sel_pos] < k {
-                        sel_pos += 1;
-                    }
-                    let selected_k = sel_pos < selected.len() && selected[sel_pos] == k;
                     let index = first + k;
                     let handle = table + u64::from(k) * 32;
                     let words = crate::descriptor::record_at(handle);
@@ -4634,9 +4501,10 @@ impl State {
                             index,
                             copy_batch,
                             |listed, cached| {
-                                let kind = used_k
+                                let kind = group
+                                    .entry(k)
                                     .map(|u| u.kind)
-                                    .or_else(|| selected_k.then_some(listed.kind).flatten());
+                                    .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                                 if let Some(kind) = kind {
                                     if !listed.texture && kind == ResourceType::Srv {
                                         let refresh_epoch = list.refresh_epoch();
@@ -4725,7 +4593,7 @@ impl State {
                     }
                     #[cfg(feature = "diagnostics")]
                     let miss_began = std::time::Instant::now();
-                    let used = used_k;
+                    let used = group.entry(k);
                     if words.is_none() {
                         host.make_null_table_slot(index, copy_batch);
                         strides[k as usize] = 0;
@@ -4783,7 +4651,7 @@ impl State {
                                 d_miss_ns += miss_began.elapsed().as_nanos() as u64;
                             }
                             let kind = used.map(|u| u.kind).or_else(|| {
-                                selected_k.then(|| view_kind(&view)).flatten()
+                                selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                             });
                             if let Some(kind) = kind {
                                 #[cfg(feature = "diagnostics")]
@@ -5187,12 +5055,7 @@ impl State {
             return Some((b.scratch.clone(), at));
         }
         self.batch = None;
-        let (mut table, scratch) = crate::indirect::open_batch(
-            list,
-            (id, &args.buffer),
-            &argument_copies(args),
-            self.take_uav_dirty(),
-        )?;
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
@@ -5381,20 +5244,9 @@ impl State {
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(
-                        list,
-                        (&args.buffer, offset),
-                        (kind, step, records),
-                        self.take_uav_dirty(),
-                    )
+                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(
-                        list,
-                        (&args.buffer, offset),
-                        count_arg,
-                        (kind, step, records),
-                        self.take_uav_dirty(),
-                    )
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
                 let Some(bounded) = bounded else {
                     self.last_indirect_args = Some(cached_args);

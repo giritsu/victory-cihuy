@@ -743,9 +743,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
-    let need_uav = super::barrier_groups_need_uav(count, groups);
-    front(this).put(BARRIER_GROUPS, &[u64::from(count), u64::from(need_uav)]);
+extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -937,7 +936,7 @@ fn translate_one(op: u64, list: This, w: &[u64]) -> bool {
         BARRIER => {
             super::barrier(list, n as u32, at_or(w, 1));
         }
-        BARRIER_GROUPS => super::barrier_groups_filtered(list, n as u32, w.get(1).copied().unwrap_or(1) != 0),
+        BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
         VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
         SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
         BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),

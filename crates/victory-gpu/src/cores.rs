@@ -69,25 +69,6 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
-/// Raises the calling critical-path thread to `THREAD_PRIORITY_ABOVE_NORMAL`
-/// (`VICTORY_THREAD_PRIORITY=0`: off) so frame-blocking coordinators and the
-/// short-burst helpers they synchronously wait on are not preempted by
-/// background recording or title worker threads on 6-core CPUs.
-pub(crate) fn elevate_priority(what: &str) {
-    use windows_sys::Win32::System::Threading::{
-        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-    };
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_PRIORITY").is_none_or(|v| v != "0")) {
-        return;
-    }
-    // SAFETY: setting this thread's own priority.
-    let ok = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
-    if ok == 0 {
-        tracing::warn!(what, error = %std::io::Error::last_os_error(), "could not elevate thread priority");
-    }
-}
-
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
     if stage() < from {

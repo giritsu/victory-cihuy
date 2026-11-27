@@ -134,139 +134,45 @@ pub(super) struct Writer {
     copy: bool,
 }
 
-/// Collects unique `(shadow, from, to, copy)` writers across `items` and `landing`,
-/// checking uniqueness before cloning `Arc<Shadow>`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(super) fn writers_dedup(items: &[Late], landing: &[Writer]) -> Vec<Writer> {
-    let mut seen = std::collections::HashSet::with_capacity_and_hasher(
-        items.len() * 4 + landing.len(),
-        std::hash::BuildHasherDefault::<AddressHash>::default(),
-    );
-    let mut out = Vec::with_capacity(items.len() * 4 + landing.len());
-    let mut push = |shadow: Option<&Arc<Shadow>>, from: usize, to: usize, copy: bool| {
-        let ptr = shadow.map_or(0, |s| Arc::as_ptr(s) as usize);
-        if seen.insert((ptr, from, to, copy)) {
-            out.push(Writer {
-                shadow: shadow.cloned(),
-                from,
-                to,
-                copy,
-            });
-        }
-    };
-    for item in items {
-        if let Late::Run(flight) = item {
-            for (shadow, ranges) in &flight.back {
-                for &(from, to) in ranges {
-                    push(Some(shadow), from, to, false);
-                }
-            }
-            for &(from, to) in &flight.backs_ranges {
-                push(None, from, to, false);
-            }
-            if let Some(taken) = &flight.own {
-                for w in taken.copied() {
-                    push(w.shadow.as_ref(), w.from, w.to, w.copy);
-                }
-            }
-        } else if let Late::Write(at, _, bytes) = item {
-            push(None, *at, *at + *bytes, false);
-        }
-    }
-    for w in landing {
-        push(w.shadow.as_ref(), w.from, w.to, w.copy);
-    }
-    out
-}
-
-/// Collects deduplicated raw writer intervals directly from `items` and `landing`
-/// without allocating an intermediate `Vec<Writer>`.
-fn collect_writer_raw(items: &[Late], landing: &[Writer]) -> Vec<(usize, usize, Option<(ShadowKey, u64, u64, bool)>)> {
-    let est = items.len() * 4 + landing.len();
-    let mut seen = std::collections::HashSet::with_capacity_and_hasher(
-        est,
-        std::hash::BuildHasherDefault::<AddressHash>::default(),
-    );
-    let mut out = Vec::with_capacity(est);
-    let mut push = |shadow: Option<&Arc<Shadow>>, from: usize, to: usize| {
-        let ptr = shadow.map_or(0, |s| Arc::as_ptr(s) as usize);
-        if seen.insert((ptr, from, to)) {
-            let target = shadow.map(|s| {
-                let (start, len) = s.span();
-                (ShadowKey(s.clone()), start, len, s.in_place())
-            });
-            out.push((from, to, target));
-        }
-    };
-    for item in items {
-        if let Late::Run(flight) = item {
-            for (shadow, ranges) in &flight.back {
-                for &(from, to) in ranges {
-                    push(Some(shadow), from, to);
-                }
-            }
-            for &(from, to) in &flight.backs_ranges {
-                push(None, from, to);
-            }
-            if let Some(taken) = &flight.own {
-                for (shadow, from, to) in &taken.copied {
-                    push(Some(shadow), *from, *to);
-                }
-            }
-        } else if let Late::Write(at, _, bytes) = item {
-            push(None, *at, *at + *bytes);
-        }
-    }
-    for w in landing {
-        push(w.shadow.as_ref(), w.from, w.to);
-    }
-    out
-}
-
-/// What `items` of the line write (deduplicated).
-#[cfg_attr(not(test), allow(dead_code))]
+/// What `items` of the line write.
 pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
-    writers_dedup(items, &[])
-}
-
-/// The destinations of copies done here that have not landed, as `(shadow_ptr, from, to)` without cloning `Arc`.
-pub(super) fn copy_ranges(line: &Line) -> Vec<(usize, usize, usize)> {
-    if stage() < 2 {
-        return Vec::new();
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            Late::Run(flight) => {
+                for (shadow, ranges) in &flight.back {
+                    out.extend(ranges.iter().map(|&(from, to)| Writer {
+                        shadow: Some(shadow.clone()),
+                        from,
+                        to,
+                        copy: false,
+                    }));
+                }
+                for &i in &flight.order {
+                    for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
+                        out.push(Writer {
+                            shadow: None,
+                            from: at,
+                            to: at + rows.saturating_sub(1) * pitch + row,
+                            copy: false,
+                        });
+                    }
+                }
+                out.extend(flight.own.iter().flat_map(Taken::copied));
+            }
+            Late::Write(at, _, bytes) => out.push(Writer {
+                shadow: None,
+                from: *at,
+                to: *at + *bytes,
+                copy: false,
+            }),
+            Late::Signal(..) => {}
+        }
     }
-    let flying = line.line.iter().filter_map(|l| match l {
-        Late::Run(flight) => flight.own.as_ref(),
-        _ => None,
-    });
-    let landing = line.landing.iter().filter(|w| w.copy).map(|w| {
-        (w.shadow.as_ref().map_or(0, |s| Arc::as_ptr(s) as usize), w.from, w.to)
-    });
-    flying
-        .flat_map(|t| t.copied.iter().map(|(s, from, to)| (Arc::as_ptr(s) as usize, *from, *to)))
-        .chain(landing)
-        .collect()
-}
-
-/// Whether `runs` refresh another host copy of a destination in `copies` (`copy_ranges`),
-/// or read it in a step that flights are not waited for otherwise (`Step::Host`).
-pub(super) fn copied_read_ranges(copies: &[(usize, usize, usize)], runs: &[&HostList]) -> bool {
-    if copies.is_empty() {
-        return false;
-    }
-    runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
-            Step::Refresh(shadow, at, len) => copies
-                .iter()
-                .any(|&(ptr, from, to)| from < *at + *len && *at < to && (ptr == 0 || ptr != Arc::as_ptr(shadow) as usize)),
-            Step::Host(_, (from, to)) => copies.iter().any(|&(_, w_from, w_to)| w_from < *to && *from < w_to),
-            Step::Plane((at, len), _) => copies.iter().any(|&(_, w_from, w_to)| w_from < at.saturating_add(*len) && *at < w_to),
-            _ => false,
-        })
-    })
+    out
 }
 
 /// The destinations of copies done here that have not landed.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn copies(line: &Line) -> Vec<Writer> {
     if stage() < 2 {
         return Vec::new();
@@ -285,7 +191,6 @@ pub(super) fn copies(line: &Line) -> Vec<Writer> {
 /// Whether `runs` refresh another host copy of a destination in `copies`,
 /// or read it in a step that flights are not waited for otherwise
 /// (`Step::Host`): that reads title memory, where the copy is not yet.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
     if copies.is_empty() {
         return false;
@@ -557,8 +462,7 @@ fn build_interval_spans<T: Clone + Eq + std::hash::Hash>(
     if writers.is_empty() {
         return Vec::new();
     }
-    let mut ids: std::collections::HashMap<T, usize, std::hash::BuildHasherDefault<AddressHash>> =
-        std::collections::HashMap::with_capacity_and_hasher(32, Default::default());
+    let mut ids: std::collections::HashMap<T, usize> = std::collections::HashMap::new();
     let mut unique: Vec<T> = Vec::new();
     let mut events: Vec<(usize, SweepEvent)> = Vec::with_capacity(writers.len() * 2);
     for (from, to, target) in writers {
@@ -718,17 +622,14 @@ impl std::hash::Hash for ShadowKey {
     }
 }
 
-/// Disjoint partition of `writers` intervals for O(log N) + MRU [`holder`] lookups,
-/// plus O(copies) in-submission overlay writes so `Step::Copy` dependencies never rebuild `spans`.
+/// Disjoint partition of `writers` intervals for O(log N) + MRU [`holder`] lookups.
 struct WriterIndex {
     spans: Vec<IndexedSpan<ShadowKey>>,
-    overlay: Vec<Writer>,
     last: Option<(usize, usize, Arc<Shadow>)>,
     last_miss: Option<(usize, usize, Arc<Shadow>)>,
 }
 
 impl WriterIndex {
-    #[cfg_attr(not(test), allow(dead_code))]
     fn build(writers: &[Writer]) -> Self {
         let raw: Vec<(usize, usize, Option<(ShadowKey, u64, u64, bool)>)> = writers
             .iter()
@@ -740,103 +641,45 @@ impl WriterIndex {
                 (w.from, w.to, target)
             })
             .collect();
-        Self::build_from_raw(&raw)
-    }
-
-    fn build_from_raw(raw: &[(usize, usize, Option<(ShadowKey, u64, u64, bool)>)]) -> Self {
         Self {
-            spans: build_interval_spans(raw),
-            overlay: Vec::new(),
+            spans: build_interval_spans(&raw),
             last: None,
             last_miss: None,
         }
     }
 
-    fn push_overlay(&mut self, shadow: Arc<Shadow>, from: usize, to: usize) {
-        self.overlay.push(Writer {
-            shadow: Some(shadow),
-            from,
-            to,
-            copy: true,
-        });
-        self.last = None;
-        self.last_miss = None;
-    }
-
-    fn lookup(&mut self, from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
-        let has_overlay = !self.overlay.is_empty() && self.overlay.iter().any(|w| meet((w.from, w.to), (from, to)));
-        if !has_overlay {
-            if let Some((a, b, s)) = &self.last
-                && *a <= from
-                && to <= *b
-            {
-                return Ok(s.clone());
-            }
-            if let Some((sf, st, res)) = lookup_interval_spans(&self.spans, from, to) {
-                return match res {
-                    Ok(key) => {
-                        let s = key.0.clone();
-                        self.last = Some((sf, st, s.clone()));
-                        Ok(s)
-                    }
-                    Err(msg) => Err(msg),
-                };
-            }
-            if let Some((mf, mt, s)) = &self.last_miss
-                && *mf == from
-                && *mt == to
-            {
-                return Ok(s.clone());
-            }
+    fn lookup(&mut self, writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+        if let Some((a, b, s)) = &self.last
+            && *a <= from
+            && to <= *b
+        {
+            return Ok(s.clone());
         }
-        self.lookup_slow(from, to, has_overlay)
-    }
-
-    fn lookup_slow(&mut self, from: usize, to: usize, has_overlay: bool) -> Result<Arc<Shadow>, &'static str> {
-        let mut found: Option<&Arc<Shadow>> = None;
-        let idx = self.spans.partition_point(|s| s.to <= from);
-        for span in &self.spans[idx..] {
-            if span.from >= to {
-                break;
-            }
-            match &span.hit {
-                IntervalHit::Conflict(msg) => return Err(*msg),
-                IntervalHit::One(key) => match found {
-                    Some(f) if !Arc::ptr_eq(&key.0, f) => {
-                        return Err("flights write it through two host copies");
-                    }
-                    _ => found = Some(&key.0),
-                },
-            }
-        }
-        for w in self.overlay.iter().filter(|w| meet((w.from, w.to), (from, to))) {
-            match (&w.shadow, found) {
-                (None, _) => return Err("a read-back or a value behind a flight is written there"),
-                (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => {
-                    return Err("flights write it through two host copies");
+        if let Some((sf, st, res)) = lookup_interval_spans(&self.spans, from, to) {
+            return match res {
+                Ok(key) => {
+                    let s = key.0.clone();
+                    self.last = Some((sf, st, s.clone()));
+                    Ok(s)
                 }
-                (Some(s), _) => found = Some(s),
-            }
+                Err(msg) => Err(msg),
+            };
         }
-        let shadow = match found {
-            Some(s) => s.clone(),
-            None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
-        };
-        let (start, len) = shadow.span();
-        if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
-            return Err("no host copy holds all of it");
+        if let Some((mf, mt, s)) = &self.last_miss
+            && *mf == from
+            && *mt == to
+        {
+            return Ok(s.clone());
         }
-        if !has_overlay {
-            self.last_miss = Some((from, to, shadow.clone()));
-        }
-        Ok(shadow)
+        let s = holder(writers, from, to)?;
+        self.last_miss = Some((from, to, s.clone()));
+        Ok(s)
     }
 }
 
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
-#[cfg_attr(not(test), allow(dead_code))]
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
     let mut found: Option<&Arc<Shadow>> = None;
     for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
@@ -1089,7 +932,7 @@ static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::Ato
 /// list by address, their place in it).
 pub(super) struct Taken {
     own: Own,
-    steps: ByCopy<Vec<u64>>,
+    steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
 }
 
@@ -1098,21 +941,11 @@ impl Taken {
         &self.own.list
     }
 
-    /// Returns the packed per-step bitset slice for `list`, if any steps of `list`
-    /// were taken onto the card.
-    #[inline]
-    pub(super) fn bits_for(&self, list: &HostList) -> Option<&[u64]> {
-        self.steps.get(&(std::ptr::from_ref(list) as usize)).map(Vec::as_slice)
-    }
-
     /// Whether step `i` of `list` is done by this.
-    #[allow(dead_code)]
     pub(super) fn takes(&self, list: &HostList, i: usize) -> bool {
-        self.bits_for(list)
-            .is_some_and(|bits| bits.get(i >> 6).is_some_and(|&w| w & (1u64 << (i & 63)) != 0))
+        self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn copied(&self) -> impl Iterator<Item = Writer> {
         self.copied.iter().map(|(shadow, from, to)| Writer {
             shadow: Some(shadow.clone()),
@@ -1148,10 +981,10 @@ impl Host {
             if line.written.is_empty() {
                 return None;
             }
-            (line.written.clone(), copy_ranges(&line))
+            (line.written.clone(), copies(&line))
         };
         blocked_by(&written, runs, false)?;
-        let taken = if copied_read_ranges(&copies, runs) {
+        let taken = if copied_read(&copies, runs) {
             Err("a copy done on the card is read through another host copy")
         } else {
             self.take_steps(&written, runs)
@@ -1216,11 +1049,16 @@ impl Host {
                 }
             }
         }
-        let raw = {
+        let mut writers = {
             let line = line();
-            collect_writer_raw(&line.line, &line.landing)
+            let mut all = writers(&line.line);
+            all.extend(line.landing.iter().map(|w| Writer {
+                shadow: w.shadow.clone(),
+                ..*w
+            }));
+            all
         };
-        let mut writer_index = WriterIndex::build_from_raw(&raw);
+        let mut writer_index = WriterIndex::build(&writers);
         #[cfg(feature = "diagnostics")]
         let (writers_ns, st2) = (st1.elapsed().as_nanos() as u64, std::time::Instant::now());
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
@@ -1258,7 +1096,7 @@ impl Host {
             if len == 0 {
                 return Err("nothing to read");
             }
-            let from = writer_index.lookup(src, src + len)?;
+            let from = writer_index.lookup(&writers, src, src + len)?;
             let from_ptr = Arc::as_ptr(&from) as usize;
             let place = (from_ptr, src, len, level);
             let (at, first_read) = match places.get(&place) {
@@ -1279,7 +1117,7 @@ impl Host {
             let from_idx = intern_shadow(&mut shadows, &mut last_shadow, from);
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = writer_index.lookup(dst, dst + len)?;
+                    let to = writer_index.lookup(&writers, dst, dst + len)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
@@ -1288,7 +1126,13 @@ impl Host {
                     }
                     // What the steps behind it read of it is in that host
                     // copy, or nowhere.
-                    writer_index.push_overlay(to.clone(), dst, dst + len);
+                    writers.push(Writer {
+                        shadow: Some(to.clone()),
+                        from: dst,
+                        to: dst + len,
+                        copy: true,
+                    });
+                    writer_index = WriterIndex::build(&writers);
                     To::Copy(to, dst)
                 }
                 _ => match fill_tos[pos].take() {
@@ -1394,16 +1238,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         noted(&ops, &shadows);
         spent.end();
-        let mut taken_steps: ByCopy<Vec<u64>> = ByCopy::default();
-        for &(i, _) in &chosen {
-            let (list_ptr, step_idx) = steps[i];
-            let words = taken_steps.entry(list_ptr).or_default();
-            let word = step_idx >> 6;
-            if words.len() <= word {
-                words.resize(word + 1, 0);
-            }
-            words[word] |= 1u64 << (step_idx & 63);
-        }
+        let mut taken_steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>> =
+            std::collections::HashSet::with_capacity_and_hasher(chosen.len(), Default::default());
+        taken_steps.extend(chosen.iter().map(|&(i, _)| steps[i]));
         Ok(Some(Taken {
             own,
             steps: taken_steps,
@@ -2022,83 +1859,5 @@ mod tests {
             .collect();
         let spans = build_interval_spans(&stress);
         assert_eq!(lookup_interval_spans(&spans, 100, 900).map(|(_, _, r)| r), Some(Ok(&1)));
-    }
-
-    #[test]
-    fn writer_index_overlay_and_straddle_matches_holder() {
-        let Some(_) = host() else {
-            return;
-        };
-        let buf_a = vec![0u8; 8192].into_boxed_slice();
-        let buf_b = vec![0u8; 8192].into_boxed_slice();
-        let buf_c = vec![0u8; 8192].into_boxed_slice();
-        let addr_a = buf_a.as_ptr() as usize;
-        let addr_b = buf_b.as_ptr() as usize;
-        let addr_c = buf_c.as_ptr() as usize;
-        crate::shadow::register(0xA101, addr_a as u64, 8192);
-        crate::shadow::register(0xA102, addr_b as u64, 8192);
-        crate::shadow::register(0xA103, addr_c as u64, 8192);
-        let sa = crate::shadow::find(addr_a as u64, 64).unwrap();
-        let sb = crate::shadow::find(addr_b as u64, 64).unwrap();
-        let sc = crate::shadow::find(addr_c as u64, 64).unwrap();
-
-        let mut writers = vec![
-            // Disjoint intervals of `sa` separated by a gap [addr_a+1000, addr_a+2000).
-            Writer { shadow: Some(sa.clone()), from: addr_a + 100, to: addr_a + 1000, copy: false },
-            Writer { shadow: Some(sa.clone()), from: addr_a + 2000, to: addr_a + 3000, copy: false },
-            // Two-shadow conflict inside `sa` at [addr_a+4000, addr_a+4200).
-            Writer { shadow: Some(sa.clone()), from: addr_a + 3500, to: addr_a + 4500, copy: false },
-            Writer { shadow: Some(sb.clone()), from: addr_a + 4000, to: addr_a + 4200, copy: false },
-            // Read-back (`None`) interval on `sb`.
-            Writer { shadow: None, from: addr_b + 500, to: addr_b + 700, copy: false },
-        ];
-        let mut idx = WriterIndex::build(&writers);
-
-        let queries = [
-            // Exact span hit (caches MRU).
-            (addr_a + 200, addr_a + 400),
-            // MRU repeat.
-            (addr_a + 250, addr_a + 350),
-            // Gap inside registered `sa` (no writer overlaps, falls back to `shadow::find`).
-            (addr_a + 1200, addr_a + 1500),
-            // Straddle across gap between two `sa` writer spans.
-            (addr_a + 800, addr_a + 2200),
-            // Two-shadow conflict.
-            (addr_a + 4050, addr_a + 4150),
-            // Straddle into two-shadow conflict.
-            (addr_a + 3600, addr_a + 4100),
-            // None writer conflict.
-            (addr_b + 550, addr_b + 650),
-            // Gap in `sc` with no writers at all.
-            (addr_c + 100, addr_c + 300),
-        ];
-
-        for &(from, to) in &queries {
-            let got = idx.lookup(from, to);
-            let exp = holder(&writers, from, to);
-            match (&got, &exp) {
-                (Ok(gs), Ok(es)) => assert!(Arc::ptr_eq(gs, es), "mismatch for {from:#x}..{to:#x}"),
-                (Err(_), Err(_)) => {}
-                _ => panic!("result mismatch for {from:#x}..{to:#x}: got={} exp={}", got.is_ok(), exp.is_ok()),
-            }
-        }
-
-        // Push overlay copy of `sc` on `addr_c + 200..addr_c + 500`, then conflict overlay of `sb` on `addr_a + 200..300`.
-        idx.push_overlay(sc.clone(), addr_c + 200, addr_c + 500);
-        writers.push(Writer { shadow: Some(sc.clone()), from: addr_c + 200, to: addr_c + 500, copy: true });
-        // Still matches `sc` on [addr_c+250..400), and still hits base `sa` on [addr_a+250..350).
-        assert!(Arc::ptr_eq(&idx.lookup(addr_c + 250, addr_c + 400).unwrap(), &sc));
-        assert!(Arc::ptr_eq(&idx.lookup(addr_a + 250, addr_a + 350).unwrap(), &sa));
-
-        idx.push_overlay(sb.clone(), addr_a + 200, addr_a + 300);
-        writers.push(Writer { shadow: Some(sb.clone()), from: addr_a + 200, to: addr_a + 300, copy: true });
-        // Now [addr_a+250..350) must detect the two-shadow conflict even though `last` had cached `sa` before push_overlay!
-        assert!(idx.lookup(addr_a + 250, addr_a + 350).is_err());
-        assert!(holder(&writers, addr_a + 250, addr_a + 350).is_err());
-
-        crate::shadow::unregister(0xA101, addr_a as u64);
-        crate::shadow::unregister(0xA102, addr_b as u64);
-        crate::shadow::unregister(0xA103, addr_c as u64);
-        drop((buf_a, buf_b, buf_c));
     }
 }
