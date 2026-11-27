@@ -682,11 +682,14 @@ pub(crate) fn constant_slots(
     }
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut last: Option<(usize, Option<&host::HostHeap>)> = None;
-    let mut retired = Vec::new();
+    let mut batch = host::CopyBatch::default();
     for &(heap, index, gpu, size) in slots {
         let host = match last {
             Some((cached, host)) if cached == heap => host,
             _ => {
+                if let Some((_, Some(prev))) = last {
+                    prev.flush_copy_batch(&mut batch);
+                }
                 let resolved = heaps
                     .iter()
                     .any(|&(_, _, h)| h == heap)
@@ -698,11 +701,11 @@ pub(crate) fn constant_slots(
             }
         };
         if let Some(host) = host {
-            host.constant_at_base_retire(index, buffer, buffer_gpu, gpu, size, Some(&mut retired));
+            host.constant_at_base_retire(index, buffer, buffer_gpu, gpu, size, Some(&mut batch));
         }
     }
-    if !retired.is_empty() {
-        crate::host::retire_resources(retired);
+    if let Some((_, Some(prev))) = last {
+        prev.flush_copy_batch(&mut batch);
     }
 }
 

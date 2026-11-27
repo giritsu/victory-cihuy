@@ -3225,17 +3225,13 @@ pub(crate) fn let_go_idle() {
             format!("sweep: {went} host copies of windows of title memory let go ({} KiB), held by no list and no slot", bytes >> 10)
         });
     }
-    // Retire idle windows and invalidate `ListViews` if any vanished.
-    let any_gone = !gone.is_empty();
+    // Retire idle windows (no list or descriptor slot holds a reference to them).
     for shadow in gone {
         LET_GO[0].fetch_add(1, Ordering::Relaxed);
         LET_GO[1].fetch_add(shadow.len, Ordering::Relaxed);
         // Nothing runs now and nothing names it: freed at once unless a
         // submission is running after all.
         crate::host::retire(shadow);
-    }
-    if any_gone {
-        crate::descriptor::host::invalidate_buffer_views();
     }
 }
 
@@ -6194,13 +6190,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if map.len() >= MANY {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
-        let before = map.len();
         map.retain(|_, (shadow, used)| {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
-        if map.len() < before {
-            crate::descriptor::host::invalidate_buffer_views();
-        }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));

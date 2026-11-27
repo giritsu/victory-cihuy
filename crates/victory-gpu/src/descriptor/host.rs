@@ -118,6 +118,26 @@ impl Made {
     }
 }
 
+/// Slots grouped into one dynamic-heap arena block for amortized resource holding
+/// and whole-block descriptor clearing upon full release.
+const DYN_BLOCK: u32 = 512;
+
+struct DynBlockHeld {
+    ptrs: std::collections::HashSet<usize, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    resources: Vec<ID3D12Resource>,
+}
+
+struct DynBlock {
+    held: Mutex<DynBlockHeld>,
+}
+
+struct DynAlloc {
+    next: u32,
+    taken: Vec<bool>,
+    block_live: Vec<u16>,
+    block_dirty: Vec<bool>,
+}
+
 pub(crate) struct HostHeap {
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
@@ -156,18 +176,19 @@ pub(crate) struct HostHeap {
     /// they were made from and when that was
     /// ([`HostHeap::texture_slot_gone`]).
     away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
-    /// The host resource each slot views, held while the slot does: shaders
+    /// The host resource each title slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     ///
-    /// A lock for each slot: one for the heap was what the recording threads
-    /// waited for most (5.6 % of their time, profile waits-1: each descriptor
-    /// made for a draw takes it, and lets go of what the slot held under it).
+    /// A lock for each title slot (`0..count`); dynamic slots (`count..count+dynamic`)
+    /// are held at [`DynBlock`] granularity instead of per-slot mutexes.
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Resource retention sets per [`DYN_BLOCK`] dynamic slot block.
+    dyn_blocks: Box<[DynBlock]>,
+    /// Where the search for free dynamic slots starts, which are taken
+    /// (by lists not yet reset), and per-[`DYN_BLOCK`] live slot counts.
+    next: Mutex<DynAlloc>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1386,7 +1407,13 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host
+                .next
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .taken
+                .get((index - host.count) as usize)
+                .copied();
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1408,29 +1435,33 @@ pub(crate) fn slot_story(slot: u32) -> String {
                 at as f64 / 1e3
             ));
         }
-        let kept = host.kept_in(index);
-        match kept {
-            None => text.push_str(", holds nothing"),
-            Some(resource) => {
-                // SAFETY: a resource the slot holds.
-                let d = unsafe { resource.GetDesc() };
-                let gpu = if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
-                    // SAFETY: as above.
-                    unsafe { resource.GetGPUVirtualAddress() }
-                } else {
-                    0
-                };
-                text.push_str(&format!(
-                    ", holds {:#x}: dimension {} {}x{}x{} levels {} f{} at {gpu:#x}, {} references",
-                    resource.as_raw() as usize,
-                    d.Dimension.0,
-                    d.Width,
-                    d.Height,
-                    d.DepthOrArraySize,
-                    d.MipLevels,
-                    d.Format.0,
-                    crate::host::references(&resource)
-                ));
+        if let Some(held_count) = host.dyn_block_held_count(index) {
+            text.push_str(&format!(", dynamic block holds {held_count} resources"));
+        } else {
+            let kept = host.kept_in(index);
+            match kept {
+                None => text.push_str(", holds nothing"),
+                Some(resource) => {
+                    // SAFETY: a resource the slot holds.
+                    let d = unsafe { resource.GetDesc() };
+                    let gpu = if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+                        // SAFETY: as above.
+                        unsafe { resource.GetGPUVirtualAddress() }
+                    } else {
+                        0
+                    };
+                    text.push_str(&format!(
+                        ", holds {:#x}: dimension {} {}x{}x{} levels {} f{} at {gpu:#x}, {} references",
+                        resource.as_raw() as usize,
+                        d.Dimension.0,
+                        d.Width,
+                        d.Height,
+                        d.DepthOrArraySize,
+                        d.MipLevels,
+                        d.Format.0,
+                        crate::host::references(&resource)
+                    ));
+                }
             }
         }
         text
@@ -1678,8 +1709,21 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
-            kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            kept: (0..count).map(|_| Mutex::new(None)).collect(),
+            dyn_blocks: (0..(extra as usize).div_ceil(DYN_BLOCK as usize))
+                .map(|_| DynBlock {
+                    held: Mutex::new(DynBlockHeld {
+                        ptrs: Default::default(),
+                        resources: Vec::new(),
+                    }),
+                })
+                .collect(),
+            next: Mutex::new(DynAlloc {
+                next: 0,
+                taken: vec![false; extra as usize],
+                block_live: vec![0; (extra as usize).div_ceil(DYN_BLOCK as usize)],
+                block_dirty: vec![false; (extra as usize).div_ceil(DYN_BLOCK as usize)],
+            }),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1807,6 +1851,11 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    /// Total number of dynamic descriptor slots available past `self.count`.
+    pub(crate) fn dynamic_capacity(&self) -> u32 {
+        self.dynamic
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -1817,16 +1866,15 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
+        let mut alloc = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
+        let n_usize = n as usize;
         // Search from `next` on, then from the start (extending past cursor by
         // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
+        let cursor = alloc.next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
+        let second_end = cursor.saturating_add(n_usize.saturating_sub(1)).min(end);
         let starts = (cursor..end).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
@@ -1837,15 +1885,15 @@ impl HostHeap {
                 run = 0;
             }
             last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
+            run = if alloc.taken[at] { 0 } else { run + 1 };
+            if run == n_usize {
+                found = Some(at + 1 - n_usize);
                 break;
             }
         }
         let Some(first) = found else {
             if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
+                self.too_long.fetch_min(n, std::sync::atomic::Ordering::Relaxed);
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
@@ -1859,9 +1907,18 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
+        let alloc_end = first + n_usize;
+        alloc.taken[first..alloc_end].fill(true);
+        let b_first = first / DYN_BLOCK as usize;
+        let b_last = (alloc_end - 1) / DYN_BLOCK as usize;
+        for b in b_first..=b_last {
+            let lo = (b * DYN_BLOCK as usize).max(first);
+            let hi = ((b + 1) * DYN_BLOCK as usize).min(alloc_end);
+            alloc.block_live[b] += (hi - lo) as u16;
+            alloc.block_dirty[b] = true;
+        }
+        self.free.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        alloc.next = (alloc_end % end) as u32;
         Some(self.count + first as u32)
     }
 
@@ -2757,6 +2814,34 @@ impl HostHeap {
         self.tabled_in(index, false, crate::frame::current());
     }
 
+    /// [`HostHeap::slot_tabled`] with caller-supplied `frame`.
+    pub(crate) fn slot_tabled_in(&self, index: u32, frame: u64) {
+        self.tabled_in(index, false, frame);
+    }
+
+    /// Marks `count` contiguous title slots starting at `start` as tabled in `frame`.
+    pub(crate) fn slot_tabled_range(&self, start: u32, count: u32, frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if count == 0 {
+            return;
+        }
+        let Some(end) = start.checked_add(count) else {
+            return;
+        };
+        let Some(slice) = self.tabled.get(start as usize..end as usize) else {
+            for k in 0..count {
+                self.tabled_in(start + k, false, frame);
+            }
+            return;
+        };
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        for stamp in slice {
+            if stamp.load(Relaxed) & !TABLED_READ != now {
+                stamp.store(now, Relaxed);
+            }
+        }
+    }
+
     /// The title slots that hold buffer views.
     pub(crate) fn buffer_slots(&self) -> Vec<u32> {
         self.buffers.all(|_| true)
@@ -2897,26 +2982,138 @@ impl HostHeap {
     }
 
     /// Gives back multiple dynamic descriptor ranges under a single allocator
-    /// lock and atomic summary update.
+    /// lock and atomic summary update, cleaning and retiring any [`DYN_BLOCK`]
+    /// whose live slot count reaches zero.
     pub(crate) fn release_many(&self, ranges: impl IntoIterator<Item = (u32, u32)>) {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut total_given = 0u32;
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut zero_candidates: Vec<usize> = Vec::new();
+        let mut alloc = self.next.lock().unwrap_or_else(|e| e.into_inner());
         for (first, n) in ranges {
             let Some(at) = first.checked_sub(self.count) else {
                 continue;
             };
-            let end = (at + n).min(self.dynamic) as usize;
-            if let Some(slots) = guard.1.get_mut(at as usize..end) {
-                let given = slots.iter().filter(|taken| **taken).count() as u32;
+            let end = at.saturating_add(n).min(self.dynamic);
+            if at >= end {
+                continue;
+            }
+            let b_first = at as usize / DYN_BLOCK as usize;
+            let b_last = (end as usize - 1) / DYN_BLOCK as usize;
+            for b in b_first..=b_last {
+                let lo = (b * DYN_BLOCK as usize).max(at as usize);
+                let hi = ((b + 1) * DYN_BLOCK as usize).min(end as usize);
+                let given = alloc.taken[lo..hi].iter().filter(|taken| **taken).count() as u32;
+                alloc.taken[lo..hi].fill(false);
+                alloc.block_live[b] = alloc.block_live[b].saturating_sub(given as u16);
                 total_given += given;
-                slots.fill(false);
+                if alloc.block_live[b] == 0 && alloc.block_dirty[b] {
+                    zero_candidates.push(b);
+                }
             }
         }
-        drop(guard);
-        if total_given > 0 {
-            self.free.fetch_add(total_given, std::sync::atomic::Ordering::Relaxed);
-            self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+        let mut to_clean: Vec<usize> = Vec::new();
+        for b in zero_candidates {
+            if alloc.block_live[b] == 0 && alloc.block_dirty[b] {
+                alloc.block_dirty[b] = false;
+                let b_start = b * DYN_BLOCK as usize;
+                let b_end = (b_start + DYN_BLOCK as usize).min(self.dynamic as usize);
+                // Pin the whole block while resetting descriptors outside `self.next`.
+                alloc.taken[b_start..b_end].fill(true);
+                to_clean.push(b);
+            }
         }
+        drop(alloc);
+        if !to_clean.is_empty() {
+            let mut retired = Vec::new();
+            for &b in &to_clean {
+                self.clean_dyn_block(b, &mut retired);
+            }
+            let mut alloc = self.next.lock().unwrap_or_else(|e| e.into_inner());
+            for &b in &to_clean {
+                let b_start = b * DYN_BLOCK as usize;
+                let b_end = (b_start + DYN_BLOCK as usize).min(self.dynamic as usize);
+                alloc.taken[b_start..b_end].fill(false);
+            }
+            drop(alloc);
+            if !retired.is_empty() {
+                crate::host::retire_resources(retired);
+            }
+        }
+        if total_given > 0 {
+            self.free.fetch_add(total_given, Relaxed);
+            self.too_long.store(u32::MAX, Relaxed);
+        }
+    }
+
+    /// Nullifies descriptors/twins/strides and drains retained resources for
+    /// dynamic block `b`, which is exclusively pinned by `release_many`.
+    fn clean_dyn_block(&self, b: usize, retired: &mut Vec<ID3D12Resource>) {
+        if let Some(block) = self.dyn_blocks.get(b) {
+            let mut held = block.held.lock().unwrap_or_else(|e| e.into_inner());
+            held.ptrs.clear();
+            retired.extend(held.resources.drain(..));
+        }
+        let offset = b as u32 * DYN_BLOCK;
+        let len = DYN_BLOCK.min(self.dynamic.saturating_sub(offset));
+        if len == 0 {
+            return;
+        }
+        let start = self.count + offset;
+        if let (Some(host), Some(block)) = (host(), null_block()) {
+            // SAFETY: `self.cpu(start)` covers `len` dynamic slots and `block` holds `DYN_BLOCK >= len`.
+            unsafe {
+                host.device.CopyDescriptorsSimple(
+                    len,
+                    self.cpu(start),
+                    block.tex2d(),
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            }
+            if self.raw != 0 {
+                // SAFETY: `self.cpu(self.raw + start)` covers `len` twin slots and `block` holds `DYN_BLOCK >= len`.
+                unsafe {
+                    host.device.CopyDescriptorsSimple(
+                        len,
+                        self.cpu(self.raw + start),
+                        block.buf_srv(),
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    );
+                }
+            }
+        } else {
+            for i in start..start + len {
+                self.put_null_kind(i, NullViewKind::Tex2d);
+                if self.raw != 0 {
+                    self.put_null_kind(self.raw + i, NullViewKind::BufferSrv);
+                }
+            }
+        }
+        if self.raw != 0
+            && let Some(flags) = self.twins.get(start as usize..(start + len) as usize)
+        {
+            for flag in flags {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        if let Some((_, _, data)) = &self.strides
+            && start < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let end = (start + len).min(victory_shader::emit::SLOT_STRIDES_COUNT);
+            for idx in start..end {
+                // SAFETY: inside `SLOT_STRIDES_COUNT` mapping and block `b` is pinned.
+                unsafe { (*data as *mut u32).add(idx as usize).write_volatile(0) };
+            }
+        }
+    }
+
+    /// Number of unique host resources held in the dynamic block containing `index`, if dynamic.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    fn dyn_block_held_count(&self, index: u32) -> Option<usize> {
+        let at = index.checked_sub(self.count)?;
+        let b = (at / DYN_BLOCK) as usize;
+        Some(self.dyn_blocks.get(b)?.held.lock().unwrap_or_else(|e| e.into_inner()).resources.len())
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -2934,8 +3131,9 @@ impl HostHeap {
     }
 }
 
-/// Pending 1-to-1 descriptor copies and retired resources accumulated across
-/// a dynamic table build and flushed in one `CopyDescriptors` / shard-retire call.
+/// Pending 1-to-1 descriptor copies and deferred/retired resource bookkeeping
+/// accumulated across a dynamic table build and flushed in one `CopyDescriptors`
+/// / block-insert / shard-retire call.
 #[derive(Default)]
 pub(crate) struct CopyBatch {
     dst: Vec<D3D12_CPU_DESCRIPTOR_HANDLE>,
@@ -2943,6 +3141,13 @@ pub(crate) struct CopyBatch {
     #[cfg(feature = "diagnostics")]
     written_slots: Vec<u32>,
     retired: Vec<ID3D12Resource>,
+    /// Host heap pointer that owns entries currently deduplicated in `kept_seen`.
+    kept_heap: usize,
+    /// `(dyn_block, ID3D12Resource raw ptr)` pairs already kept for the active
+    /// `HostList` recording; cleared only in [`CopyBatch::clear`], NOT per flush.
+    kept_seen: std::collections::HashSet<(u32, usize), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// New `(dyn_block, resource)` pairs queued for insertion into [`DynBlock`] on flush.
+    pending_kept: Vec<(u32, ID3D12Resource)>,
 }
 
 impl CopyBatch {
@@ -2952,12 +3157,15 @@ impl CopyBatch {
         #[cfg(feature = "diagnostics")]
         self.written_slots.clear();
         self.retired.clear();
+        self.kept_heap = 0;
+        self.kept_seen.clear();
+        self.pending_kept.clear();
     }
 }
 
 impl HostHeap {
-    /// Ensures this thread's [`ListViews`] cache matches `(frame, buf_epoch, tex_epoch)`
-    /// and has capacity for `needed` views before a table loop begins so
+    /// Ensures this thread's [`ListViews`] cache matches `(buf_epoch, tex_epoch)`
+    /// and TTL/capacity limits for `needed` views before a table loop begins so
     /// [`make_listed_batched`] never invalidates source handles mid-batch.
     pub(crate) fn prepare_list_views(&self, frame: u64, needed: u32) {
         if self.sampler {
@@ -2965,6 +3173,7 @@ impl HostHeap {
         }
         let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
         let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let pressured = crate::residency::pressured() || crate::residency::critical_commit();
         LIST_VIEWS.with(|views| {
             let mut views = views.borrow_mut();
             if views.is_none() {
@@ -2973,30 +3182,51 @@ impl HostHeap {
             let Some(views) = views.as_mut() else {
                 return;
             };
-            if views.frame != frame {
-                views.frame = frame;
-                views.buf_epoch = buf_epoch;
-                views.tex_epoch = tex_epoch;
-                views.buf_made.clear();
-                views.tex_made.clear();
-                return;
-            }
             let buf_used = (views.buf_made.len() as u32).saturating_mul(2);
             let buf_need = needed.saturating_mul(2);
-            if views.buf_epoch != buf_epoch || buf_used.saturating_add(buf_need) > ListViews::BUF_SLOTS {
+            if views.buf_epoch != buf_epoch {
                 views.buf_epoch = buf_epoch;
+                views.buf_since = frame;
+                if !views.buf_made.is_empty() {
+                    views.buf_made.clear();
+                    #[cfg(feature = "diagnostics")]
+                    LIST_VIEWS_STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else if should_clear_ttl(views.buf_since, frame, pressured) {
+                views.buf_since = frame;
+                if !views.buf_made.is_empty() {
+                    views.buf_made.clear();
+                    #[cfg(feature = "diagnostics")]
+                    LIST_VIEWS_STATS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else if buf_used.saturating_add(buf_need) > ListViews::BUF_SLOTS {
+                views.buf_since = frame;
                 views.buf_made.clear();
+                #[cfg(feature = "diagnostics")]
+                LIST_VIEWS_STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+
             let tex_used = views.tex_made.len() as u32;
-            if views.tex_epoch != tex_epoch || tex_used.saturating_add(needed) > ListViews::TEX_SLOTS {
+            if views.tex_epoch != tex_epoch {
                 views.tex_epoch = tex_epoch;
+                views.tex_since = frame;
+                if !views.tex_made.is_empty() {
+                    views.tex_made.clear();
+                    #[cfg(feature = "diagnostics")]
+                    LIST_VIEWS_STATS[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else if should_clear_ttl(views.tex_since, frame, pressured) {
+                views.tex_since = frame;
+                views.tex_made.clear();
+            } else if tex_used.saturating_add(needed) > ListViews::TEX_SLOTS {
+                views.tex_since = frame;
                 views.tex_made.clear();
             }
         });
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
-    /// from this thread's descriptor of it if the `(frame, epoch)` cache has
+    /// from this thread's descriptor of it if the `(buf_epoch, tex_epoch)` cache has
     /// made one, else as [`HostHeap::make_at`] does, and keeps that
     /// ([`ListViews`]). What is known of the record; `None` (slot not made):
     /// not a view kept so.
@@ -3008,7 +3238,7 @@ impl HostHeap {
         Some(listed)
     }
 
-    /// Queues descriptor copies and resource retirements for cached view `words`
+    /// Queues descriptor copies and resource retentions for cached view `words`
     /// into `batch` so the caller can flush an entire table in one
     /// `CopyDescriptors` call via [`HostHeap::flush_copy_batch`].
     pub(crate) fn make_listed_batched(
@@ -3037,31 +3267,46 @@ impl HostHeap {
         }
         let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
         let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+        let pressured = crate::residency::pressured() || crate::residency::critical_commit();
         LIST_VIEWS.with(|views| {
             let mut views = views.borrow_mut();
             if views.is_none() {
                 *views = Some(ListViews::new()?);
             }
             let views = views.as_mut()?;
-            if views.frame != frame {
-                if !batch.dst.is_empty() {
-                    return None;
+            if batch.dst.is_empty() {
+                if views.buf_epoch != buf_epoch {
+                    views.buf_epoch = buf_epoch;
+                    views.buf_since = frame;
+                    if !views.buf_made.is_empty() {
+                        views.buf_made.clear();
+                        #[cfg(feature = "diagnostics")]
+                        LIST_VIEWS_STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else if should_clear_ttl(views.buf_since, frame, pressured) {
+                    views.buf_since = frame;
+                    if !views.buf_made.is_empty() {
+                        views.buf_made.clear();
+                        #[cfg(feature = "diagnostics")]
+                        LIST_VIEWS_STATS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
-                views.frame = frame;
-                views.buf_epoch = buf_epoch;
-                views.tex_epoch = tex_epoch;
-                views.buf_made.clear();
-                views.tex_made.clear();
+                if views.tex_epoch != tex_epoch {
+                    views.tex_epoch = tex_epoch;
+                    views.tex_since = frame;
+                    if !views.tex_made.is_empty() {
+                        views.tex_made.clear();
+                        #[cfg(feature = "diagnostics")]
+                        LIST_VIEWS_STATS[7].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                } else if should_clear_ttl(views.tex_since, frame, pressured) {
+                    views.tex_since = frame;
+                    views.tex_made.clear();
+                }
             }
+            let buf_valid = views.buf_epoch == buf_epoch && !should_clear_ttl(views.buf_since, frame, pressured);
+            let tex_valid = views.tex_epoch == tex_epoch && !should_clear_ttl(views.tex_since, frame, pressured);
             let twins = self.twins.get(index as usize).is_some();
-            if views.buf_epoch != buf_epoch && batch.dst.is_empty() {
-                views.buf_epoch = buf_epoch;
-                views.buf_made.clear();
-            }
-            if views.tex_epoch != tex_epoch && batch.dst.is_empty() {
-                views.tex_epoch = tex_epoch;
-                views.tex_made.clear();
-            }
             let (views_start, views_step) = (views.start, views.step);
             let enqueue = |made: &mut ListView| {
                 let slot_at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -3082,6 +3327,7 @@ impl HostHeap {
                     }
                     self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
                 } else if let Some(twin_flag) = self.twins.get(index as usize)
+                    && twin_flag.load(std::sync::atomic::Ordering::Relaxed)
                     && twin_flag.swap(false, std::sync::atomic::Ordering::Relaxed)
                 {
                     if let Some(bank) = null_bank() {
@@ -3096,17 +3342,18 @@ impl HostHeap {
                     }
                 }
                 self.write_stride(index, made.stride_word);
-                self.keep_ref_retire(index, made.kept.as_ref(), &mut batch.retired);
+                self.keep_dynamic_batched(index, made.kept.as_ref(), batch);
                 on_hit(&mut made.listed, &made.readable)
             };
-            if views.tex_epoch == tex_epoch
-                && let Some(made) = views.tex_made.get_mut(&words)
-            {
+            // Check buffer views first (roughly 14x more frequent than textures in tables).
+            if buf_valid && let Some(made) = views.buf_made.get_mut(&words) {
+                #[cfg(feature = "diagnostics")]
+                LIST_VIEWS_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(enqueue(made));
             }
-            if views.buf_epoch == buf_epoch
-                && let Some(made) = views.buf_made.get_mut(&words)
-            {
+            if tex_valid && let Some(made) = views.tex_made.get_mut(&words) {
+                #[cfg(feature = "diagnostics")]
+                LIST_VIEWS_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(enqueue(made));
             }
             let view = super::view_at(words[1], words[2])?;
@@ -3116,14 +3363,16 @@ impl HostHeap {
             }
             let is_tex = is_texture_view(&view);
             if is_tex {
-                if views.tex_epoch != tex_epoch {
+                if !tex_valid {
                     return None;
                 }
                 let at = ListViews::TEX_BASE + views.tex_made.len() as u32;
                 if at >= ListViews::SLOTS {
                     return None;
                 }
-                let kept = make_twinned(&view, views.slot(at), None)?;
+                let (kept, readable) = make_twinned_with_readable(&view, views.slot(at), None)?;
+                #[cfg(feature = "diagnostics")]
+                LIST_VIEWS_STATS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
@@ -3131,7 +3380,6 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                let readable = resolve_cached_readable(&view);
                 let made = views.tex_made.entry(words).or_insert(ListView {
                     view,
                     at,
@@ -3143,7 +3391,7 @@ impl HostHeap {
                 });
                 Some(enqueue(made))
             } else {
-                if views.buf_epoch != buf_epoch {
+                if !buf_valid {
                     return None;
                 }
                 let at = 2 * views.buf_made.len() as u32;
@@ -3151,7 +3399,10 @@ impl HostHeap {
                     return None;
                 }
                 let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some((views.slot(at + 1), true)))?;
+                let (kept, readable) =
+                    make_twinned_with_readable(&view, views.slot(at), Some((views.slot(at + 1), true)))?;
+                #[cfg(feature = "diagnostics")]
+                LIST_VIEWS_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let stride_word = view_stride_word(&view);
                 let listed = Listed {
                     kind: crate::draw::view_kind(&view),
@@ -3159,7 +3410,6 @@ impl HostHeap {
                     ready: (0, 0, false),
                     tabled: None,
                 };
-                let readable = resolve_cached_readable(&view);
                 let made = views.buf_made.entry(words).or_insert(ListView {
                     view,
                     at,
@@ -3187,6 +3437,7 @@ impl HostHeap {
             }
             self.write_stride(index, 0);
             if let Some(twin_flag) = self.twins.get(index as usize)
+                && twin_flag.load(std::sync::atomic::Ordering::Relaxed)
                 && twin_flag.swap(false, std::sync::atomic::Ordering::Relaxed)
             {
                 batch.dst.push(self.cpu(self.raw + index));
@@ -3196,14 +3447,16 @@ impl HostHeap {
                     batch.written_slots.push(self.raw + index);
                 }
             }
-            self.keep_ref_retire(index, None, &mut batch.retired);
+            if index < self.count {
+                self.keep_ref_retire(index, None, &mut batch.retired);
+            }
             return;
         }
         self.make_null(index);
     }
 
-    /// Issues a single batched `CopyDescriptors` call and retires replaced slot
-    /// resources in one shard batch.
+    /// Issues a single batched `CopyDescriptors` call, flushes new dynamic-block
+    /// resource retentions, and retires replaced title-slot resources in one shard batch.
     pub(crate) fn flush_copy_batch(&self, batch: &mut CopyBatch) {
         if !batch.dst.is_empty() {
             #[cfg(feature = "diagnostics")]
@@ -3235,6 +3488,35 @@ impl HostHeap {
             }
             batch.dst.clear();
             batch.src.clear();
+        }
+        if !batch.pending_kept.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let began = std::time::Instant::now();
+            if batch.pending_kept.len() > 1 {
+                batch.pending_kept.sort_unstable_by_key(|(b, _)| *b);
+            }
+            let mut iter = batch.pending_kept.drain(..).peekable();
+            while let Some((b, first_res)) = iter.next() {
+                if let Some(block) = self.dyn_blocks.get(b as usize) {
+                    use windows::core::Interface;
+                    let mut held = block.held.lock().unwrap_or_else(|e| e.into_inner());
+                    let raw = first_res.as_raw() as usize;
+                    if held.ptrs.insert(raw) {
+                        held.resources.push(first_res);
+                    }
+                    while let Some(&(next_b, _)) = iter.peek()
+                        && next_b == b
+                    {
+                        let (_, res) = iter.next().expect("peeked element exists");
+                        let raw = res.as_raw() as usize;
+                        if held.ptrs.insert(raw) {
+                            held.resources.push(res);
+                        }
+                    }
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            KEEP_REF_NS.fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         if !batch.retired.is_empty() {
             crate::host::retire_resources(batch.retired.drain(..));
@@ -3303,6 +3585,7 @@ impl HostHeap {
     /// The raw twin of slot `index` is a null view again.
     fn clear_twin(&self, index: u32) {
         if let Some(made) = self.twins.get(index as usize)
+            && made.load(std::sync::atomic::Ordering::Relaxed)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
             self.put_null_kind(self.raw + index, NullViewKind::BufferSrv);
@@ -3319,6 +3602,31 @@ impl HostHeap {
     fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
         let raw = resource.map(windows::core::Interface::as_raw);
         self.keep_with(index, raw, || resource.cloned())
+    }
+
+    /// Retains `resource` for dynamic slots via per-list deduplication + block insertion
+    /// into [`DynBlock`], falling back to [`HostHeap::keep_ref_retire`] for title slots.
+    fn keep_dynamic_batched(&self, index: u32, resource: Option<&ID3D12Resource>, batch: &mut CopyBatch) {
+        let Some(offset) = index.checked_sub(self.count) else {
+            self.keep_ref_retire(index, resource, &mut batch.retired);
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        if let Some(res) = resource {
+            let heap_ptr = std::ptr::from_ref(self) as usize;
+            if batch.kept_heap != heap_ptr {
+                batch.kept_seen.clear();
+                batch.kept_heap = heap_ptr;
+            }
+            let b = offset / DYN_BLOCK;
+            let raw = windows::core::Interface::as_raw(res) as usize;
+            if batch.kept_seen.insert((b, raw)) {
+                batch.pending_kept.push((b, res.clone()));
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        KEEP_REF_NS.fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn keep_ref_retire(&self, index: u32, resource: Option<&ID3D12Resource>, retired: &mut Vec<ID3D12Resource>) {
@@ -3346,6 +3654,21 @@ impl HostHeap {
     }
 
     fn keep_with(&self, index: u32, raw: Option<*mut std::ffi::c_void>, next: impl FnOnce() -> Option<ID3D12Resource>) {
+        if let Some(offset) = index.checked_sub(self.count) {
+            if let Some(raw_ptr) = raw
+                && let Some(block) = self.dyn_blocks.get((offset / DYN_BLOCK) as usize)
+            {
+                let mut held = block.held.lock().unwrap_or_else(|e| e.into_inner());
+                let raw_usize = raw_ptr as usize;
+                if !held.ptrs.contains(&raw_usize)
+                    && let Some(res) = next()
+                {
+                    held.ptrs.insert(raw_usize);
+                    held.resources.push(res);
+                }
+            }
+            return;
+        }
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
@@ -3491,8 +3814,8 @@ impl HostHeap {
         self.constant_at_base_retire(index, buffer, buffer_gpu, gpu, size, None);
     }
 
-    /// [`HostHeap::constant_at_base`] appending replaced slot resources to `batch`
-    /// for one batched retirement flush.
+    /// [`HostHeap::constant_at_base`] appending retained resources to `batch`
+    /// for amortized block holding and descriptor flush.
     pub(crate) fn constant_at_batched(
         &self,
         index: u32,
@@ -3502,7 +3825,7 @@ impl HostHeap {
         size: u32,
         batch: &mut CopyBatch,
     ) {
-        self.constant_at_base_retire(index, buffer, buffer_gpu, gpu, size, Some(&mut batch.retired));
+        self.constant_at_base_retire(index, buffer, buffer_gpu, gpu, size, Some(batch));
     }
 
     /// Writes a constant buffer view (and raw twin if present) at `index`.
@@ -3515,7 +3838,7 @@ impl HostHeap {
         buffer_gpu: u64,
         gpu: u64,
         size: u32,
-        retired: Option<&mut Vec<ID3D12Resource>>,
+        batch: Option<&mut CopyBatch>,
     ) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
@@ -3576,8 +3899,8 @@ impl HostHeap {
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         let held = holds.then_some(buffer);
-        match retired {
-            Some(list) => self.keep_ref_retire(index, held, list),
+        match batch {
+            Some(batch) => self.keep_dynamic_batched(index, held, batch),
             None => self.keep_ref(index, held),
         }
     }
@@ -4279,21 +4602,24 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
     Some((from / 4, dwords, (start - from) as u32))
 }
 
-fn buffer_srv(
+type ResolvedBuffer = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+
+fn buffer_srv_inner(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
-) -> Option<Kept> {
+) -> Option<(Kept, Option<ResolvedBuffer>)> {
     let mut shadow = crate::shadow::find(address, len)?;
     let mut offset = shadow.offset(address);
     let unit = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let own = unsafe { &mut desc.Anonymous.Buffer };
     let start = address + own.FirstElement * unit;
+    let view_len = u64::from(own.NumElements) * unit;
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
-    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    let home = view_home(shadow.clone(), start, view_len, kind);
     if !std::sync::Arc::ptr_eq(&home, &shadow) {
         // Its own bytes: it begins where they do.
         (shadow, offset) = (home, 0);
@@ -4378,21 +4704,32 @@ fn buffer_srv(
             null_buffer_view(twin);
         }
     }
-    Some(Some(shadow.buffer.clone()))
+    let kept = Some(shadow.buffer.clone());
+    let readable = (view_len > 0).then(|| {
+        if view_extent() && start >= address && start - address < len.max(1) {
+            (shadow, start, view_len)
+        } else if let Some(s) = crate::shadow::find(start, view_len) {
+            (view_home(s, start, view_len, kind), start, view_len)
+        } else {
+            (shadow, start, view_len)
+        }
+    });
+    Some((kept, readable))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
-/// bytes) on its host copy, as [`buffer_srv`]; false if the copy cannot be
+/// bytes) on its host copy, as [`buffer_srv_inner`]; false if the copy cannot be
 /// written by shaders (upload memory).
 /// shortcut: what shaders write stays in the host copy; title memory (and
 /// so the CPU, and copies run on the CPU) does not see it.
-fn buffer_uav(
+fn buffer_uav_inner(
     address: u64,
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
-) -> Option<Kept> {
+) -> Option<(Kept, Option<ResolvedBuffer>)> {
+    let address_base = address;
     let mut shadow = crate::shadow::find(address, len)?;
     let unit = {
         // SAFETY: a buffer view's union member.
@@ -4408,8 +4745,9 @@ fn buffer_uav(
     // SAFETY: a buffer view's union member.
     let own = unsafe { &mut desc.Anonymous.Buffer };
     let start = address + own.FirstElement * unit;
+    let view_len = u64::from(own.NumElements) * unit;
     let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
-    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    let home = view_home(shadow.clone(), start, view_len, kind);
     let mut address = address;
     if !std::sync::Arc::ptr_eq(&home, &shadow) {
         // Its own bytes: it begins where they do.
@@ -4499,7 +4837,17 @@ fn buffer_uav(
             null_buffer_view(twin);
         }
     }
-    Some(Some(shadow.buffer.clone()))
+    let kept = Some(shadow.buffer.clone());
+    let readable = (view_len > 0).then(|| {
+        if view_extent() && start >= address_base && start - address_base < len.max(1) {
+            (shadow, start, view_len)
+        } else if let Some(s) = crate::shadow::find(start, view_len) {
+            (view_home(s, start, view_len, kind), start, view_len)
+        } else {
+            (shadow, start, view_len)
+        }
+    });
+    Some((kept, readable))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -4659,6 +5007,16 @@ fn make_twinned(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
 ) -> Option<Kept> {
+    make_twinned_with_readable(view, at, twin).map(|(kept, _)| kept)
+}
+
+/// Combined [`make_twinned`] + [`CachedReadable`] resolution so [`ListViews`]
+/// misses never run `shadow::find` or `placed_texture` twice.
+fn make_twinned_with_readable(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<(D3D12_CPU_DESCRIPTOR_HANDLE, bool)>,
+) -> Option<(Kept, CachedReadable)> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -4683,10 +5041,10 @@ fn make_twinned(
                     device.CreateConstantBufferView(Some(&desc), twin);
                 }
             }
-            Some(Some(shadow.buffer.clone()))
+            Some((Some(shadow.buffer.clone()), CachedReadable::None))
         }
-        View::Shader(resource, desc) => {
-            let resource = *resource as crate::object::This;
+        View::Shader(resource_id, desc) => {
+            let resource = *resource_id as crate::object::This;
             if let Some(copy) = crate::resource::host_copy(resource) {
                 let texture = &copy.texture;
                 // The title's views of textures with a stencil plane, as it
@@ -4753,21 +5111,37 @@ fn make_twinned(
                         at,
                     )
                 };
-                Some(Some(texture.clone()))
+                Some((
+                    Some(texture.clone()),
+                    CachedReadable::TextureShader {
+                        resource: *resource_id,
+                        first_mip: 0,
+                    },
+                ))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at, twin)
+                let (kept, buf) = buffer_srv_inner(data as u64, len, srv_desc(desc), at, twin)?;
+                let readable = match buf {
+                    Some((shadow, address, len)) => CachedReadable::Buffer { shadow, address, len },
+                    None => CachedReadable::None,
+                };
+                Some((kept, readable))
             } else {
                 None
             }
         }
-        View::Unordered(resource, _counter, desc) => {
-            let resource = *resource as crate::object::This;
+        View::Unordered(resource_id, _counter, desc) => {
+            let resource = *resource_id as crate::object::This;
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at, twin)
+                        let (kept, buf) = buffer_uav_inner(data as u64, len, uav_desc(desc), at, twin)?;
+                        let readable = match buf {
+                            Some((shadow, address, len)) => CachedReadable::Buffer { shadow, address, len },
+                            None => CachedReadable::None,
+                        };
+                        Some((kept, readable))
                     }
                     _ => None,
                 };
@@ -4815,7 +5189,12 @@ fn make_twinned(
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some((
+                Some(texture.clone()),
+                CachedReadable::TextureUav {
+                    resource: *resource_id,
+                },
+            ))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -4826,17 +5205,26 @@ fn make_twinned(
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some((None, CachedReadable::None))
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            Some(None)
+            Some((None, CachedReadable::None))
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+            if let Some(placed) = placed_texture(view) {
+                let first_mip = match &placed {
+                    View::Shader(_, Some(d)) => crate::resource::first_mip(d),
+                    _ => 0,
+                };
+                let resource_id = match placed {
+                    View::Shader(r, _) => r,
+                    _ => 0,
+                };
+                let kept = make(&placed, at)?;
+                return Some((kept, CachedReadable::TextureShader { resource: resource_id, first_mip }));
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -4873,11 +5261,16 @@ fn make_twinned(
             if len == 0 {
                 return None;
             }
-            if *unordered {
-                buffer_uav(address, len, uav_desc(words), at, twin)
+            let (kept, buf) = if *unordered {
+                buffer_uav_inner(address, len, uav_desc(words), at, twin)?
             } else {
-                buffer_srv(address, len, srv_desc(words), at, twin)
-            }
+                buffer_srv_inner(address, len, srv_desc(words), at, twin)?
+            };
+            let readable = match buf {
+                Some((shadow, address, len)) => CachedReadable::Buffer { shadow, address, len },
+                None => CachedReadable::None,
+            };
+            Some((kept, readable))
         }
     }
 }
@@ -5467,6 +5860,70 @@ fn null_bank() -> Option<&'static NullBank> {
         }
     })
     .as_ref()
+}
+
+struct NullBlock {
+    start: usize,
+    step: usize,
+    _heap: ID3D12DescriptorHeap,
+}
+
+// SAFETY: non-shader-visible CPU descriptor heap populated once under `OnceLock`.
+unsafe impl Send for NullBlock {}
+// SAFETY: see above.
+unsafe impl Sync for NullBlock {}
+
+impl NullBlock {
+    fn tex2d(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start }
+    }
+
+    fn buf_srv(&self) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: self.start + DYN_BLOCK as usize * self.step,
+        }
+    }
+}
+
+fn null_block() -> Option<&'static NullBlock> {
+    static BLOCK: std::sync::OnceLock<Option<NullBlock>> = std::sync::OnceLock::new();
+    BLOCK
+        .get_or_init(|| {
+            let host = host()?;
+            // SAFETY: non-shader-visible CPU descriptor heap filled once via doubling copies.
+            unsafe {
+                let heap: ID3D12DescriptorHeap = host
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 2 * DYN_BLOCK,
+                        ..Default::default()
+                    })
+                    .ok()?;
+                let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                let step = host
+                    .device
+                    .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    as usize;
+                let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step };
+                for (base, kind) in [(0u32, NullViewKind::Tex2d), (DYN_BLOCK, NullViewKind::BufferSrv)] {
+                    create_null_kind(kind, at(base));
+                    let mut filled = 1u32;
+                    while filled < DYN_BLOCK {
+                        let n = filled.min(DYN_BLOCK - filled);
+                        host.device.CopyDescriptorsSimple(
+                            n,
+                            at(base + filled),
+                            at(base),
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        );
+                        filled += n;
+                    }
+                }
+                Some(NullBlock { start, step, _heap: heap })
+            }
+        })
+        .as_ref()
 }
 
 fn null_srv_tex_kind(dim: u32) -> NullViewKind {
@@ -6896,6 +7353,104 @@ mod tests {
         );
         heap.release_many([(s0, 4), (s1, 3)]);
     }
+
+    #[test]
+    fn list_views_persists_across_frames_and_honors_ttl_and_split_epochs() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[12, 1, 0, 0, 64, 0, 0, 0, 0, 0]);
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let view = View::Placed(true, resource, desc);
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, view);
+        let rec = [slot_mem[0], slot_mem[1], slot_mem[2]];
+
+        let s = heap.dynamic(1).unwrap();
+        let f0 = 2000u64;
+        heap.prepare_list_views(f0, 1);
+        assert!(heap.make_listed(f0, rec, s).is_some());
+        assert!(listed_view(f0, rec).is_some());
+
+        // Adjacent frame persists across frame increment without clearing buf_made.
+        heap.prepare_list_views(f0 + 1, 1);
+        assert!(listed_view(f0 + 1, rec).is_some());
+
+        // Texture invalidation does not clear cached buffer views.
+        invalidate_texture_views();
+        heap.prepare_list_views(f0 + 2, 1);
+        assert!(listed_view(f0 + 2, rec).is_some());
+
+        // TTL expiration invalidates stale entries, and buffer epoch invalidation clears immediately.
+        let f_ttl = f0 + LIST_VIEWS_TTL_FRAMES;
+        assert!(listed_view(f_ttl, rec).is_none());
+        heap.prepare_list_views(f_ttl, 1);
+        assert!(heap.make_listed(f_ttl, rec, s).is_some());
+        assert!(listed_view(f_ttl, rec).is_some());
+        invalidate_buffer_views();
+        assert!(listed_view(f_ttl, rec).is_none());
+        heap.release_many([(s, 1)]);
+    }
+
+    #[test]
+    fn dyn_block_dedups_kept_and_cleans_block_on_full_release() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use victory_shader::emit::{VIEW_INTEGER};
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = heap.strides else {
+            panic!("view heap should allocate strides table");
+        };
+        let read_stride = |slot: u32| -> u32 {
+            // SAFETY: inside `SLOT_STRIDES_COUNT` mapping of `heap.strides`.
+            unsafe { *(data as *const u32).add(slot as usize) }
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[12, 1, 0, 0, 64, 0, 0, 0, 0, 0]);
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let view = View::Placed(true, resource, desc);
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, view);
+        let rec = [slot_mem[0], slot_mem[1], slot_mem[2]];
+
+        let a = heap.dynamic(2).unwrap();
+        let b = heap.dynamic(2).unwrap();
+        assert_eq!((a - heap.count) / DYN_BLOCK, (b - heap.count) / DYN_BLOCK);
+
+        let frame = 3000u64;
+        heap.prepare_list_views(frame, 3);
+        let mut batch = CopyBatch::default();
+        assert!(heap.make_listed_batched(frame, rec, a, &mut batch).is_some());
+        assert!(heap.make_listed_batched(frame, rec, a + 1, &mut batch).is_some());
+        assert!(heap.make_listed_batched(frame, rec, b, &mut batch).is_some());
+        heap.flush_copy_batch(&mut batch);
+
+        assert_eq!(heap.dyn_block_held_count(a), Some(1));
+        assert_eq!(read_stride(a), 8 | VIEW_INTEGER);
+        assert_eq!(read_stride(b), 8 | VIEW_INTEGER);
+
+        // Partial block release keeps held resources and remaining slot strides intact.
+        heap.release_many([(a, 2)]);
+        assert_eq!(heap.dyn_block_held_count(b), Some(1));
+        assert_eq!(read_stride(b), 8 | VIEW_INTEGER);
+
+        // Releasing the last live slots in the block resets strides/twins and drains held resources.
+        heap.release_many([(b, 2)]);
+        assert_eq!(heap.dyn_block_held_count(a), Some(0));
+        assert_eq!(read_stride(a), 0);
+        assert_eq!(read_stride(b), 0);
+        if let Some(twin_flag) = heap.twins.get(b as usize) {
+            assert!(!twin_flag.load(Relaxed));
+        }
+    }
 }
 
 /// Pre-resolved `readable` work cached inside [`ListView`] for `(frame, epoch)` hits.
@@ -6915,22 +7470,7 @@ pub(crate) enum CachedReadable {
     },
 }
 
-fn resolve_cached_readable(view: &View) -> CachedReadable {
-    if let Some(View::Shader(resource, desc)) = placed_texture(view) {
-        let first_mip = desc.as_ref().map_or(0, |d| crate::resource::first_mip(d));
-        return CachedReadable::TextureShader { resource, first_mip };
-    }
-    if let Some((shadow, address, len)) = buffer_copy(view) {
-        return CachedReadable::Buffer { shadow, address, len };
-    }
-    match view {
-        View::Shader(resource, _) => CachedReadable::TextureShader { resource: *resource, first_mip: 0 },
-        View::Unordered(resource, _, _) => CachedReadable::TextureUav { resource: *resource },
-        _ => CachedReadable::None,
-    }
-}
-
-/// What is known of a record a list's tables hold, in the `(frame, epoch)`
+/// What is known of a record a list's tables hold, in the `(buf_epoch, tex_epoch)`
 /// cache ([`HostHeap::make_listed_batched`]).
 #[derive(Clone, Copy)]
 pub(crate) struct Listed {
@@ -6954,11 +7494,19 @@ struct ListView {
     readable: CachedReadable,
 }
 
-/// The descriptors a thread made for one frame, split across independent buffer
+const LIST_VIEWS_TTL_FRAMES: u64 = 32;
+
+fn should_clear_ttl(since: u64, frame: u64, pressured: bool) -> bool {
+    since == u64::MAX || frame.abs_diff(since) >= LIST_VIEWS_TTL_FRAMES || (pressured && since != frame)
+}
+
+/// The descriptors a thread made across frames, split across independent buffer
 /// (`0..BUF_SLOTS`) and texture (`TEX_BASE..SLOTS`) epochs so texture streaming
-/// invalidations do not discard cached buffer views/raw twins.
+/// invalidations do not discard cached buffer views/raw twins and buffer caches
+/// persist across frames unless epochs change, pressure hits, or TTL expires.
 struct ListViews {
-    frame: u64,
+    buf_since: u64,
+    tex_since: u64,
     buf_epoch: u64,
     tex_epoch: u64,
     heap: ID3D12DescriptorHeap,
@@ -6969,7 +7517,7 @@ struct ListViews {
 }
 
 impl ListViews {
-    const BUF_SLOTS: u32 = 8192;
+    const BUF_SLOTS: u32 = 16384;
     const TEX_BASE: u32 = Self::BUF_SLOTS;
     const TEX_SLOTS: u32 = 8192;
     const SLOTS: u32 = Self::BUF_SLOTS + Self::TEX_SLOTS;
@@ -6989,7 +7537,8 @@ impl ListViews {
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
             Some(ListViews {
-                frame: u64::MAX,
+                buf_since: u64::MAX,
+                tex_since: u64::MAX,
                 buf_epoch: 0,
                 tex_epoch: 0,
                 heap,
@@ -7019,8 +7568,17 @@ pub(crate) fn take_keep_ref_ns() -> u64 {
     KEEP_REF_NS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Looks up `words` in this thread's `(frame, epoch)` [`ListViews`] cache and
-/// invokes `f(&mut Listed, &CachedReadable)` in one hash lookup without copying
+/// `buf_hit, buf_miss, tex_hit, tex_miss, buf_clr_epoch, buf_clr_cap, buf_clr_ttl, tex_clr_epoch`.
+#[cfg(feature = "diagnostics")]
+static LIST_VIEWS_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_list_views_stats() -> [u64; 8] {
+    std::array::from_fn(|i| LIST_VIEWS_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Looks up `words` in this thread's [`ListViews`] cache and invokes
+/// `f(&mut Listed, &CachedReadable)` in one hash lookup without copying
 /// any descriptors (for `fresh_tables` hits in `draw::tables`).
 pub(crate) fn with_cached_readable<R>(
     frame: u64,
@@ -7029,16 +7587,19 @@ pub(crate) fn with_cached_readable<R>(
 ) -> Option<R> {
     let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let pressured = crate::residency::pressured() || crate::residency::critical_commit();
     LIST_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        let views = views.as_mut().filter(|v| v.frame == frame)?;
-        if views.tex_epoch == tex_epoch
-            && let Some(made) = views.tex_made.get_mut(&words)
+        let views = views.as_mut()?;
+        if views.buf_epoch == buf_epoch
+            && !should_clear_ttl(views.buf_since, frame, pressured)
+            && let Some(made) = views.buf_made.get_mut(&words)
         {
             return Some(f(&mut made.listed, &made.readable));
         }
-        if views.buf_epoch == buf_epoch
-            && let Some(made) = views.buf_made.get_mut(&words)
+        if views.tex_epoch == tex_epoch
+            && !should_clear_ttl(views.tex_since, frame, pressured)
+            && let Some(made) = views.tex_made.get_mut(&words)
         {
             return Some(f(&mut made.listed, &made.readable));
         }
@@ -7046,19 +7607,22 @@ pub(crate) fn with_cached_readable<R>(
     })
 }
 
-/// The view the record `words` names, as this thread made it for `(frame, epoch)`.
+/// The view the record `words` names, as this thread made it for `(buf_epoch, tex_epoch)`.
 pub(crate) fn listed_view(frame: u64, words: [u32; 3]) -> Option<View> {
     let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let pressured = crate::residency::pressured() || crate::residency::critical_commit();
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
-        let views = views.as_ref().filter(|v| v.frame == frame)?;
+        let views = views.as_ref()?;
         if views.buf_epoch == buf_epoch
+            && !should_clear_ttl(views.buf_since, frame, pressured)
             && let Some(m) = views.buf_made.get(&words)
         {
             return Some(m.view.clone());
         }
         if views.tex_epoch == tex_epoch
+            && !should_clear_ttl(views.tex_since, frame, pressured)
             && let Some(m) = views.tex_made.get(&words)
         {
             return Some(m.view.clone());
@@ -7067,23 +7631,26 @@ pub(crate) fn listed_view(frame: u64, words: [u32; 3]) -> Option<View> {
     })
 }
 
-/// Notes what is known of the record `words` in `(frame, epoch)`.
+/// Notes what is known of the record `words` in `(buf_epoch, tex_epoch)`.
 #[cfg(test)]
 pub(crate) fn note_listed(frame: u64, words: [u32; 3], listed: Listed) {
     let buf_epoch = BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
     let tex_epoch = TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let pressured = crate::residency::pressured() || crate::residency::critical_commit();
     LIST_VIEWS.with(|views| {
         let mut views = views.borrow_mut();
-        let Some(views) = views.as_mut().filter(|v| v.frame == frame) else {
+        let Some(views) = views.as_mut() else {
             return;
         };
         if views.buf_epoch == buf_epoch
+            && !should_clear_ttl(views.buf_since, frame, pressured)
             && let Some(made) = views.buf_made.get_mut(&words)
         {
             made.listed = listed;
             return;
         }
         if views.tex_epoch == tex_epoch
+            && !should_clear_ttl(views.tex_since, frame, pressured)
             && let Some(made) = views.tex_made.get_mut(&words)
         {
             made.listed = listed;
