@@ -599,6 +599,16 @@ pub(crate) fn live_span_bytes() -> u64 {
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
 }
 
+/// Card buffer and RT/BVH arena bytes live on the card, for the HUD panel.
+pub(crate) fn vram_breakdown() -> [u64; 2] {
+    let bvh = MEMORY_CARD_BYTES.load(Ordering::Relaxed);
+    let buf = CARD_BYTES[0].load(Ordering::Relaxed)
+        + CARD_BYTES[1].load(Ordering::Relaxed)
+        + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
+    [buf, bvh]
+}
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
 pub(crate) fn card_stats() -> [u64; 10] {
