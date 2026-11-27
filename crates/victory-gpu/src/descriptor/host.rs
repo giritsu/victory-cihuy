@@ -304,6 +304,14 @@ pub(crate) fn invalidate_texture_views() {
     TEXTURE_VIEWS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
+/// Current `(buffer, texture)` view invalidation epochs for epoch-checked caches.
+pub(crate) fn view_epochs() -> (u64, u64) {
+    (
+        BUFFER_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+        TEXTURE_VIEWS_EPOCH.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
@@ -2763,6 +2771,11 @@ impl HostHeap {
         self.tabled_in(index, read, crate::frame::current());
     }
 
+    /// [`HostHeap::texture_slot_tabled`] with caller-supplied `frame`.
+    pub(crate) fn texture_slot_tabled_in(&self, index: u32, read: bool, frame: u64) {
+        self.tabled_in(index, read, frame);
+    }
+
     /// [`HostHeap::texture_slot_tabled`] in frame `frame`.
     fn tabled_in(&self, index: u32, read: bool, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
@@ -2835,13 +2848,8 @@ impl HostHeap {
         }
     }
 
-    /// Title slot `index` lies in a table a draw reads or had made afresh:
-    /// what it holds is the draw's to make ([`HostHeap::copied_tabled`]).
-    pub(crate) fn slot_tabled(&self, index: u32) {
-        self.tabled_in(index, false, crate::frame::current());
-    }
-
-    /// [`HostHeap::slot_tabled`] with caller-supplied `frame`.
+    /// Marks title slot `index` as tabled in `frame` (`HostHeap::copied_tabled`),
+    /// indicating it lies in a table a draw reads or had made afresh.
     pub(crate) fn slot_tabled_in(&self, index: u32, frame: u64) {
         self.tabled_in(index, false, frame);
     }
@@ -8094,9 +8102,31 @@ mod tests {
         assert!(!heap.made(1));
         assert!(heap.is_clean_null(1, NullViewKind::Cbv));
     }
+
+    #[test]
+    fn view_epochs_and_cached_readable_of_handle_variants() {
+        let (b0, t0) = view_epochs();
+        invalidate_buffer_views();
+        let (b1, t1) = view_epochs();
+        assert!(b1 > b0);
+        assert_eq!(t1, t0);
+
+        invalidate_texture_views();
+        let (b2, t2) = view_epochs();
+        assert_eq!(b2, b1);
+        assert!(t2 > t1);
+
+        let (c, is_tex) = cached_readable_of(&View::Constant(0x1000, 256));
+        assert!(!is_tex && matches!(c, CachedReadable::None));
+        let (s, is_tex) = cached_readable_of(&View::Sampler([0; 13]));
+        assert!(!is_tex && matches!(s, CachedReadable::None));
+        let (cs, is_tex) = cached_readable_of(&View::ConsoleSampler([0; 27]));
+        assert!(!is_tex && matches!(cs, CachedReadable::None));
+    }
 }
 
 /// Pre-resolved `readable` work cached inside [`ListView`] for `(frame, epoch)` hits.
+#[derive(Clone)]
 pub(crate) enum CachedReadable {
     None,
     Buffer {
@@ -8111,6 +8141,47 @@ pub(crate) enum CachedReadable {
     TextureUav {
         resource: usize,
     },
+}
+
+/// Pre-resolves `readable()` work and `is_texture_view` flag for a cold `View`.
+pub(crate) fn cached_readable_of(view: &View) -> (CachedReadable, bool) {
+    match view {
+        View::Constant(..) | View::Sampler(..) | View::ConsoleSampler(..) => (CachedReadable::None, false),
+        View::Placed(..) => {
+            if let Some(placed) = placed_texture(view) {
+                let (resource, first_mip) = match &placed {
+                    View::Shader(r, desc) => (*r, desc.as_ref().map_or(0, |d| crate::resource::first_mip(d))),
+                    _ => (0, 0),
+                };
+                (CachedReadable::TextureShader { resource, first_mip }, true)
+            } else {
+                let is_tex = is_texture_view(view);
+                let cr = match buffer_copy(view) {
+                    Some((shadow, address, len)) => CachedReadable::Buffer { shadow, address, len },
+                    None => CachedReadable::None,
+                };
+                (cr, is_tex)
+            }
+        }
+        View::Shader(resource, _) => {
+            if let Some((shadow, address, len)) = buffer_copy(view) {
+                (CachedReadable::Buffer { shadow, address, len }, false)
+            } else if is_texture_view(view) {
+                (CachedReadable::TextureShader { resource: *resource, first_mip: 0 }, true)
+            } else {
+                (CachedReadable::None, false)
+            }
+        }
+        View::Unordered(resource, _, _) => {
+            if let Some((shadow, address, len)) = buffer_copy(view) {
+                (CachedReadable::Buffer { shadow, address, len }, false)
+            } else if crate::resource::buffer_bytes(*resource as crate::object::This).is_none() {
+                (CachedReadable::TextureUav { resource: *resource }, false)
+            } else {
+                (CachedReadable::None, false)
+            }
+        }
+    }
 }
 
 /// What is known of a record a list's tables hold, in the `(buf_epoch, tex_epoch)`
@@ -8368,7 +8439,6 @@ pub(crate) fn with_readable_table<R>(frame: u64, f: impl FnOnce(&mut ReadableVie
 /// Looks up `words` in this thread's [`ListViews`] cache and invokes
 /// `f(&mut Listed, &CachedReadable)` in one hash lookup without copying
 /// any descriptors (for `fresh_tables` hits in `draw::tables`).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn with_cached_readable<R>(
     frame: u64,
     words: [u32; 3],
