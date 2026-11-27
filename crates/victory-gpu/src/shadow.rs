@@ -144,6 +144,8 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Arena buffer backing raw-address title memory ([`by_address`]).
+    by_address: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
@@ -582,6 +584,7 @@ pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 pub(crate) fn live_span_bytes() -> u64 {
     CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + MEMORY_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
 }
 
@@ -595,6 +598,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + MEMORY_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
@@ -767,6 +771,8 @@ fn window_card_most() -> u64 {
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Bytes alive of raw-address RT arena buffers ([`by_address`]).
+static MEMORY_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
@@ -2880,7 +2886,9 @@ impl Drop for Shadow {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
-            if window {
+            if self.by_address {
+                MEMORY_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
+            } else if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
@@ -3402,6 +3410,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            by_address: false,
             changes_only: Default::default(),
             mapped: false,
             place: None,
@@ -5972,22 +5981,27 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
 /// What shaders write there by address is not brought back, so the copy is
 /// the only place that has it. The CPU's side holds the bytes as they were
 /// last taken, and only dwords that changed since go up.
+fn memory_card_limit(compact: bool, env_mb: Option<u64>) -> u64 {
+    env_mb.unwrap_or(if compact { 2048 } else { 4096 }) << 20
+}
+
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {
         return None;
     }
-    // At most so much on the card's own memory (4 GiB unless
-    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
-    // that the side shaders see is in the PC's memory.
+    // At most so much on the card's own memory (2 GiB on <=18 GiB RAM hosts,
+    // 4 GiB otherwise, unless `VICTORY_MEMORY_CARD_MB` overrides), while VRAM
+    // has headroom; tracked separately from `WINDOW_CARD_BYTES`.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    static USED: AtomicU64 = AtomicU64::new(0);
+    let compact = crate::residency::compact_host_ram();
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(4096) << 20
+        memory_card_limit(compact, mb)
     });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
-    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
+    let vram_pct = if compact { 92 } else { 97 };
+    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * vram_pct);
+    let on_card = if room && MEMORY_CARD_BYTES.load(Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
         None
@@ -5995,13 +6009,18 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let (buffer, staging, data) = match on_card {
         Some(on_card) if card_ram_staging() => {
             let Some(ram) = RamBuffer::new(len) else {
-                USED.fetch_sub(len, Ordering::Relaxed);
                 return None;
             };
             let ptr = ram.ptr;
             (on_card, CardStaging::Ram(ram), ptr)
         }
         other => {
+            if other.is_none()
+                && compact
+                && (crate::residency::shared_pressured() || crate::residency::critical_commit())
+            {
+                return None;
+            }
             let (staging_buf, data) = host.shared_buffer(len)?;
             crate::host::name(&staging_buf, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
             let buffer = match other {
@@ -6012,12 +6031,13 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         }
     };
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
-    // (Counted down with the windows' on the card when it goes.)
-    WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+    // (Tracked under `MEMORY_CARD_BYTES`, isolated from `WINDOW_CARD_BYTES`.)
+    MEMORY_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.by_address = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card::new(staging, len));
     let shadow = Arc::new(shadow);
@@ -6510,6 +6530,13 @@ mod window_tests {
         assert_eq!(all, vec![(60 << 10, 130 << 10), (65 << 16, (65 << 16) + 512)]);
         assert!(card.dirty_shards.iter().all(|w| w.load(Ordering::Acquire) == 0));
         assert!(card.snapshot_dirty().is_empty());
+    }
+
+    #[test]
+    fn memory_card_limit_caps_compact_ram_rt_arenas() {
+        assert_eq!(super::memory_card_limit(true, None), 2048 << 20);
+        assert_eq!(super::memory_card_limit(false, None), 4096 << 20);
+        assert_eq!(super::memory_card_limit(true, Some(3072)), 3072 << 20);
     }
 }
 

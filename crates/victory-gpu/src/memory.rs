@@ -84,8 +84,17 @@ const PAGE: u64 = 1 << 16;
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
 const PIECE: usize = 4096;
-/// Pages held, at most (3 GiB).
+/// Pages held, at most (3 GiB, or 2 GiB on <=18 GiB RAM hosts).
 const MOST: usize = 3 << 14;
+const MOST_COMPACT: usize = 2 << 14;
+
+fn max_pages_for(compact: bool) -> usize {
+    if compact { MOST_COMPACT } else { MOST }
+}
+
+fn max_pages() -> usize {
+    max_pages_for(crate::residency::compact_host_ram())
+}
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
 /// The biggest packed structure taken for one.
@@ -369,9 +378,10 @@ impl Memory {
             }
             return false;
         }
-        if self.pages.len() >= MOST {
+        let limit = max_pages();
+        if self.pages.len() >= limit {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
+            ONCE.call_once(|| tracing::warn!(max = limit, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
         if let Some((copy, at)) = self.free.pop() {
@@ -879,10 +889,15 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
         return 0;
     }
     let mut changed = 0;
-    for (t, o) in title.chunks_exact(4).zip(ours.chunks_exact_mut(4)) {
-        if t != o {
-            o.copy_from_slice(t);
-            changed += 1;
+    for (t_line, o_line) in title.chunks_exact(64).zip(ours.chunks_exact_mut(64)) {
+        if t_line == o_line {
+            continue;
+        }
+        for (t, o) in t_line.chunks_exact(4).zip(o_line.chunks_exact_mut(4)) {
+            if t != o {
+                o.copy_from_slice(t);
+                changed += 1;
+            }
         }
     }
     changed
@@ -926,7 +941,7 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < max_pages() && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -956,6 +971,7 @@ pub(crate) fn ready(
         }
     }
     let mut came = [held(m) - before, 0, 0, 0];
+    let mut landed_any = false;
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
@@ -984,7 +1000,7 @@ pub(crate) fn ready(
                     m.land(at);
                 }
             });
-            m.bring_up(list);
+            landed_any = true;
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
@@ -1050,7 +1066,8 @@ pub(crate) fn ready(
     // written over by the arena's first upload: in frames that stream much in
     // half of them, run light-8).
     let first_read = list.first_use(READ);
-    if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
+    let new_copies = list.first_use(usize::MAX - (6 << 33) - m.copies.len());
+    if landed_any || new_copies {
         m.bring_up(list);
     }
     if first_read {
@@ -1288,6 +1305,11 @@ mod tests {
         title[41] = 8;
         assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
+        // Sparse updates across multiple 64-byte chunks.
+        title[0] = 9;
+        title[PIECE - 4] = 10;
+        assert_eq!(merge(&title, &mut ours, false), 2);
+        assert_eq!(ours, title);
     }
 
     #[test]
@@ -1300,5 +1322,11 @@ mod tests {
         assert_eq!(packed_len(header(0x8102_0007, 5)), None);
         assert_eq!(packed_len(header(0x8102_0006, 0)), None);
         assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
+    }
+
+    #[test]
+    fn max_pages_for_caps_compact_ram_at_2_gib() {
+        assert_eq!(max_pages_for(true), 2 << 14);
+        assert_eq!(max_pages_for(false), 3 << 14);
     }
 }

@@ -1,18 +1,19 @@
-# Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p).
-#   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-s|series-x]
-#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-BarrierTest groups|indirect|both] [-Warm] [-Safe]
+# Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p, Series X + Ray Tracing default).
+#   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-x|series-s]
+#                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-NoRayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-BarrierTest groups|indirect|both] [-Warm] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
-# Note: -Console series-x is now viable to test on 16 GB VRAM for sharper visuals.
+# Note: -Console series-x and -RayTracing (VICTORY_BVH_BUILDER=1) are enabled by default; pass -NoRayTracing for A/B comparison.
 # Run from a normal (non-Administrator) PowerShell window so the GPU driver shader cache stays unified.
 param(
     [string]$GameDir = $env:VICTORY_GAME_DIR,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
+    [ValidateSet('series-s', 'series-x')][string]$Console = 'series-x',
     [switch]$Panel,
     [switch]$DebugLayer,
     [switch]$DredLight,
     [switch]$MemoryMap,
     [switch]$RayTracing,
+    [switch]$NoRayTracing,
     [switch]$LevelsOnDemand,
     [switch]$InplaceProbe,
     [switch]$NoKeepShown,
@@ -108,7 +109,7 @@ if ($Safe) {
 
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
 if ($DebugLayer) { $settings.VICTORY_D3D12_DEBUG = '1' }
-if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
+if (-not $NoRayTracing -or $RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
 if ($InplaceProbe) { $settings.VICTORY_INPLACE_PROBE = '1' }
 if ($NoKeepShown) { $settings.VICTORY_KEEP_SHOWN = '0' }
@@ -129,7 +130,7 @@ $logDir = Split-Path -Parent $LogFile
 if ($logDir) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 
 $Exe = (Resolve-Path $Exe).Path
-Write-Host "Running [$Build] ($Console) -> log: $LogFile"
+Write-Host "Running [$Build] ($Console, RT=$($settings.ContainsKey('VICTORY_BVH_BUILDER'))) -> log: $LogFile"
 Write-Host "Cache: $($env:VICTORY_CACHE_DIR)"
 
 $stream = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
