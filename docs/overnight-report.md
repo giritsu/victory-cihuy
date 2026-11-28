@@ -41,7 +41,7 @@ Kedua run dijalankan via `scripts/play-dev.ps1 -Console series-s -Panel -NoRayTr
 
 ---
 
-## Pass 1 — Zero-Clone `BufferSweep` Fast-Path, `mirror_for_pass`, & Incremental `CopySpans`
+## Pass 1 (`2793754`) — Zero-Clone `BufferSweep` Fast-Path, `mirror_for_pass`, & Incremental `CopySpans`
 
 - **Target:** `heap_buffer_pass` ([draw.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/draw.rs), [descriptor/host.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/descriptor/host.rs), [descriptor.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/descriptor.rs)):
   1. Menambahkan `descriptor::view_alive(i, generation)` lock-free/zero-clone check tanpa `View::clone()` pada slot yang sudah ter-materialisasi.
@@ -67,3 +67,71 @@ Kedua run dijalankan via `scripts/play-dev.ps1 -Console series-s -Panel -NoRayTr
 ### Log & Screenshot Pass 1 (Terverifikasi 3D World Normal)
 - `Series S release` ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-s-release/run.log)): [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-s-release/shot-1.png), [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-s-release/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-s-release/shot-3.png)
 - `Series S diag` ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-s-diag/run.log)): [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-s-diag/shot-1.png), [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-s-diag/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-s-diag/shot-3.png)
+
+---
+
+## Pass 2 (Reverted) — Defer Object-Buffer Sync + `Tracked` Journal Fast-Exit
+
+- **Target:** `sync_heaps` (`descriptor.rs`) + `watch.rs` (`Tracked::take` + `Journal::last_note`).
+  - Memindahkan sinkronisasi `View::Shader`/`View::Unordered` buffer object (`kind == 0`) dari mirror langsung ke antrean tunda `out.wait`, menggabungkan `before` + `make` ke satu panggilan `land::each_view(true, ...)`, dan menambahkan fast-exit `full_note` + single `journal()` lock di `Tracked::take`.
+- **Hasil Live Test (vs Pass 1 `2793754`):**
+  - **`Series S release`** ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-2/series-s-release/run.log)): `STEADY>=3k` (`n=71`, avg 6195 draws): med **14.90 FPS** (vs 15.00), avg **13.72** (vs 14.31), **`p10` 8.80 FPS** (**`-26.7%` regresi** vs 12.00 FPS), `p90` 16.30, `maxMs` **220.6 ms** (`ALL>=3k` `maxMs 309.1 ms`); HUD `1%` turun menjadi **2–4** (vs 10 di Pass 1), dengan hitch **2.7 FPS / `FRAME 375.8 ms` (`SUB 46.7 ms`, `MAX 719`, `CPU 32%`, `GPU 12%`)** tertangkap pada `shot-2.png`. `ERROR=0`, 0 crash, RAM `13.8–14.2/15.9 GiB`, `pressure_events=1`.
+  - **`Series S diag`** ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-2/series-s-diag/run.log), `69.9s` in-world): `STEADY>=3k` (`n=73`, avg 6397 draws): med **14.20 FPS** (vs 13.60), `p10` 10.20 (vs 10.00), `maxMs` **273.2 ms** (vs 204.9 ms); `sync_heaps total` `25.99 -> 23.91 ms` (`waited 9.09 -> 7.20 ms`, `objects 6650 -> 1481`), `heap_pass slots 21.60 -> 18.70 ms`, `wait_close 9.90 -> 7.90 ms`; namun `waited_nd` ("waited and no draw came") melonjak **2923 -> 5292** dan `sync_heaps making` naik **7.76 -> 9.81 ms**, `refresh wall` naik `22.80 -> 25.30 ms`, `guards lock` `19.04 -> 20.03 ms`. `ERROR=0`, 0 crash, `0.00` null twins, `0` evict, RAM `13.9–14.9 GiB`, Shared `3.3–3.4 GiB`.
+- **Keputusan (Aturan 4 — Auto-Revert):** **GAGAL / REVERTED** ke `2793754` karena `Series S release` mengalami regresi tajam pada `p10` (`12.00 -> 8.80 FPS`) dan `1%` low (`10 -> 2–4`) disertai frame stall `375.8 ms`, serta penundaan buffer objek menggandakan `waited_nd` dan menaikkan biaya `sync_heaps making`.
+- **Screenshot Pass 2 (Visual World Normal):**
+  - `Series S release`: [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-2/series-s-release/shot-1.png), [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-2/series-s-release/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-2/series-s-release/shot-3.png)
+  - `Series S diag`: [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-2/series-s-diag/shot-1.png), [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-2/series-s-diag/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-2/series-s-diag/shot-3.png)
+
+---
+
+## Pass 3 (Reverted) — Single-Call `mirror_for_pass` (`PassSlot`), `put_with_twin`, & `merge_sorted_dedup`
+
+- **Target:** `heap_buffer_pass` & `mirror` ([descriptor/host.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/descriptor/host.rs), [draw.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/draw.rs), [host/aside.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/host/aside.rs)).
+  - Menghilangkan lookup `buffer_copy` ganda melalui `PassSlot` di `mirror_for_pass`, menggabung `put + put_twin` menjadi satu `CopyDescriptors(2)` via `put_with_twin`, memakai `keep_ref` + `Slots::put_if_absent`, `merge_sorted_dedup`, `AT_A_TIME = 256`, serta registrasi thread `victory-aside` di `copystat`.
+- **Hasil Live Test (vs Pass 1 `2793754`):**
+  - **`Series S release`** ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-3/series-s-release/run.log)): `STEADY>=3k` (`n=71`, avg 6059 draws): med **14.20 FPS** (`-5.3%` vs 15.00), avg **13.65** (vs 14.31), **`p10` 9.20 FPS** (`-23.3%` vs 12.00), `p90` 16.80, `maxMs` 222.8 ms (`9k+` `12.10 FPS`, `maxMs` 95.9 ms); HUD `1%` `2–9`, RAM memuncak **`15.5/15.9 GiB`** saat `shot-3.png` (`pressure_events=1`). `ERROR=0`, 0 crash.
+  - **`Series S diag`** ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-3/series-s-diag/run.log), `69.8s` in-world): `STEADY>=3k` (`n=71`, avg 6992 draws): med **13.00 FPS** (vs 13.60), `p10` **7.00 FPS** (vs 10.00), `maxMs` 189.6 ms (`ALL>=3k` `271.9 ms`); `heap_pass slots` **21.20 ms** (vs 21.60 ms, `-1.8%`), `wait_close` **9.90 ms** (vs 9.90 ms), `title hook mirror` **13.90 ms** (vs 14.30 ms), `VICTORY_THIN` **209.00 ms** (vs 208.50 ms), terungkap CPU **`aside` `7.6–10.3 + 0.0–0.5 ms`** dan `victory-views` `9.4–12.8 ms`. `ERROR=0`, 0 crash, `0.00` null twins, `0` evict, RAM `14.7–15.6/15.9 GiB`, Shared `3.5–3.6 GiB`.
+- **Keputusan (Aturan 4 — Auto-Revert):** **GAGAL / REVERTED** ke `2793754` karena bottleneck target (`heap_pass slots 21.60 -> 21.20 ms`, `wait_close 9.90 -> 9.90 ms`) nyaris tidak bergerak sementara `Series S release` turun (`15.00 -> 14.20 FPS` med, `p10 12.00 -> 9.20 FPS`) disertai tekanan RAM (`15.5–15.6 GiB`). Temuan penting `diag`: `aside` hanya ~8–10 ms CPU sedangkan sebagian besar biaya `heap_buffer_pass` ternyata bukan di materialisasi `mirror_for_pass`.
+- **Screenshot Pass 3 (Visual World Normal):**
+  - `Series S release`: [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-3/series-s-release/shot-1.png), [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-3/series-s-release/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-3/series-s-release/shot-3.png)
+  - `Series S diag`: [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-3/series-s-diag/shot-1.png), [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-3/series-s-diag/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-3/series-s-diag/shot-3.png)
+
+---
+
+## Pass 4 (Reverted) — `CheckMinMax` Range Pruning, 4 KiB Diff-Copy (`copy_unwatched`), & Threshold `should_wide_update`
+
+- **Target:** `submit refreshes` critical path ([shadow.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/shadow.rs), [watch.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/watch.rs), [host.rs](file:///d:/Codingan/victory-amd/crates/victory-gpu/src/host.rs)).
+  - Menambahkan `CopiedState::max_page_ts`, `RangedCheck::CheckMinMax`/`CheckRanged(min_t, max_t)`, serta `JournalRead::ranged_check_minmax` untuk mem-prune `need-full` (`<= 512` halaman / 32 MiB); memparalelkan diff-copy 4 KiB (`copy_mapped`) pada card-backed unwatched buffer (`>= 256 KiB`) dan menurunkan ambang `should_wide_update` (`>= 2` span dengan total `>= 64 KiB`).
+- **Hasil Live Test (vs Pass 1 `2793754`):**
+  - **`Series S release`** ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-4/series-s-release/run.log)): `STEADY>=3k` (`n=71`, avg 6880 draws): med **14.20 FPS** (`-5.3%` vs 15.00), avg **13.33** (vs 14.31), **`p10` 9.50 FPS** (`-20.8%` vs 12.00), `p90` 16.20, `ms_p99 / maxMs` 179.6 / 179.6 ms (`ALL>=3k` 253.8 ms), `4k–7k` 13.90 (vs 15.30), `9k+` 12.30 (86.5 ms); HUD `6 / 16 / 15 FPS`, `1%` `6–9`, `MAX` `67–294`, RAM `14.2–14.9 / 15.9 GiB`, GPU `19–64%`. `ERROR=0`, 0 crash, `pressure_events=1`.
+  - **`Series S diag`** ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-4/series-s-diag/run.log), `70.0s` in-world): `STEADY>=3k` (`n=74`, avg 6445 draws): med **14.10 FPS** (vs 13.60), `p10` 11.60 (vs 10.00), `maxMs` 95.2 ms (`ALL>=3k` 155.4 ms); `refresh need-full` **`671–772 -> 426.00`** (`-37%`), `refresh MB copied` **`91–110 -> 72.50 MB`**, `card sent MB` **`53.6 -> 38.30 MB`** (`-28.5%`, upload `0x...1412200` turun `21.05 -> 0.00 MB`), `GPU card_sync` `4.0 -> 3.10 ms`; namun `copy_mapped` per-4 KiB (~10.240 syscall `ReadProcessMemory`/frame) membuat CPU thread `wide` melonjak **`31.7 -> 50.5 ms` (+18.8 ms)** dan memundurkan critical path **`submit worker` (`63.50 -> 68.30 ms`)**, `submit refreshes wall` (`21.70 -> 25.30 ms`), serta `card_mem` (`4.90 -> 6.40 ms`). `ERROR=0`, 0 crash, `0.00` null twins, `0` evict, RAM `14.1–15.2 / 15.9 GiB`.
+- **Keputusan (Aturan 4 — Auto-Revert):** **GAGAL / REVERTED** ke `2793754` karena `Series S release` mengalami regresi (`15.00 -> 14.20 FPS` med, `p10 12.00 -> 9.50 FPS`, `1%` turun `10 -> 6–9`) dan `submit worker` critical path memburuk (`63.50 -> 68.30 ms`) akibat overhead syscall 4 KiB `ReadProcessMemory`.
+- **Screenshot Pass 4 (Visual World Normal):**
+  - `Series S release`: [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-4/series-s-release/shot-1.png), [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-4/series-s-release/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-4/series-s-release/shot-3.png)
+  - `Series S diag`: [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-4/series-s-diag/shot-1.png), [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-4/series-s-diag/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-4/series-s-diag/shot-3.png)
+
+---
+
+## Verifikasi Akhir `Series X release` pada `2793754` (Pass 1)
+
+Setelah kode dikembalikan bersih ke `2793754`, build `release` (`--console series-x -Panel -NoRayTracing`) diuji live selama `68.3s` berturut-turut di in-game world (`draws >= 3000`):
+
+- **`Series X release`** ([run.log](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-x-release/run.log)):
+  - `STEADY>=3k` (`n=76`, avg `7288` draws): **med `12.10 FPS`**, avg `10.92`, `p10 5.70`, `p90 14.70`, `ms_p99 / maxMs 282.8 / 282.8 ms`, `cpu 40.8 ms`, `back 26.0 ms` (`4k–7k` `10.10`, `7k–9k` `11.70`, `9k+` `9.20 FPS`).
+  - `ALL>=3k` (`n=86`, avg `7293` draws): med `11.00 FPS`, avg `10.41`, `p10 5.50`, `p90 14.60`, `maxMs 282.8 ms`.
+  - **HUD 4K (`3840x2160`):** pada scene berat (`shot-3`, `9351 DRAWS`), GPU RX 7600 XT mencapai **`79%` busy (`67.6 ms` GPU vs `59.8 ms` SUB)**, **`12 FPS`** (`11.7 FPS`), Local VRAM `10.9 GiB`, Shared GPU **`3.7 GiB`**, System RAM **`15.3/15.9 GiB`**; (`shot-2`, `3932 DRAWS`: `8 FPS`, `35%` GPU, Local `10.8 GiB`, Shared `3.7 GiB`, RAM `15.4/15.9 GiB`).
+  - **Stabilitas:** `ERROR=0`, 0 crash, `0` eviksi VRAM, Shared GPU aman `3.3–3.7 GiB` (`< 5.5 GB`), `pressure_events=1`. *(Catatan screenshot: `shot-1.png` sempat tertangkap tepat saat transisi kamera `1 DRAWS` sebelum harness me-reset timer 68.3s in-world; `shot-2.png` dan `shot-3.png` menampilkan 3D world 4K penuh yang bersih dan normal.)*
+- **Screenshot `Series X release` (`2793754`):** [shot-1.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-x-release/shot-1.png) *(frame transisi `1 DRAWS`)*, [shot-2.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-x-release/shot-2.png), [shot-3.png](file:///d:/Codingan/victory-amd/out/overnight/pass-1/series-x-release/shot-3.png).
+
+---
+
+## Kesimpulan & Batas Berhenti (Aturan 5)
+
+- **State Terkomit Terbaik (`wadaw-overnight`, tanpa push ke remote):** **`2793754`** (Pass 1 — Zero-Clone `BufferSweep`, `mirror_for_pass`, & Incremental `CopySpans`):
+  - **`Series S release`:** `STEADY>=3k` median meningkat **`13.50 -> 15.00 FPS` (+11.1%)**, `p10` **`9.80 -> 12.00 FPS` (+22.4%)**, HUD `1%` low naik **`4–5 -> 10` (`MAX 68–95 ms`)**, `0 ERROR`, `0` crash, `0` eviksi VRAM, `0.00` null raw twins, Shared GPU aman `3.4–3.6 GiB`.
+  - **`Series X release`:** terverifikasi bersih `12.10 FPS` med (`9k+` `9.20 FPS`, `79%` GPU busy di `9351` draws 4K), `0 ERROR`, `0` crash, `0` eviksi VRAM, Shared GPU `3.7 GiB`.
+- **Alasan Berhenti (Aturan 5b):** Tiga pass berturut-turut setelah Pass 1 (Pass 2, Pass 3, dan Pass 4) gagal memberikan peningkatan >3% FPS atau >10% penurunan spike pada `Series S release` tanpa regresi stabilitas/frametime dan otomatis di-revert ke `2793754`.
+- **Temuan Teknis untuk Iterasi Berikutnya:**
+  1. Pada CPU **Ryzen 5 5600 (6C/12T) + 16 GB RAM**, total kerja CPU lintas seluruh thread berada di **~580–640 ms/frame** (saturasi 6C/12T ~80–95%) sementara `physical_free` di akhir streaming kerap menyentuh `236–515 MiB` sehingga memicu noise `±5–10%` `p10`. Target 20 FPS stabil pada PC ini membutuhkan pemangkasan total CPU wall + contention yang jauh lebih besar tanpa menambah syscall kernel.
+  2. Pelajaran Pass 4: melakukan diff-copy via 10k syscall 4 KiB `ReadProcessMemory` menambah `+18.8 ms` biaya CPU/kernel walaupun menghemat `-15.3 MB` GPU upload — implementasi berikutnya untuk `0x...1412200` harus membaca range secara besar/langsung (bukan 10k×4 KiB syscall) atau langsung membandingkan di user-space/SIMD jika aman.
+  3. Kandidat terbersih untuk pass selanjutnya (di luar sesi berhenti ini): eliminasi `clr_epoch` `0.6/frame` yang mengosongkan 32k entri `ListViews` (per-`Shadow` `alive` bit), cache `intern_shape` TLS lock-free di `descriptor.rs`, serta peningkatan shard `GUARDS` (`1024`) untuk memangkas `17–22 ms` guard lock wait.
