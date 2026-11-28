@@ -1,5 +1,6 @@
 # Development & profiling launcher tuned for 16 GB RAM + 6C/12T CPU + RX 7600 XT 16 GB (1080p, Series X + Ray Tracing default).
 #   scripts\play-dev.ps1 [-GameDir <path>] [-Build diag|release] [-Console series-x|series-s]
+#                        [-Output 720p|1080p|1440p|2k|4k|auto|<WxH>] [-RenderScale <0.5..1.0>] [-Fsr4k quality|balanced|performance]
 #                        [-Panel] [-DebugLayer] [-DredLight] [-MemoryMap] [-RayTracing] [-NoRayTracing] [-LevelsOnDemand] [-InplaceProbe] [-NoKeepShown] [-LearnWriteSites] [-BarrierTest groups|indirect|both] [-Warm] [-Safe]
 #                        [-LogFile <path>] [-More @{...}]
 # Note: -Console series-x and -RayTracing (VICTORY_BVH_BUILDER=1) are enabled by default; pass -NoRayTracing for A/B comparison.
@@ -8,6 +9,9 @@ param(
     [string]$GameDir = $env:VICTORY_GAME_DIR,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-x',
+    [string]$Output = '',
+    [string]$RenderScale = '',
+    [ValidateSet('', 'quality', 'balanced', 'performance')][string]$Fsr4k = '',
     [switch]$Panel,
     [switch]$DebugLayer,
     [switch]$DredLight,
@@ -109,6 +113,26 @@ if ($Safe) {
 
 if ($Panel) { $settings.VICTORY_PANEL = '1' }
 if ($DebugLayer) { $settings.VICTORY_D3D12_DEBUG = '1' }
+if ($Output) {
+    $resolvedOutput = switch ($Output.Trim().ToLowerInvariant()) {
+        '720p'   { '1280x720' }
+        '936p'   { '1664x936' }
+        '1080p'  { '1920x1080' }
+        '1440p'  { '2560x1440' }
+        '2k'     { '2560x1440' }
+        '4k'     { '3840x2160' }
+        '2160p'  { '3840x2160' }
+        'auto'   { 'auto' }
+        'native' { 'native' }
+        default  { $Output.Trim() }
+    }
+    $settings.VICTORY_OUTPUT = $resolvedOutput
+    if ($resolvedOutput -match '^\d+[xX]\d+$') {
+        $settings.VICTORY_DISPLAY_MODE = $resolvedOutput
+    }
+}
+if ($RenderScale) { $settings.VICTORY_RENDER_SCALE = $RenderScale.Trim() }
+if ($Fsr4k) { $settings.VICTORY_FSR_4K = $Fsr4k.Trim().ToLowerInvariant() }
 if (-not $NoRayTracing -or $RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($LevelsOnDemand) { $settings.VICTORY_LEVELS_ON_DEMAND = '1' }
 if ($InplaceProbe) { $settings.VICTORY_INPLACE_PROBE = '1' }
@@ -130,7 +154,12 @@ $logDir = Split-Path -Parent $LogFile
 if ($logDir) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
 
 $Exe = (Resolve-Path $Exe).Path
-Write-Host "Running [$Build] ($Console, RT=$($settings.ContainsKey('VICTORY_BVH_BUILDER'))) -> log: $LogFile"
+$resParts = @()
+if ($settings.ContainsKey('VICTORY_OUTPUT')) { $resParts += "out=$($settings['VICTORY_OUTPUT'])" } else { $resParts += 'console-default' }
+if ($settings.ContainsKey('VICTORY_RENDER_SCALE')) { $resParts += "scale=$($settings['VICTORY_RENDER_SCALE'])" }
+if ($settings.ContainsKey('VICTORY_FSR_4K')) { $resParts += "fsr4k=$($settings['VICTORY_FSR_4K'])" }
+$resBanner = $resParts -join ', '
+Write-Host "Running [$Build] ($Console, $resBanner, RT=$($settings.ContainsKey('VICTORY_BVH_BUILDER'))) -> log: $LogFile"
 Write-Host "Cache: $($env:VICTORY_CACHE_DIR)"
 
 $stream = [System.IO.File]::Open($LogFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
