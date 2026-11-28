@@ -440,7 +440,6 @@ pub(crate) fn texture_room() -> u64 {
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
     let textures = lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20);
     let staging = {

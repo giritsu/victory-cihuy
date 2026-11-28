@@ -58,6 +58,8 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(apu::module());
     #[cfg(windows)]
+    all.push(audio::wasapi_null::module());
+    #[cfg(windows)]
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());

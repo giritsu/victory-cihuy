@@ -46,7 +46,7 @@ struct TableGroup {
 #[cfg(feature = "diagnostics")]
 static TABLE_DIAG: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 #[cfg(feature = "diagnostics")]
-static TABLE_SPLIT: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+static TABLE_SPLIT: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
 #[cfg(feature = "diagnostics")]
 static BIND_SPLIT: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 #[cfg(feature = "diagnostics")]
@@ -57,7 +57,7 @@ pub(crate) fn log_tables(frames: f64) {
     let calls = TABLE_DIAG[0].swap(0, Ordering::Relaxed);
     if calls != 0 {
         let vals: [u64; 7] = std::array::from_fn(|i| TABLE_DIAG[i + 1].swap(0, Ordering::Relaxed));
-        let sp: [u64; 16] = std::array::from_fn(|i| TABLE_SPLIT[i].swap(0, Ordering::Relaxed));
+        let sp: [u64; 20] = std::array::from_fn(|i| TABLE_SPLIT[i].swap(0, Ordering::Relaxed));
         let keep_ref_ns = crate::descriptor::host::take_keep_ref_ns();
         let lv = crate::descriptor::host::take_list_views_stats();
         tracing::info!(
@@ -72,7 +72,7 @@ pub(crate) fn log_tables(frames: f64) {
             vals[5] as f64 / frames,
         );
         tracing::info!(
-            "draw::tables split per frame (all threads): hash {:.1}ms, fresh_hit {:.1}ms ({:.0} hits, {:.0} fast-skip), dynamic {:.1}ms, inline_cbv {:.1}ms, listed_slot {:.1}ms (miss {:.1}ms, mirror {:.1}ms, stride_dyn {:.1}ms, keep_ref {:.1}ms), readable {:.1}ms (fresh {:.0}, buf {:.0}, tex {:.0}, uav {:.0}, miss {:.0}), make_miss {:.1}ms, flush {:.1}ms",
+            "draw::tables split per frame (all threads): hash {:.1}ms, fresh_hit {:.1}ms ({:.0} hits, {:.0} fast-skip), dynamic {:.1}ms, inline_cbv {:.1}ms, listed_slot {:.1}ms (miss {:.1}ms, mirror {:.1}ms, stride_dyn {:.1}ms, keep_ref {:.1}ms), readable {:.1}ms (fresh {:.0}, buf {:.0}, tex {:.0}, uav {:.0}, miss {:.0}), make_miss {:.1}ms, flush {:.1}ms, direct {:.1}ms ({:.0} samp, {:.0} hit, {:.0} miss)",
             sp[0] as f64 / 1e6 / frames,
             sp[1] as f64 / 1e6 / frames,
             sp[2] as f64 / frames,
@@ -92,6 +92,10 @@ pub(crate) fn log_tables(frames: f64) {
             sp[12] as f64 / frames,
             sp[7] as f64 / 1e6 / frames,
             vals[6] as f64 / 1e6 / frames,
+            sp[16] as f64 / 1e6 / frames,
+            sp[17] as f64 / frames,
+            sp[18] as f64 / frames,
+            sp[19] as f64 / frames,
         );
         tracing::info!(
             "list_views per frame (all threads): buf {:.0} hit / {:.0} miss (evict {:.0}, clr epoch {:.1}, ttl {:.1}), tex {:.0} hit / {:.0} miss (clr epoch {:.1})",
@@ -558,6 +562,8 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// Direct non-CBV descriptor table slots resolved on this recording thread.
+    direct_ready: std::collections::HashMap<(usize, u32), DirectEntry, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -617,6 +623,7 @@ impl State {
         self.dynamic.clear();
         self.dyn_slab = (0, 0, 0);
         self.fresh_tables.clear();
+        self.direct_ready.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -808,23 +815,201 @@ fn heap_spread() -> bool {
 
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
+#[cfg(test)]
 #[derive(Default)]
 struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
+
+#[derive(Clone, Copy)]
+struct SweepSlot {
+    key: u64,
+    copy_key: usize,
+    from: u64,
+    to: u64,
+    buf_epoch: u32,
+    copy_pos: u32,
+}
+
+impl SweepSlot {
+    const EMPTY: Self = Self {
+        key: 0,
+        copy_key: 0,
+        from: 0,
+        to: 0,
+        buf_epoch: 0,
+        copy_pos: 0,
+    };
+
+    #[inline]
+    fn occupied(self) -> bool {
+        self.copy_key != 0
+    }
+}
+
+struct CopySpan<T> {
+    copy: T,
+    from: u64,
+    to: u64,
+    slots: Vec<u32>,
+    dirty: bool,
+}
+
+struct SweepIndex<T> {
+    slots: Vec<SweepSlot>,
+    spans: crate::host::ByCopy<CopySpan<T>>,
+    views: u32,
+}
+
+impl<T> Default for SweepIndex<T> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            spans: Default::default(),
+            views: 0,
+        }
+    }
+}
+
+impl<T> SweepIndex<T> {
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.spans.clear();
+        self.views = 0;
+    }
+
+    fn remove(&mut self, slot: u32) {
+        let Some(entry) = self.slots.get_mut(slot as usize) else {
+            return;
+        };
+        if !entry.occupied() {
+            return;
+        }
+        let old = *entry;
+        *entry = SweepSlot::EMPTY;
+        self.views -= 1;
+        let remove_span = if let Some(span) = self.spans.get_mut(&old.copy_key) {
+            let pos = old.copy_pos as usize;
+            span.slots.swap_remove(pos);
+            if let Some(&moved_slot) = span.slots.get(pos) {
+                // Keep the moved slot's `copy_pos` valid after `swap_remove`.
+                self.slots[moved_slot as usize].copy_pos = pos as u32;
+            }
+            if span.slots.is_empty() {
+                true
+            } else {
+                if old.from == span.from || old.to == span.to {
+                    span.dirty = true;
+                }
+                false
+            }
+        } else {
+            false
+        };
+        if remove_span {
+            self.spans.remove(&old.copy_key);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set(
+        &mut self,
+        slot: u32,
+        key: u64,
+        buf_epoch: u32,
+        copy_key: usize,
+        make_copy: impl FnOnce() -> T,
+        from: u64,
+        to: u64,
+    ) {
+        debug_assert!(copy_key != 0);
+        if let Some(old) = self.slots.get_mut(slot as usize)
+            && old.occupied()
+            && old.copy_key == copy_key
+        {
+            old.key = key;
+            old.buf_epoch = buf_epoch;
+            if old.from != from || old.to != to {
+                if let Some(span) = self.spans.get_mut(&copy_key) {
+                    if (old.from == span.from && from > old.from) || (old.to == span.to && to < old.to) {
+                        span.dirty = true;
+                    }
+                    span.from = span.from.min(from);
+                    span.to = span.to.max(to);
+                }
+                old.from = from;
+                old.to = to;
+            }
+            return;
+        }
+        self.remove(slot);
+        let idx = slot as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize(idx + 1, SweepSlot::EMPTY);
+        }
+        let copy_pos = match self.spans.entry(copy_key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let span = entry.into_mut();
+                span.from = span.from.min(from);
+                span.to = span.to.max(to);
+                let pos = span.slots.len() as u32;
+                span.slots.push(slot);
+                pos
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let span = entry.insert(CopySpan {
+                    copy: make_copy(),
+                    from,
+                    to,
+                    slots: vec![slot],
+                    dirty: false,
+                });
+                let _ = span;
+                0
+            }
+        };
+        self.slots[idx] = SweepSlot {
+            key,
+            copy_key,
+            from,
+            to,
+            buf_epoch,
+            copy_pos,
+        };
+        self.views += 1;
+    }
+
+    fn recompute_dirty(&mut self) {
+        for span in self.spans.values_mut() {
+            if !span.dirty {
+                continue;
+            }
+            let (mut lo, mut hi) = (u64::MAX, 0u64);
+            for &slot in &span.slots {
+                let s = self.slots[slot as usize];
+                lo = lo.min(s.from);
+                hi = hi.max(s.to);
+            }
+            span.from = lo;
+            span.to = hi;
+            span.dirty = false;
+        }
+    }
+}
 
 /// Descriptor-derived references belong to the heap that produced them.
 pub(crate) struct BufferSweep {
     passes: u64,
-    ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    index: SweepIndex<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, index: SweepIndex::default(), unwatched: Default::default() }
     }
 }
 
+#[cfg(test)]
 impl<T> HeapRanges<T> {
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
         let slot = slot as usize;
@@ -916,6 +1101,47 @@ mod heap_range_tests {
             best(&mut || join::<std::hash::RandomState>(&mut table.values())),
             best(&mut || join::<std::hash::BuildHasherDefault<crate::host::AddressHash>>(&mut slots.ranges())),
         );
+    }
+
+    #[test]
+    fn sweep_index_tracks_incremental_spans_and_updates() {
+        let mut index: super::SweepIndex<u32> = super::SweepIndex::default();
+        // Insert multiple slots for copy 10 -> widens span without dirtying.
+        index.set(1, 101, 1, 10, || 10, 100, 200);
+        index.set(2, 102, 1, 10, || unreachable!(), 150, 300);
+        index.set(3, 103, 1, 10, || unreachable!(), 50, 120);
+        assert_eq!(index.views, 3);
+        assert_eq!(index.spans.len(), 1);
+        assert_eq!((index.spans[&10].from, index.spans[&10].to, index.spans[&10].dirty), (50, 300, false));
+
+        // Remove interior slot 1 -> dirty stays false, swap_remove keeps copy_pos valid.
+        index.remove(1);
+        assert_eq!(index.views, 2);
+        assert_eq!((index.spans[&10].from, index.spans[&10].to, index.spans[&10].dirty), (50, 300, false));
+
+        // Remove boundary slot 3 (`from == 50`) -> dirty becomes true; recompute shrinks span.
+        index.remove(3);
+        assert!(index.spans[&10].dirty);
+        index.recompute_dirty();
+        assert_eq!((index.spans[&10].from, index.spans[&10].to, index.spans[&10].dirty), (150, 300, false));
+
+        // Overwrite slot 2 with same copy and narrower high boundary -> marks dirty & shrinks on recompute.
+        index.set(2, 104, 2, 10, || unreachable!(), 160, 250);
+        index.recompute_dirty();
+        assert_eq!((index.spans[&10].from, index.spans[&10].to), (160, 250));
+
+        // Overwrite slot 2 with a different copy 20 -> removes empty copy 10 span, inserts copy 20.
+        index.set(2, 201, 2, 20, || 20, 400, 500);
+        index.recompute_dirty();
+        assert!(!index.spans.contains_key(&10));
+        assert_eq!(index.spans.len(), 1);
+        assert_eq!((index.spans[&20].from, index.spans[&20].to), (400, 500));
+        assert_eq!(index.views, 1);
+
+        index.clear();
+        assert_eq!(index.views, 0);
+        assert!(index.spans.is_empty());
+        assert!(index.slots.is_empty());
     }
 }
 
@@ -1038,23 +1264,32 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 /// they show are to be refreshed.
 fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
-    // Per host heap: the host copy and range each slot's buffer view
-    // reads, kept from pass to pass. Only the slots written since the
-    // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-    // at best); all of them every 16 passes, because a view of a
-    // released resource goes stale without a write, and a slot written
-    // before its memory had a host copy is only made then.
+    // Per host heap: the host copy and range each slot's buffer view reads,
+    // kept incrementally from pass to pass. Unchanged slots skip descriptor
+    // cloning and buffer_copy lookups; modified slots update per-copy spans
+    // in place without rebuilding over all 150k+ slots each frame.
+    enum SweepAction {
+        Clear(u32),
+        Set {
+            slot: u32,
+            key: u64,
+            shadow: std::sync::Arc<crate::shadow::Shadow>,
+            from: u64,
+            to: u64,
+            written: bool,
+        },
+    }
+    let cur_buf_epoch = crate::descriptor::host::view_epochs().0 as u32;
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, index, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        index.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
         let mut slots = host.buffer_slots_of(part, parts);
         slots.extend(changed);
         slots.sort_unstable();
@@ -1080,30 +1315,57 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
     }
     let heap = Shared(heap);
+    let prev_slots = &index.slots;
     // What a slot of the title's shows: its copy and range, and whether it is
     // an unordered view.
-    let look = |index: u32| {
+    let look = |slot_idx: u32| -> Option<SweepAction> {
+        let had = prev_slots.get(slot_idx as usize).filter(|e| e.occupied());
         // A draw's table's: the draw brings what it reads up to date.
-        if host.copied_tabled(index, frame) {
+        if host.copied_tabled(slot_idx, frame) {
+            return had.map(|_| SweepAction::Clear(slot_idx));
+        }
+        let Some(handle) = heap.handle(slot_idx) else {
+            return had.map(|_| SweepAction::Clear(slot_idx));
+        };
+        if !all
+            && let Some(prev) = had
+            && prev.buf_epoch == cur_buf_epoch
+            && let Some([_, i, generation]) = crate::descriptor::record_at(handle)
+            && let key = u64::from(generation) << 32 | u64::from(i)
+            && prev.key == key
+            && host.quick_matches(slot_idx, key)
+            && crate::descriptor::view_alive(i, generation)
+        {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let Some((view, key)) = host.mirror_for_pass(slot_idx, handle) else {
+            return had.map(|_| SweepAction::Clear(slot_idx));
+        };
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            return had.map(|_| SweepAction::Clear(slot_idx));
+        };
         #[cfg(feature = "diagnostics")]
-        if host.shows(index, &shadow.buffer) == Some(false) {
+        if host.shows(slot_idx, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
-        Some(((shadow, address, address + len), written))
+        Some(SweepAction::Set {
+            slot: slot_idx,
+            key,
+            shadow,
+            from: address,
+            to: address + len,
+            written,
+        })
     };
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 64;
     let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
-    let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
+    let found: Vec<std::sync::OnceLock<Vec<SweepAction>>> = parts.iter().map(|_| Default::default()).collect();
     crate::land::each_view(false, parts.len(), &|n| {
-        let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+        let looked: Vec<SweepAction> = parts[n].iter().filter_map(|&slot_idx| look(slot_idx)).collect();
         // (After each piece while the device lives: a cheap query.)
         if alive
             && let Some(why) = crate::descriptor::host::device_removed()
@@ -1119,31 +1381,31 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         let _ = found[n].set(looked);
     });
-    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let range = shows.map(|(range, written)| {
-            if written {
-                unordered.push(range.clone());
+    for action in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+        match action {
+            SweepAction::Clear(slot_idx) => index.remove(slot_idx),
+            SweepAction::Set {
+                slot: slot_idx,
+                key,
+                shadow,
+                from,
+                to,
+                written,
+            } => {
+                if written {
+                    unordered.push((shadow.clone(), from, to));
+                }
+                let copy_key = std::sync::Arc::as_ptr(&shadow) as usize;
+                index.set(slot_idx, key, cur_buf_epoch, copy_key, || shadow, from, to);
             }
-            range
-        });
-        ranges.set(index, range);
+        }
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
-    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+    index.recompute_dirty();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
@@ -1155,22 +1417,37 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(spans.len());
-    let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
-        if every > 1 && shadow.unwatched() {
-            let id = shadow.id();
-            if let Some(&(last, low, high)) = unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
-            {
-                next_unwatched.insert(id, (last, low, high));
-                continue;
+    let mut found = Vec::with_capacity(index.spans.len());
+    if every > 1 {
+        let mut next_unwatched = std::collections::HashMap::new();
+        for span in index.spans.values() {
+            if span.copy.unwatched() {
+                let id = span.copy.id();
+                if let Some(&(last, low, high)) = unwatched.get(&id)
+                    && frame >= last && frame - last < every && low <= span.from && span.to <= high
+                {
+                    next_unwatched.insert(id, (last, low, high));
+                    continue;
+                }
+                next_unwatched.insert(id, (frame, span.from, span.to));
             }
-            next_unwatched.insert(id, (frame, *from, *to));
+            found.push((span.copy.clone(), span.from, span.to.min(span.from + span.copy.left(span.from))));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        *unwatched = next_unwatched;
+    } else {
+        for span in index.spans.values() {
+            found.push((span.copy.clone(), span.from, span.to.min(span.from + span.copy.left(span.from))));
+        }
     }
-    *unwatched = next_unwatched;
+    let views = index.views;
+    let copies = index.spans.len();
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    // The first pass and every growth of the set by half.
+    let seen = LOGGED.load(Ordering::Relaxed);
+    let log_bytes = (u64::from(views) > seen + seen / 2).then(|| {
+        LOGGED.store(u64::from(views), Ordering::Relaxed);
+        index.spans.values().map(|s| s.to - s.from).sum::<u64>()
+    });
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
@@ -1179,15 +1456,11 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
     }
-    static LOGGED: AtomicU64 = AtomicU64::new(0);
-    // The first pass and every growth of the set by half.
-    let seen = LOGGED.load(Ordering::Relaxed);
-    if u64::from(views) > seen + seen / 2 {
-        LOGGED.store(u64::from(views), Ordering::Relaxed);
+    if let Some(bytes) = log_bytes {
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies,
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
@@ -1230,6 +1503,7 @@ impl State {
         self.heaps = [0; 2];
         self.cached_heap_buffers = None;
         self.cached_heap_strides = None;
+        self.direct_ready.clear();
         for &h in heaps {
             if !h.is_null() {
                 let samplers = crate::descriptor::heap(h).samplers();
@@ -1447,6 +1721,7 @@ impl State {
         self.host_heaps_set = false;
         self.cached_heap_buffers = None;
         self.cached_heap_strides = None;
+        self.direct_ready.clear();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1989,7 +2264,9 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             let rv_began = std::time::Instant::now();
+            let bounded_root_srvs = crate::pipeline::host::bounded_root_srvs();
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
+                let tabled = srv && bounded_root_srvs;
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
@@ -2041,7 +2318,6 @@ impl State {
                         }
                         continue;
                     }
-                    let tabled = srv && crate::pipeline::host::bounded_root_srvs();
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
@@ -2435,7 +2711,7 @@ impl State {
         } else {
             (list.fill_scratch(address as *const u8, len)?, None)
         };
-        if self.root_view_cache.len() >= 1024 {
+        if self.root_view_cache.len() >= 4096 {
             self.root_view_cache.clear();
         }
         self.root_view_cache.insert(
@@ -3185,42 +3461,46 @@ impl State {
             }
             let mut partly = None;
             let mut there = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
-                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
-                let first = crate::resource::first_mip(&desc);
-                let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
-                if mapped == 0 {
-                    HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
-                    continue;
-                }
-                host.texture_slot_here(index);
-                there = Some(mapped);
-                if mapped < len {
-                    if mapped <= host.texture_slot_mapped(index) {
-                        HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
+            let view = heap.handle(index).and_then(crate::descriptor::view);
+            match &view {
+                Some(View::Placed(false, resource, desc)) => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    let first = crate::resource::first_mip(desc);
+                    let len = crate::resource::placed_bytes_from(resource, first).unwrap_or(1);
+                    let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                    if mapped == 0 {
+                        HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                        // Streamed out: what the slot showed is let go.
+                        host.texture_slot_gone(index);
                         host.texture_slot_later(index, write, frame, most);
                         continue;
                     }
-                    if !crate::texture::committed(address as *const u8, 1) {
-                        HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
+                    host.texture_slot_here(index);
+                    there = Some(mapped);
+                    if mapped < len {
+                        if mapped <= host.texture_slot_mapped(index) {
+                            HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
+                            host.texture_slot_later(index, write, frame, most);
+                            continue;
+                        }
+                        if !crate::texture::committed(address as *const u8, 1) {
+                            HEAP_TEXTURES_PARTLY[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                        partly = Some(mapped);
                     }
-                    partly = Some(mapped);
                 }
-            }
-            // A texture object the host renders to or writes holds the
-            // host's own contents: nothing to bring up to date, and this
-            // pass is no use of it (its host copy is made when something
-            // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
-                && crate::resource::buffer_bytes(object as This).is_none()
-                && !crate::resource::title_fills(object as This)
-            {
-                host.texture_slot_done(index, write, None);
-                continue;
+                // A texture object the host renders to or writes holds the
+                // host's own contents: nothing to bring up to date, and this
+                // pass is no use of it (its host copy is made when something
+                // uses it, and its slots then: `descriptor::make_waiting`).
+                Some(View::Shader(object, _))
+                    if crate::resource::buffer_bytes(*object as This).is_none()
+                        && !crate::resource::title_fills(*object as This) =>
+                {
+                    host.texture_slot_done(index, write, None);
+                    continue;
+                }
+                _ => {}
             }
             // From here on a host texture is made: not without room. The
             // slot stays due.
@@ -4055,28 +4335,6 @@ impl State {
         }
     }
 
-    fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
-        let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return;
-        };
-        let handle = table + u64::from(u.table_offset_dwords) * 4;
-        let Some(heap) = self.heap_of(handle) else {
-            return;
-        };
-        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return;
-        };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
-            // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
-                host.texture_slot_tabled(index, true);
-            } else {
-                host.slot_tabled(index);
-            }
-        }
-    }
-
     /// The descriptors a shader reads through tables. Tables holding a
     /// constant buffer are made afresh for the draw in dynamic slots, with
     /// the constant data copied to upload memory when the list is
@@ -4095,25 +4353,199 @@ impl State {
         compute: bool,
     ) -> Few<(u8, u32), 16> {
         let mut fresh = [0u64; 4];
+        let mut has_direct = false;
+        let mut direct_groups: Few<
+            Option<(u64, &'static crate::descriptor::Heap, &'static crate::descriptor::host::HostHeap)>,
+            16,
+        > = Few::default();
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
             let slot = group.slot;
+            let resolved = match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::Table(table)) => self
+                    .heap_of(table)
+                    .and_then(|heap| heap.host().map(|host| (table, heap, host))),
+                _ => None,
+            };
             let needs_snapshot = group.has_cbv
-                || match self.roots_ref(compute).get(usize::from(slot)) {
-                    Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
-                        heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
-                    }),
-                    _ => false,
-                };
+                || resolved.is_some_and(|(table, heap, host)| group.needs_snapshot(heap, host.count(), table));
             if needs_snapshot {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
+                direct_groups.push(None);
+            } else {
+                has_direct |= resolved.is_some();
+                direct_groups.push(resolved);
             }
         }
-        for &(g, e) in &plan.direct {
-            let group = &plan.groups[g];
-            if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+        #[cfg(feature = "diagnostics")]
+        let (mut d_direct_ns, mut d_direct_sampler, mut d_direct_hit, mut d_direct_miss) =
+            (0u64, 0u64, 0u64, 0u64);
+        if has_direct && !plan.direct.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            let direct_began = std::time::Instant::now();
+            let frame = crate::frame::current();
+            let (buf_epoch, tex_epoch) = crate::descriptor::host::view_epochs();
+            let list_ptr = std::ptr::from_ref(list) as usize;
+            let use_cache = ready_once();
+            for &(g, e) in &plan.direct {
+                let Some((table, heap, host)) = direct_groups[g] else {
+                    continue;
+                };
+                let u = &plan.groups[g].entries[e];
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some(index) = heap.index(handle) else {
+                    continue;
+                };
+                let words = crate::descriptor::record_at(handle);
+                if heap.samplers() && u.kind == ResourceType::Sampler {
+                    if let Some(words) = words
+                        && host.quick_matches(index, u64::from(words[2]) << 32 | u64::from(words[1]))
+                    {
+                        host.slot_tabled_in(index, frame);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_direct_sampler += 1;
+                        }
+                        continue;
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        d_direct_miss += 1;
+                    }
+                    if host.mirror(index, handle, true).is_some() {
+                        host.slot_tabled_in(index, frame);
+                    }
+                    continue;
+                }
+                let host_ptr = std::ptr::from_ref(host) as usize;
+                if use_cache
+                    && let Some(words) = words
+                    && host.quick_matches(index, u64::from(words[2]) << 32 | u64::from(words[1]))
+                {
+                    if let Some(entry) = self.direct_ready.get_mut(&(host_ptr, index))
+                        && entry.matches(words, list_ptr, buf_epoch, tex_epoch)
+                    {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_direct_hit += 1;
+                        }
+                        if !entry.is_texture && u.kind == ResourceType::Srv {
+                            let cur_ref = list.refresh_epoch();
+                            if entry.ready_epoch != cur_ref {
+                                readable_cached(list, u.kind, &entry.readable);
+                                entry.ready_epoch = cur_ref;
+                            }
+                        } else if entry.is_texture && u.kind == ResourceType::Srv {
+                            let tested = TESTED_DEPTH.get();
+                            if entry.ready_epoch == list.epoch() && entry.tested_depth == tested.0 {
+                                if entry.was_tested_depth {
+                                    TESTED_DEPTH.set((tested.0, true));
+                                }
+                            } else {
+                                let (re, td, wd) = read_direct_cached(list, u.kind, &entry.readable, true);
+                                entry.ready_epoch = re;
+                                entry.tested_depth = td;
+                                entry.was_tested_depth = wd;
+                            }
+                        } else {
+                            readable_cached(list, u.kind, &entry.readable);
+                        }
+                        if entry.tabled_frame != frame {
+                            if entry.is_texture {
+                                host.texture_slot_tabled_in(index, true, frame);
+                            } else {
+                                host.slot_tabled_in(index, frame);
+                            }
+                            entry.tabled_frame = frame;
+                        }
+                        continue;
+                    }
+                    if let Some((cached, is_tex)) = crate::descriptor::host::with_cached_readable(
+                        frame,
+                        words,
+                        |listed, cached| (cached.clone(), listed.texture),
+                    ) && !matches!(cached, crate::descriptor::host::CachedReadable::None)
+                    {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            d_direct_hit += 1;
+                        }
+                        let (ready_epoch, tested_depth, was_tested_depth) =
+                            read_direct_cached(list, u.kind, &cached, is_tex);
+                        if is_tex {
+                            host.texture_slot_tabled_in(index, true, frame);
+                        } else {
+                            host.slot_tabled_in(index, frame);
+                        }
+                        if self.direct_ready.len() >= DIRECT_READY_CAP {
+                            self.direct_ready.clear();
+                        }
+                        self.direct_ready.insert(
+                            (host_ptr, index),
+                            DirectEntry {
+                                words,
+                                list_ptr,
+                                view_epoch: if is_tex { tex_epoch } else { buf_epoch },
+                                is_texture: is_tex,
+                                readable: cached,
+                                ready_epoch,
+                                tested_depth,
+                                was_tested_depth,
+                                tabled_frame: frame,
+                            },
+                        );
+                        continue;
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    d_direct_miss += 1;
+                }
+                let Some(view) = host.mirror(index, handle, true) else {
+                    self.direct_ready.remove(&(host_ptr, index));
+                    continue;
+                };
+                let (cached, is_tex) = crate::descriptor::host::cached_readable_of(&view);
+                let (ready_epoch, tested_depth, was_tested_depth) =
+                    if matches!(cached, crate::descriptor::host::CachedReadable::None) {
+                        readable(list, u.kind, &view);
+                        (0, 0, false)
+                    } else {
+                        read_direct_cached(list, u.kind, &cached, is_tex)
+                    };
+                if is_tex {
+                    host.texture_slot_tabled_in(index, true, frame);
+                } else {
+                    host.slot_tabled_in(index, frame);
+                }
+                if use_cache
+                    && !matches!(cached, crate::descriptor::host::CachedReadable::None)
+                    && let Some(words) = words
+                    && crate::descriptor::record_at(handle) == Some(words)
+                    && host.quick_matches(index, u64::from(words[2]) << 32 | u64::from(words[1]))
+                {
+                    if self.direct_ready.len() >= DIRECT_READY_CAP {
+                        self.direct_ready.clear();
+                    }
+                    self.direct_ready.insert(
+                        (host_ptr, index),
+                        DirectEntry {
+                            words,
+                            list_ptr,
+                            view_epoch: if is_tex { tex_epoch } else { buf_epoch },
+                            is_texture: is_tex,
+                            readable: cached,
+                            ready_epoch,
+                            tested_depth,
+                            was_tested_depth,
+                            tabled_frame: frame,
+                        },
+                    );
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                d_direct_ns = direct_began.elapsed().as_nanos() as u64;
             }
         }
         let mut made = Few::default();
@@ -4447,8 +4879,25 @@ impl State {
             );
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let mut list_epoch = list.epoch();
+            let list_refresh_epoch = list.refresh_epoch();
+            let by_desc = &group.by_descriptor;
+            let sel_slice = &*selected;
+            let mut bd_pos = 0usize;
+            let mut sel_pos = 0usize;
             host.with_table_views(frame, n, |tv| {
                 for k in 0..n {
+                    while bd_pos < by_desc.len() && by_desc[bd_pos].0 < k {
+                        bd_pos += 1;
+                    }
+                    let used = by_desc
+                        .get(bd_pos)
+                        .filter(|item| item.0 == k)
+                        .map(|item| &entries[item.1]);
+                    while sel_pos < sel_slice.len() && sel_slice[sel_pos] < k {
+                        sel_pos += 1;
+                    }
+                    let is_selected = sel_slice.get(sel_pos).copied() == Some(k);
                     let index = first + k;
                     let handle = table + u64::from(k) * 32;
                     let words = crate::descriptor::record_at(handle);
@@ -4501,14 +4950,12 @@ impl State {
                             index,
                             copy_batch,
                             |listed, cached| {
-                                let kind = group
-                                    .entry(k)
+                                let kind = used
                                     .map(|u| u.kind)
-                                    .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                                    .or_else(|| is_selected.then_some(listed.kind).flatten());
                                 if let Some(kind) = kind {
                                     if !listed.texture && kind == ResourceType::Srv {
-                                        let refresh_epoch = list.refresh_epoch();
-                                        if listed.ready.0 != refresh_epoch {
+                                        if listed.ready.0 != list_refresh_epoch {
                                             #[cfg(feature = "diagnostics")]
                                             let rb = std::time::Instant::now();
                                             readable_cached(list, kind, cached);
@@ -4518,11 +4965,11 @@ impl State {
                                                 d_readable += 1;
                                                 d_r_buf += 1;
                                             }
-                                            listed.ready = (refresh_epoch, 0, false);
+                                            listed.ready = (list_refresh_epoch, 0, false);
                                         }
                                     } else if listed.texture && kind == ResourceType::Srv {
                                         let tested = TESTED_DEPTH.get();
-                                        if listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                                        if listed.ready.0 == list_epoch && listed.ready.1 == tested.0 {
                                             if listed.ready.2 {
                                                 TESTED_DEPTH.set((tested.0, true));
                                             }
@@ -4532,6 +4979,7 @@ impl State {
                                             #[cfg(feature = "diagnostics")]
                                             let rb = std::time::Instant::now();
                                             readable_cached(list, kind, cached);
+                                            list_epoch = list.epoch();
                                             #[cfg(feature = "diagnostics")]
                                             {
                                                 d_r_ns += rb.elapsed().as_nanos() as u64;
@@ -4541,13 +4989,14 @@ impl State {
                                             let depth = TESTED_DEPTH.get().1;
                                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                                             if !crate::residency::take_staging_deferred() {
-                                                listed.ready = (list.epoch(), tested.0, depth);
+                                                listed.ready = (list_epoch, tested.0, depth);
                                             }
                                         }
                                     } else {
                                         #[cfg(feature = "diagnostics")]
                                         let rb = std::time::Instant::now();
                                         readable_cached(list, kind, cached);
+                                        list_epoch = list.epoch();
                                         #[cfg(feature = "diagnostics")]
                                         {
                                             d_r_ns += rb.elapsed().as_nanos() as u64;
@@ -4580,9 +5029,9 @@ impl State {
                         if let Some((title_slot, read)) = need_tex_tabled {
                             #[cfg(feature = "diagnostics")]
                             let mir_began = std::time::Instant::now();
-                            host.texture_slot_tabled(title_slot, read);
+                            host.texture_slot_tabled_in(title_slot, read, frame);
                             if read {
-                                host.mirror_after(list, title_slot, handle);
+                                host.mirror_after_words(list, title_slot, handle, words);
                             }
                             #[cfg(feature = "diagnostics")]
                             {
@@ -4593,8 +5042,7 @@ impl State {
                     }
                     #[cfg(feature = "diagnostics")]
                     let miss_began = std::time::Instant::now();
-                    let used = group.entry(k);
-                    if words.is_none() {
+                    let Some(words) = words else {
                         host.make_null_table_slot(index, copy_batch);
                         strides[k as usize] = 0;
                         #[cfg(feature = "diagnostics")]
@@ -4606,7 +5054,7 @@ impl State {
                             once!(slot, "a table entry without a view");
                         }
                         continue;
-                    }
+                    };
                     match crate::descriptor::view(handle) {
                         Some(View::Constant(address, size)) => {
                             #[cfg(feature = "diagnostics")]
@@ -4650,13 +5098,14 @@ impl State {
                                 d_make_miss += 1;
                                 d_miss_ns += miss_began.elapsed().as_nanos() as u64;
                             }
-                            let kind = used.map(|u| u.kind).or_else(|| {
-                                selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
-                            });
+                            let kind = used
+                                .map(|u| u.kind)
+                                .or_else(|| is_selected.then(|| view_kind(&view)).flatten());
                             if let Some(kind) = kind {
                                 #[cfg(feature = "diagnostics")]
                                 let rb = std::time::Instant::now();
                                 readable(list, kind, &view);
+                                list_epoch = list.epoch();
                                 #[cfg(feature = "diagnostics")]
                                 {
                                     d_r_ns += rb.elapsed().as_nanos() as u64;
@@ -4672,9 +5121,9 @@ impl State {
                             if crate::descriptor::host::is_texture_view(&view) {
                                 table_has_texture = true;
                                 if let Some(title) = title_first {
-                                    host.texture_slot_tabled(title + k, kind.is_some());
+                                    host.texture_slot_tabled_in(title + k, kind.is_some(), frame);
                                     if kind.is_some() {
-                                        host.mirror_after(list, title + k, handle);
+                                        host.mirror_after_words(list, title + k, handle, words);
                                     }
                                 }
                             }
@@ -4751,6 +5200,10 @@ impl State {
             if d_fresh_skip > 0 { TABLE_SPLIT[13].fetch_add(d_fresh_skip, Ordering::Relaxed); }
             if d_mirror_ns > 0 { TABLE_SPLIT[14].fetch_add(d_mirror_ns, Ordering::Relaxed); }
             if d_stride_dyn_ns > 0 { TABLE_SPLIT[15].fetch_add(d_stride_dyn_ns, Ordering::Relaxed); }
+            if d_direct_ns > 0 { TABLE_SPLIT[16].fetch_add(d_direct_ns, Ordering::Relaxed); }
+            if d_direct_sampler > 0 { TABLE_SPLIT[17].fetch_add(d_direct_sampler, Ordering::Relaxed); }
+            if d_direct_hit > 0 { TABLE_SPLIT[18].fetch_add(d_direct_hit, Ordering::Relaxed); }
+            if d_direct_miss > 0 { TABLE_SPLIT[19].fetch_add(d_direct_miss, Ordering::Relaxed); }
         }
         made
     }
@@ -5522,6 +5975,60 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
     }
 }
 
+/// Maximum entries cached in [`State::direct_ready`] before clearing.
+const DIRECT_READY_CAP: usize = 4096;
+
+/// Cached non-CBV direct table slot state for one `(host_heap, slot)` on a list.
+struct DirectEntry {
+    words: [u32; 3],
+    list_ptr: usize,
+    view_epoch: u64,
+    is_texture: bool,
+    readable: crate::descriptor::host::CachedReadable,
+    ready_epoch: u64,
+    tested_depth: usize,
+    was_tested_depth: bool,
+    tabled_frame: u64,
+}
+
+impl DirectEntry {
+    #[inline]
+    fn matches(&self, words: [u32; 3], list_ptr: usize, buf_epoch: u64, tex_epoch: u64) -> bool {
+        self.words == words
+            && self.list_ptr == list_ptr
+            && self.view_epoch == if self.is_texture { tex_epoch } else { buf_epoch }
+    }
+}
+
+/// Runs `readable_cached` and computes `(ready_epoch, tested_depth, was_tested_depth)`
+/// after any transitions/refreshes complete.
+fn read_direct_cached(
+    list: &HostList,
+    kind: ResourceType,
+    cached: &crate::descriptor::host::CachedReadable,
+    is_texture: bool,
+) -> (u64, usize, bool) {
+    if !is_texture && kind == ResourceType::Srv {
+        readable_cached(list, kind, cached);
+        (list.refresh_epoch(), 0, false)
+    } else if is_texture && kind == ResourceType::Srv {
+        let tested = TESTED_DEPTH.get();
+        let _ = crate::residency::take_staging_deferred();
+        TESTED_DEPTH.set((tested.0, false));
+        readable_cached(list, kind, cached);
+        let depth = TESTED_DEPTH.get().1;
+        TESTED_DEPTH.set((tested.0, tested.1 || depth));
+        if crate::residency::take_staging_deferred() {
+            (0, 0, false)
+        } else {
+            (list.epoch(), tested.0, depth)
+        }
+    } else {
+        readable_cached(list, kind, cached);
+        (0, 0, false)
+    }
+}
+
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
 struct FreshTable {
     first: u32,
@@ -6041,6 +6548,69 @@ mod tests {
         assert!(State::should_root_uav_write(true, true, crate::memory::BACK, false));
         assert!(!State::should_root_uav_write(true, true, 64 << 20, false));
         assert!(State::should_root_uav_write(true, true, 64 << 20, true));
+    }
+
+    #[test]
+    fn direct_entry_matches_checks_words_list_and_relevant_epoch() {
+        use crate::descriptor::host::CachedReadable;
+        let words = [0x1234_5678, 10, 2];
+        let buf_entry = super::DirectEntry {
+            words,
+            list_ptr: 0xAA00,
+            view_epoch: 5,
+            is_texture: false,
+            readable: CachedReadable::None,
+            ready_epoch: 1,
+            tested_depth: 0,
+            was_tested_depth: false,
+            tabled_frame: 10,
+        };
+        assert!(buf_entry.matches(words, 0xAA00, 5, 99));
+        assert!(!buf_entry.matches([0x1234_5678, 11, 2], 0xAA00, 5, 99));
+        assert!(!buf_entry.matches(words, 0xBB00, 5, 99));
+        assert!(!buf_entry.matches(words, 0xAA00, 6, 99));
+
+        let tex_entry = super::DirectEntry {
+            words,
+            list_ptr: 0xAA00,
+            view_epoch: 9,
+            is_texture: true,
+            readable: CachedReadable::None,
+            ready_epoch: 1,
+            tested_depth: 0,
+            was_tested_depth: false,
+            tabled_frame: 10,
+        };
+        assert!(tex_entry.matches(words, 0xAA00, 777, 9));
+        assert!(!tex_entry.matches(words, 0xAA00, 777, 10));
+    }
+
+    #[test]
+    fn direct_ready_clears_on_set_heaps_tables_done_and_reset() {
+        use crate::descriptor::host::CachedReadable;
+        let mut s = super::State::default();
+        let entry = || super::DirectEntry {
+            words: [1, 2, 3],
+            list_ptr: 0x10,
+            view_epoch: 1,
+            is_texture: false,
+            readable: CachedReadable::None,
+            ready_epoch: 1,
+            tested_depth: 0,
+            was_tested_depth: false,
+            tabled_frame: 1,
+        };
+        s.direct_ready.insert((0x100, 0), entry());
+        s.set_heaps(&[]);
+        assert!(s.direct_ready.is_empty());
+
+        s.direct_ready.insert((0x100, 1), entry());
+        s.tables_done();
+        assert!(s.direct_ready.is_empty());
+
+        s.direct_ready.insert((0x100, 2), entry());
+        s.reset(std::ptr::null());
+        assert!(s.direct_ready.is_empty());
     }
 }
 

@@ -1563,6 +1563,20 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
+/// Zero-clone liveness check for a recorded view `(i, generation)`.
+#[cfg(windows)]
+pub(crate) fn view_alive(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        0 => {
+            let views = views_read();
+            views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+        }
+        CONSTANT => true,
+        PLACED => ((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize) < SHAPES_TABLE.len(),
+        _ => false,
+    }
+}
+
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
@@ -2181,6 +2195,40 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    #[test]
+    fn view_alive_checks_table_constant_and_placed_without_cloning() {
+        let null = std::ptr::null();
+        let slots = [0u64; 3 * 4];
+        let (a, b, c) = (
+            slots.as_ptr() as u64,
+            slots.as_ptr() as u64 + 32,
+            slots.as_ptr() as u64 + 64,
+        );
+        // Table entry: live until `forget`.
+        let resource = 0x7778_0000usize as This;
+        create_srv(null, resource, std::ptr::null(), a);
+        let rec = record_at(a).unwrap();
+        assert!(view_alive(rec[1], rec[2]));
+        forget(0x7778_0000);
+        assert!(!view_alive(rec[1], rec[2]));
+
+        // Inline constant view and placed view.
+        if inline() {
+            create_cbv(null, &[0x2000, 6, 256, 0], b);
+            let cbv_rec = record_at(b).unwrap();
+            assert!(view_alive(cbv_rec[1], cbv_rec[2]));
+
+            let res_desc: [u32; 14] = std::array::from_fn(|k| 0x6ee0_0000 + k as u32);
+            let mut srv_desc: [u32; 16] = std::array::from_fn(|k| 0x7b70_0000 + k as u32);
+            let placed = 0xd_4950_0000u64;
+            (srv_desc[10], srv_desc[11]) = (placed as u32, (placed >> 32) as u32);
+            create_placed_srv(null, &res_desc, &srv_desc, c);
+            let placed_rec = record_at(c).unwrap();
+            assert!(view_alive(placed_rec[1], placed_rec[2]));
+            assert!(!view_alive(placed_rec[1], (PLACED << KIND_SHIFT) | 0x3f_ffff));
+        }
     }
 
     /// The title places its shader-visible heap in its own memory
