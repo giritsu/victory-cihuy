@@ -4241,6 +4241,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 mod send;
+mod shot;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
@@ -10238,10 +10239,11 @@ impl Host {
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
+            let shot_path = shot::poll_request();
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = shot_path.is_some() || crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
+            let read_now = shot_path.is_some();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -10365,6 +10367,22 @@ impl Host {
                 crate::popwatch::take(&self.device, list, texture)
             };
             p.panel.draw(self, copy, &back, (width, height), format);
+            let shot_buf = shot_path.as_ref().and_then(|_| {
+                #[cfg(feature = "diagnostics")]
+                let _ours = crate::replay::record::unrecorded();
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let res = shot::read_back(&self.device, list, &back);
+                list.ResourceBarrier(&[transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+                res
+            });
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -10403,6 +10421,9 @@ impl Host {
             }
             #[cfg(not(feature = "diagnostics"))]
             let _ = flown;
+            if let (Some(path), Some((buffer, footprint))) = (shot_path, shot_buf) {
+                shot::save_async(path, &buffer, &footprint);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
