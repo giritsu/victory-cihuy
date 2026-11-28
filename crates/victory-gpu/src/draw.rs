@@ -815,23 +815,201 @@ fn heap_spread() -> bool {
 
 /// The host copy and range the buffer view of each of a heap's slots reads
 /// ([`State::heap_buffers`]), by slot.
+#[cfg(test)]
 #[derive(Default)]
 struct HeapRanges<T>(Vec<Option<(T, u64, u64)>>);
+
+#[derive(Clone, Copy)]
+struct SweepSlot {
+    key: u64,
+    copy_key: usize,
+    from: u64,
+    to: u64,
+    buf_epoch: u32,
+    copy_pos: u32,
+}
+
+impl SweepSlot {
+    const EMPTY: Self = Self {
+        key: 0,
+        copy_key: 0,
+        from: 0,
+        to: 0,
+        buf_epoch: 0,
+        copy_pos: 0,
+    };
+
+    #[inline]
+    fn occupied(self) -> bool {
+        self.copy_key != 0
+    }
+}
+
+struct CopySpan<T> {
+    copy: T,
+    from: u64,
+    to: u64,
+    slots: Vec<u32>,
+    dirty: bool,
+}
+
+struct SweepIndex<T> {
+    slots: Vec<SweepSlot>,
+    spans: crate::host::ByCopy<CopySpan<T>>,
+    views: u32,
+}
+
+impl<T> Default for SweepIndex<T> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            spans: Default::default(),
+            views: 0,
+        }
+    }
+}
+
+impl<T> SweepIndex<T> {
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.spans.clear();
+        self.views = 0;
+    }
+
+    fn remove(&mut self, slot: u32) {
+        let Some(entry) = self.slots.get_mut(slot as usize) else {
+            return;
+        };
+        if !entry.occupied() {
+            return;
+        }
+        let old = *entry;
+        *entry = SweepSlot::EMPTY;
+        self.views -= 1;
+        let remove_span = if let Some(span) = self.spans.get_mut(&old.copy_key) {
+            let pos = old.copy_pos as usize;
+            span.slots.swap_remove(pos);
+            if let Some(&moved_slot) = span.slots.get(pos) {
+                // Keep the moved slot's `copy_pos` valid after `swap_remove`.
+                self.slots[moved_slot as usize].copy_pos = pos as u32;
+            }
+            if span.slots.is_empty() {
+                true
+            } else {
+                if old.from == span.from || old.to == span.to {
+                    span.dirty = true;
+                }
+                false
+            }
+        } else {
+            false
+        };
+        if remove_span {
+            self.spans.remove(&old.copy_key);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set(
+        &mut self,
+        slot: u32,
+        key: u64,
+        buf_epoch: u32,
+        copy_key: usize,
+        make_copy: impl FnOnce() -> T,
+        from: u64,
+        to: u64,
+    ) {
+        debug_assert!(copy_key != 0);
+        if let Some(old) = self.slots.get_mut(slot as usize)
+            && old.occupied()
+            && old.copy_key == copy_key
+        {
+            old.key = key;
+            old.buf_epoch = buf_epoch;
+            if old.from != from || old.to != to {
+                if let Some(span) = self.spans.get_mut(&copy_key) {
+                    if (old.from == span.from && from > old.from) || (old.to == span.to && to < old.to) {
+                        span.dirty = true;
+                    }
+                    span.from = span.from.min(from);
+                    span.to = span.to.max(to);
+                }
+                old.from = from;
+                old.to = to;
+            }
+            return;
+        }
+        self.remove(slot);
+        let idx = slot as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize(idx + 1, SweepSlot::EMPTY);
+        }
+        let copy_pos = match self.spans.entry(copy_key) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let span = entry.into_mut();
+                span.from = span.from.min(from);
+                span.to = span.to.max(to);
+                let pos = span.slots.len() as u32;
+                span.slots.push(slot);
+                pos
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let span = entry.insert(CopySpan {
+                    copy: make_copy(),
+                    from,
+                    to,
+                    slots: vec![slot],
+                    dirty: false,
+                });
+                let _ = span;
+                0
+            }
+        };
+        self.slots[idx] = SweepSlot {
+            key,
+            copy_key,
+            from,
+            to,
+            buf_epoch,
+            copy_pos,
+        };
+        self.views += 1;
+    }
+
+    fn recompute_dirty(&mut self) {
+        for span in self.spans.values_mut() {
+            if !span.dirty {
+                continue;
+            }
+            let (mut lo, mut hi) = (u64::MAX, 0u64);
+            for &slot in &span.slots {
+                let s = self.slots[slot as usize];
+                lo = lo.min(s.from);
+                hi = hi.max(s.to);
+            }
+            span.from = lo;
+            span.to = hi;
+            span.dirty = false;
+        }
+    }
+}
 
 /// Descriptor-derived references belong to the heap that produced them.
 pub(crate) struct BufferSweep {
     passes: u64,
-    ranges: HeapRanges<std::sync::Arc<crate::shadow::Shadow>>,
+    index: SweepIndex<std::sync::Arc<crate::shadow::Shadow>>,
     // Last refresh frame and covered interval for throttled, unwatched copies.
     unwatched: std::collections::HashMap<u64, (u64, u64, u64)>,
 }
 
 impl Default for BufferSweep {
     fn default() -> Self {
-        Self { passes: 0, ranges: HeapRanges(Vec::new()), unwatched: Default::default() }
+        Self { passes: 0, index: SweepIndex::default(), unwatched: Default::default() }
     }
 }
 
+#[cfg(test)]
 impl<T> HeapRanges<T> {
     fn set(&mut self, slot: u32, range: Option<(T, u64, u64)>) {
         let slot = slot as usize;
@@ -923,6 +1101,47 @@ mod heap_range_tests {
             best(&mut || join::<std::hash::RandomState>(&mut table.values())),
             best(&mut || join::<std::hash::BuildHasherDefault<crate::host::AddressHash>>(&mut slots.ranges())),
         );
+    }
+
+    #[test]
+    fn sweep_index_tracks_incremental_spans_and_updates() {
+        let mut index: super::SweepIndex<u32> = super::SweepIndex::default();
+        // Insert multiple slots for copy 10 -> widens span without dirtying.
+        index.set(1, 101, 1, 10, || 10, 100, 200);
+        index.set(2, 102, 1, 10, || unreachable!(), 150, 300);
+        index.set(3, 103, 1, 10, || unreachable!(), 50, 120);
+        assert_eq!(index.views, 3);
+        assert_eq!(index.spans.len(), 1);
+        assert_eq!((index.spans[&10].from, index.spans[&10].to, index.spans[&10].dirty), (50, 300, false));
+
+        // Remove interior slot 1 -> dirty stays false, swap_remove keeps copy_pos valid.
+        index.remove(1);
+        assert_eq!(index.views, 2);
+        assert_eq!((index.spans[&10].from, index.spans[&10].to, index.spans[&10].dirty), (50, 300, false));
+
+        // Remove boundary slot 3 (`from == 50`) -> dirty becomes true; recompute shrinks span.
+        index.remove(3);
+        assert!(index.spans[&10].dirty);
+        index.recompute_dirty();
+        assert_eq!((index.spans[&10].from, index.spans[&10].to, index.spans[&10].dirty), (150, 300, false));
+
+        // Overwrite slot 2 with same copy and narrower high boundary -> marks dirty & shrinks on recompute.
+        index.set(2, 104, 2, 10, || unreachable!(), 160, 250);
+        index.recompute_dirty();
+        assert_eq!((index.spans[&10].from, index.spans[&10].to), (160, 250));
+
+        // Overwrite slot 2 with a different copy 20 -> removes empty copy 10 span, inserts copy 20.
+        index.set(2, 201, 2, 20, || 20, 400, 500);
+        index.recompute_dirty();
+        assert!(!index.spans.contains_key(&10));
+        assert_eq!(index.spans.len(), 1);
+        assert_eq!((index.spans[&20].from, index.spans[&20].to), (400, 500));
+        assert_eq!(index.views, 1);
+
+        index.clear();
+        assert_eq!(index.views, 0);
+        assert!(index.spans.is_empty());
+        assert!(index.slots.is_empty());
     }
 }
 
@@ -1045,23 +1264,32 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 /// they show are to be refreshed.
 fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::host::HostHeap, frame: u64) -> Vec<crate::host::aside::Refresh> {
     let started = std::time::Instant::now();
-    // Per host heap: the host copy and range each slot's buffer view
-    // reads, kept from pass to pass. Only the slots written since the
-    // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-    // at best); all of them every 16 passes, because a view of a
-    // released resource goes stale without a write, and a slot written
-    // before its memory had a host copy is only made then.
+    // Per host heap: the host copy and range each slot's buffer view reads,
+    // kept incrementally from pass to pass. Unchanged slots skip descriptor
+    // cloning and buffer_copy lookups; modified slots update per-copy spans
+    // in place without rebuilding over all 150k+ slots each frame.
+    enum SweepAction {
+        Clear(u32),
+        Set {
+            slot: u32,
+            key: u64,
+            shadow: std::sync::Arc<crate::shadow::Shadow>,
+            from: u64,
+            to: u64,
+            written: bool,
+        },
+    }
+    let cur_buf_epoch = crate::descriptor::host::view_epochs().0 as u32;
     let mut kept = host.buffer_sweep.lock().unwrap_or_else(|e| e.into_inner());
-    let BufferSweep { passes, ranges, unwatched } = &mut *kept;
+    let BufferSweep { passes, index, unwatched } = &mut *kept;
     let changed = host.buffer_changes();
     let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
     let slots = if all {
-        ranges.0.clear();
+        index.clear();
         host.buffer_slots()
     } else if heap_spread() {
         // The written ones, and this pass's part of the others.
         let (part, parts) = ((*passes % HEAP_ROUND) as u32, HEAP_ROUND as u32);
-        ranges.forget_part(part, parts);
         let mut slots = host.buffer_slots_of(part, parts);
         slots.extend(changed);
         slots.sort_unstable();
@@ -1087,30 +1315,57 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
     }
     let heap = Shared(heap);
+    let prev_slots = &index.slots;
     // What a slot of the title's shows: its copy and range, and whether it is
     // an unordered view.
-    let look = |index: u32| {
+    let look = |slot_idx: u32| -> Option<SweepAction> {
+        let had = prev_slots.get(slot_idx as usize).filter(|e| e.occupied());
         // A draw's table's: the draw brings what it reads up to date.
-        if host.copied_tabled(index, frame) {
+        if host.copied_tabled(slot_idx, frame) {
+            return had.map(|_| SweepAction::Clear(slot_idx));
+        }
+        let Some(handle) = heap.handle(slot_idx) else {
+            return had.map(|_| SweepAction::Clear(slot_idx));
+        };
+        if !all
+            && let Some(prev) = had
+            && prev.buf_epoch == cur_buf_epoch
+            && let Some([_, i, generation]) = crate::descriptor::record_at(handle)
+            && let key = u64::from(generation) << 32 | u64::from(i)
+            && prev.key == key
+            && host.quick_matches(slot_idx, key)
+            && crate::descriptor::view_alive(i, generation)
+        {
             return None;
         }
-        let view = host.mirror(index, heap.handle(index)?, true)?;
+        let Some((view, key)) = host.mirror_for_pass(slot_idx, handle) else {
+            return had.map(|_| SweepAction::Clear(slot_idx));
+        };
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
+        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            return had.map(|_| SweepAction::Clear(slot_idx));
+        };
         #[cfg(feature = "diagnostics")]
-        if host.shows(index, &shadow.buffer) == Some(false) {
+        if host.shows(slot_idx, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
         let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
-        Some(((shadow, address, address + len), written))
+        Some(SweepAction::Set {
+            slot: slot_idx,
+            key,
+            shadow,
+            from: address,
+            to: address + len,
+            written,
+        })
     };
     // Some slots at a time, on several threads.
     const AT_A_TIME: usize = 64;
     let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
-    let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
+    let found: Vec<std::sync::OnceLock<Vec<SweepAction>>> = parts.iter().map(|_| Default::default()).collect();
     crate::land::each_view(false, parts.len(), &|n| {
-        let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+        let looked: Vec<SweepAction> = parts[n].iter().filter_map(|&slot_idx| look(slot_idx)).collect();
         // (After each piece while the device lives: a cheap query.)
         if alive
             && let Some(why) = crate::descriptor::host::device_removed()
@@ -1126,31 +1381,31 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
         }
         let _ = found[n].set(looked);
     });
-    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
-        let range = shows.map(|(range, written)| {
-            if written {
-                unordered.push(range.clone());
+    for action in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+        match action {
+            SweepAction::Clear(slot_idx) => index.remove(slot_idx),
+            SweepAction::Set {
+                slot: slot_idx,
+                key,
+                shadow,
+                from,
+                to,
+                written,
+            } => {
+                if written {
+                    unordered.push((shadow.clone(), from, to));
+                }
+                let copy_key = std::sync::Arc::as_ptr(&shadow) as usize;
+                index.set(slot_idx, key, cur_buf_epoch, copy_key, || shadow, from, to);
             }
-            range
-        });
-        ranges.set(index, range);
+        }
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
     }
     #[cfg(feature = "diagnostics")]
     let looked = std::time::Instant::now();
-    // Per host copy, the span its picked views cover.
-    let mut spans: crate::host::ByCopy<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> = Default::default();
-    let mut views = 0u32;
-    for (shadow, from, to) in ranges.ranges() {
-        views += 1;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-        span.1 = span.1.min(*from);
-        span.2 = span.2.max(*to);
-    }
-    let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+    index.recompute_dirty();
     // Memory that is not write-watched is copied whole by every refresh.
     // It was once refreshed only every 120 frames (unmapped pages read
     // one by one cost 14 GB a frame in run 11, before they were
@@ -1162,22 +1417,37 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     let every = *EVERY.get_or_init(|| {
         std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
     });
-    let mut found = Vec::with_capacity(spans.len());
-    let mut next_unwatched = std::collections::HashMap::new();
-    for (shadow, from, to) in spans.values() {
-        if every > 1 && shadow.unwatched() {
-            let id = shadow.id();
-            if let Some(&(last, low, high)) = unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
-            {
-                next_unwatched.insert(id, (last, low, high));
-                continue;
+    let mut found = Vec::with_capacity(index.spans.len());
+    if every > 1 {
+        let mut next_unwatched = std::collections::HashMap::new();
+        for span in index.spans.values() {
+            if span.copy.unwatched() {
+                let id = span.copy.id();
+                if let Some(&(last, low, high)) = unwatched.get(&id)
+                    && frame >= last && frame - last < every && low <= span.from && span.to <= high
+                {
+                    next_unwatched.insert(id, (last, low, high));
+                    continue;
+                }
+                next_unwatched.insert(id, (frame, span.from, span.to));
             }
-            next_unwatched.insert(id, (frame, *from, *to));
+            found.push((span.copy.clone(), span.from, span.to.min(span.from + span.copy.left(span.from))));
         }
-        found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
+        *unwatched = next_unwatched;
+    } else {
+        for span in index.spans.values() {
+            found.push((span.copy.clone(), span.from, span.to.min(span.from + span.copy.left(span.from))));
+        }
     }
-    *unwatched = next_unwatched;
+    let views = index.views;
+    let copies = index.spans.len();
+    static LOGGED: AtomicU64 = AtomicU64::new(0);
+    // The first pass and every growth of the set by half.
+    let seen = LOGGED.load(Ordering::Relaxed);
+    let log_bytes = (u64::from(views) > seen + seen / 2).then(|| {
+        LOGGED.store(u64::from(views), Ordering::Relaxed);
+        index.spans.values().map(|s| s.to - s.from).sum::<u64>()
+    });
     drop(kept);
     #[cfg(feature = "diagnostics")]
     let refreshed = std::time::Instant::now();
@@ -1186,15 +1456,11 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked]) {
         sum.fetch_add(time.as_nanos() as u64, Ordering::Relaxed);
     }
-    static LOGGED: AtomicU64 = AtomicU64::new(0);
-    // The first pass and every growth of the set by half.
-    let seen = LOGGED.load(Ordering::Relaxed);
-    if u64::from(views) > seen + seen / 2 {
-        LOGGED.store(u64::from(views), Ordering::Relaxed);
+    if let Some(bytes) = log_bytes {
         tracing::info!(
             slots = slots.len(),
             views,
-            copies = spans.len(),
+            copies,
             mb = bytes >> 20,
             ms = started.elapsed().as_millis(),
             "buffer views of the heap made ready for shaders that pick them by index"
